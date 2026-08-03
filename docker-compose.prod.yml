@@ -40,6 +40,7 @@ services:
       REDIS_URL: redis://redis:6379
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      CORS_ORIGIN: ${CORS_ORIGIN:-https://pulsar.antimony.com.ng}
     depends_on:
       postgres:
         condition: service_healthy
