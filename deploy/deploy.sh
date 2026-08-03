@@ -2,7 +2,6 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-PROJECT_DIR=$(pwd)
 COMPOSE_PROJECT="-p pulsar"
 
 RED='\033[0;31m'
@@ -36,7 +35,6 @@ fi
 if [ ! -f .env ]; then
   if [ -f .env.production.example ]; then
     cp .env.production.example .env
-    # Generate random secrets
     JWT_SECRET=$(openssl rand -hex 32)
     PG_PASS=$(openssl rand -hex 16)
     sed -i "s/change-me-jwt-secret-min-32-chars/${JWT_SECRET}/" .env
@@ -54,49 +52,14 @@ source .env
 
 WEB_DOMAIN="${WEB_DOMAIN:-pulsar.antimony.com.ng}"
 API_DOMAIN="${API_DOMAIN:-pulsar-api.antimony.com.ng}"
-CERTBOT_EMAIL="${CERTBOT_EMAIL:-admin@antimony.com.ng}"
 
-# ── Build and start stack (HTTP only first) ────────────────────────────────
-log "Building and starting services..."
+# ── Build and start app stack (no Docker nginx) ───────────────────────────
+log "Building and starting Docker services (postgres, redis, api, web)..."
 $COMPOSE -f docker-compose.prod.yml build
-$COMPOSE -f docker-compose.prod.yml up -d postgres redis
-
-log "Waiting for Postgres..."
-sleep 8
-
-$COMPOSE -f docker-compose.prod.yml up -d api web
-sleep 5
-$COMPOSE -f docker-compose.prod.yml up -d nginx
+$COMPOSE -f docker-compose.prod.yml up -d
 
 log "Waiting for services to be ready..."
-sleep 5
-
-# ── SSL certificate via Certbot ────────────────────────────────────────────
-CERT_PATH="/etc/letsencrypt/live/${WEB_DOMAIN}/fullchain.pem"
-
-if ! $DOCKER run --rm \
-  -v pulsar_certbot-certs:/etc/letsencrypt \
-  -v pulsar_certbot-www:/var/www/certbot \
-  certbot/certbot certificates 2>/dev/null | grep -q "$WEB_DOMAIN"; then
-
-  log "Requesting SSL certificates for ${WEB_DOMAIN} and ${API_DOMAIN}..."
-  $DOCKER run --rm \
-    -v pulsar_certbot-certs:/etc/letsencrypt \
-    -v pulsar_certbot-www:/var/www/certbot \
-    certbot/certbot certonly \
-    --webroot -w /var/www/certbot \
-    --email "$CERTBOT_EMAIL" \
-    --agree-tos --no-eff-email \
-    -d "$WEB_DOMAIN" \
-    -d "$API_DOMAIN"
-else
-  log "SSL certificate already exists, skipping issuance."
-fi
-
-# ── Switch nginx to SSL config ─────────────────────────────────────────────
-log "Enabling HTTPS nginx config..."
-$COMPOSE -f docker-compose.prod.yml stop nginx
-$COMPOSE -f docker-compose.prod.yml -f docker-compose.ssl.override.yml up -d nginx certbot
+sleep 10
 
 # ── Disable seed on subsequent deploys ────────────────────────────────────
 if grep -q "RUN_SEED=true" .env; then
@@ -104,15 +67,22 @@ if grep -q "RUN_SEED=true" .env; then
   log "Set RUN_SEED=false for future deploys."
 fi
 
-# ── Health check ───────────────────────────────────────────────────────────
+# ── Configure host nginx + SSL ────────────────────────────────────────────
+log "Configuring host nginx..."
+chmod +x deploy/setup-nginx.sh
+./deploy/setup-nginx.sh
+
+# ── Health checks ─────────────────────────────────────────────────────────
 log "Running health checks..."
 sleep 3
 
-HTTP_WEB=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost" -H "Host: ${WEB_DOMAIN}" || echo "000")
-log "Web HTTP status: ${HTTP_WEB}"
+API_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/api/health" || echo "000")
+WEB_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3000" || echo "000")
+log "API (localhost:3001): ${API_LOCAL}"
+log "Web (localhost:3000): ${WEB_LOCAL}"
 
-HTTPS_API=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost/api/health" -H "Host: ${API_DOMAIN}" || echo "000")
-log "API HTTPS status: ${HTTPS_API}"
+HTTPS_API=$(curl -sk -o /dev/null -w "%{http_code}" "https://${API_DOMAIN}/api/health" || echo "000")
+log "API (https://${API_DOMAIN}): ${HTTPS_API}"
 
 echo ""
 log "Deployment complete!"
