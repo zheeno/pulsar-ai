@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+PROJECT_DIR=$(pwd)
+COMPOSE_PROJECT="-p pulsar"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log() { echo -e "${GREEN}[deploy]${NC} $*"; }
+warn() { echo -e "${YELLOW}[deploy]${NC} $*"; }
+err() { echo -e "${RED}[deploy]${NC} $*" >&2; }
+
+# ── Install Docker if missing ──────────────────────────────────────────────
+if ! command -v docker &>/dev/null; then
+  log "Installing Docker..."
+  curl -fsSL https://get.docker.com | sudo sh
+  sudo usermod -aG docker "$USER" 2>/dev/null || true
+fi
+
+DOCKER="docker"
+if ! docker info &>/dev/null 2>&1; then
+  DOCKER="sudo docker"
+fi
+
+COMPOSE="$DOCKER compose $COMPOSE_PROJECT"
+if ! $DOCKER compose version &>/dev/null 2>&1; then
+  err "Docker Compose plugin not found"
+  exit 1
+fi
+
+# ── Environment file ───────────────────────────────────────────────────────
+if [ ! -f .env ]; then
+  if [ -f .env.production.example ]; then
+    cp .env.production.example .env
+    # Generate random secrets
+    JWT_SECRET=$(openssl rand -hex 32)
+    PG_PASS=$(openssl rand -hex 16)
+    sed -i "s/change-me-jwt-secret-min-32-chars/${JWT_SECRET}/" .env
+    sed -i "s/change-me-strong-password/${PG_PASS}/" .env
+    warn "Created .env from template with generated secrets."
+    warn "Review .env and set CERTBOT_EMAIL, NGX_PULSE_API_KEY, OPENAI_API_KEY"
+  else
+    err ".env not found. Copy .env.production.example to .env first."
+    exit 1
+  fi
+fi
+
+# shellcheck disable=SC1091
+source .env
+
+WEB_DOMAIN="${WEB_DOMAIN:-pulsar.antimony.com.ng}"
+API_DOMAIN="${API_DOMAIN:-pulsar-api.antimony.com.ng}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-admin@antimony.com.ng}"
+
+# ── Build and start stack (HTTP only first) ────────────────────────────────
+log "Building and starting services..."
+$COMPOSE -f docker-compose.prod.yml build
+$COMPOSE -f docker-compose.prod.yml up -d postgres redis
+
+log "Waiting for Postgres..."
+sleep 8
+
+$COMPOSE -f docker-compose.prod.yml up -d api web
+sleep 5
+$COMPOSE -f docker-compose.prod.yml up -d nginx
+
+log "Waiting for services to be ready..."
+sleep 5
+
+# ── SSL certificate via Certbot ────────────────────────────────────────────
+CERT_PATH="/etc/letsencrypt/live/${WEB_DOMAIN}/fullchain.pem"
+
+if ! $DOCKER run --rm \
+  -v pulsar_certbot-certs:/etc/letsencrypt \
+  -v pulsar_certbot-www:/var/www/certbot \
+  certbot/certbot certificates 2>/dev/null | grep -q "$WEB_DOMAIN"; then
+
+  log "Requesting SSL certificates for ${WEB_DOMAIN} and ${API_DOMAIN}..."
+  $DOCKER run --rm \
+    -v pulsar_certbot-certs:/etc/letsencrypt \
+    -v pulsar_certbot-www:/var/www/certbot \
+    certbot/certbot certonly \
+    --webroot -w /var/www/certbot \
+    --email "$CERTBOT_EMAIL" \
+    --agree-tos --no-eff-email \
+    -d "$WEB_DOMAIN" \
+    -d "$API_DOMAIN"
+else
+  log "SSL certificate already exists, skipping issuance."
+fi
+
+# ── Switch nginx to SSL config ─────────────────────────────────────────────
+log "Enabling HTTPS nginx config..."
+$COMPOSE -f docker-compose.prod.yml stop nginx
+$COMPOSE -f docker-compose.prod.yml -f docker-compose.ssl.override.yml up -d nginx certbot
+
+# ── Disable seed on subsequent deploys ────────────────────────────────────
+if grep -q "RUN_SEED=true" .env; then
+  sed -i 's/RUN_SEED=true/RUN_SEED=false/' .env
+  log "Set RUN_SEED=false for future deploys."
+fi
+
+# ── Health check ───────────────────────────────────────────────────────────
+log "Running health checks..."
+sleep 3
+
+HTTP_WEB=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost" -H "Host: ${WEB_DOMAIN}" || echo "000")
+log "Web HTTP status: ${HTTP_WEB}"
+
+HTTPS_API=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost/api/health" -H "Host: ${API_DOMAIN}" || echo "000")
+log "API HTTPS status: ${HTTPS_API}"
+
+echo ""
+log "Deployment complete!"
+echo "  Dashboard: https://${WEB_DOMAIN}"
+echo "  API:       https://${API_DOMAIN}/api/health"
+echo "  Login:     admin@ngx.local / admin123"
+echo ""
+log "View logs: $COMPOSE -f docker-compose.prod.yml logs -f"
