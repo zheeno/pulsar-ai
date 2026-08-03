@@ -34,13 +34,14 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "127.0.0.1:${API_PORT:-3954}:3001"
+      - "127.0.0.1:${API_HOST_PORT:-3954}:3001"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ngx_trading}
       REDIS_URL: redis://redis:6379
       REDIS_HOST: redis
       REDIS_PORT: 6379
       CORS_ORIGIN: ${CORS_ORIGIN:-https://pulsar.antimony.com.ng}
+      API_PORT: "3001"
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,9 +58,9 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://pulsar-api.antimony.com.ng/api}
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${WEB_PORT:-3955}:3000"
+      - "127.0.0.1:${WEB_HOST_PORT:-3955}:3000"
     environment:
-      PORT: 3000
+      PORT: "3000"
     depends_on:
       - api
     networks:
