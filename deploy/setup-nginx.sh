@@ -23,6 +23,8 @@ fi
 WEB_DOMAIN="${WEB_DOMAIN:-pulsar.antimony.com.ng}"
 API_DOMAIN="${API_DOMAIN:-pulsar-api.antimony.com.ng}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-admin@antimony.com.ng}"
+API_PORT="${API_PORT:-3954}"
+WEB_PORT="${WEB_PORT:-3955}"
 
 if ! command -v nginx &>/dev/null; then
   err "nginx is not installed. Install with: sudo apt install nginx"
@@ -36,6 +38,8 @@ sudo cp "${PROJECT_DIR}/deploy/nginx/host/pulsar-api.conf" "/etc/nginx/sites-ava
 # Patch server_name if domains differ from defaults in template files
 sudo sed -i "s/pulsar.antimony.com.ng/${WEB_DOMAIN}/g" "/etc/nginx/sites-available/${WEB_DOMAIN}.conf"
 sudo sed -i "s/pulsar-api.antimony.com.ng/${API_DOMAIN}/g" "/etc/nginx/sites-available/${API_DOMAIN}.conf"
+sudo sed -i "s/127.0.0.1:3955/127.0.0.1:${WEB_PORT}/g" "/etc/nginx/sites-available/${WEB_DOMAIN}.conf"
+sudo sed -i "s/127.0.0.1:3954/127.0.0.1:${API_PORT}/g" "/etc/nginx/sites-available/${API_DOMAIN}.conf"
 
 sudo ln -sf "/etc/nginx/sites-available/${WEB_DOMAIN}.conf" /etc/nginx/sites-enabled/
 sudo ln -sf "/etc/nginx/sites-available/${API_DOMAIN}.conf" /etc/nginx/sites-enabled/

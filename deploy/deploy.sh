@@ -52,6 +52,8 @@ source .env
 
 WEB_DOMAIN="${WEB_DOMAIN:-pulsar.antimony.com.ng}"
 API_DOMAIN="${API_DOMAIN:-pulsar-api.antimony.com.ng}"
+API_PORT="${API_PORT:-3954}"
+WEB_PORT="${WEB_PORT:-3955}"
 
 # ── Build and start app stack (no Docker nginx) ───────────────────────────
 log "Building and starting Docker services (postgres, redis, api, web)..."
@@ -76,10 +78,10 @@ chmod +x deploy/setup-nginx.sh
 log "Running health checks..."
 sleep 3
 
-API_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/api/health" || echo "000")
-WEB_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3000" || echo "000")
-log "API (localhost:3001): ${API_LOCAL}"
-log "Web (localhost:3000): ${WEB_LOCAL}"
+API_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${API_PORT}/api/health" || echo "000")
+WEB_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${WEB_PORT}" || echo "000")
+log "API (localhost:${API_PORT}): ${API_LOCAL}"
+log "Web (localhost:${WEB_PORT}): ${WEB_LOCAL}"
 
 HTTPS_API=$(curl -sk -o /dev/null -w "%{http_code}" "https://${API_DOMAIN}/api/health" || echo "000")
 log "API (https://${API_DOMAIN}): ${HTTPS_API}"

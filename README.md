@@ -45,7 +45,7 @@ chmod +x deploy/deploy.sh deploy/setup-nginx.sh
 
 The deploy script will:
 1. Install Docker if needed
-2. Build and start Postgres, Redis, API (127.0.0.1:3001), Web (127.0.0.1:3000)
+2. Build and start Postgres, Redis, API (127.0.0.1:3954), Web (127.0.0.1:3955)
 3. Install nginx site configs from `deploy/nginx/host/`
 4. Obtain SSL certificates via host Certbot (`certbot --nginx`)
 
