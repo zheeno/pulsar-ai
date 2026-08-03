@@ -12,6 +12,7 @@ ARG NEXT_PUBLIC_API_URL=https://pulsar-api.antimony.com.ng/api
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+RUN mkdir -p apps/web/public
 RUN npm run build --workspace=@ngx/shared && npm run build --workspace=@ngx/web
 
 FROM node:22-alpine AS runner
