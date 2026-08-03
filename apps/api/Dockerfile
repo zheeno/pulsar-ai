@@ -16,13 +16,26 @@ FROM node:22-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 RUN apk add --no-cache curl
+
+# App build output
 COPY --from=builder /app/apps/api/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
 COPY --from=builder /app/apps/api/package.json ./package.json
+
+# Workspace shared package (must include package.json for Node resolution)
+COPY --from=builder /app/packages/shared/package.json ./packages/shared/package.json
+COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
+
+# Dependencies
+COPY --from=builder /app/node_modules ./node_modules
+
+# Ensure @ngx/shared workspace symlink resolves inside the container
+RUN rm -rf node_modules/@ngx/shared && ln -s ../../packages/shared node_modules/@ngx/shared
+
+# Migrations / seed scripts
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/supabase ./supabase
 COPY deploy/api-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
 EXPOSE 3001
 ENTRYPOINT ["/entrypoint.sh"]
