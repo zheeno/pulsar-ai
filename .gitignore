@@ -7,3 +7,4 @@ dist/
 *.log
 coverage/
 .DS_Store
+.env.prod.test
