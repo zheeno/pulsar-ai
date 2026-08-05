@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { RedisService } from '../redis/redis.service';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class DailySnapshotService {
@@ -12,6 +13,7 @@ export class DailySnapshotService {
   ) {}
 
   async createSnapshot(portfolioId?: string): Promise<void> {
+    const log = logStart(this.logger, 'createSnapshot', { portfolioId });
     const portfolios = portfolioId
       ? (await this.db.query('SELECT * FROM sandbox_portfolios WHERE id = $1', [portfolioId])).rows
       : (await this.db.query('SELECT * FROM sandbox_portfolios')).rows;
@@ -19,9 +21,11 @@ export class DailySnapshotService {
     for (const portfolio of portfolios) {
       await this.snapshotPortfolio(portfolio);
     }
+    log.done({ portfolios: portfolios.length });
   }
 
   private async snapshotPortfolio(portfolio: Record<string, unknown>): Promise<void> {
+    const log = logStart(this.logger, 'snapshotPortfolio', { portfolioId: portfolio.id });
     const today = new Date().toISOString().split('T')[0];
     const positions = await this.db.query('SELECT * FROM sandbox_positions WHERE portfolio_id = $1', [portfolio.id]);
     let marketValue = 0;
@@ -63,7 +67,7 @@ export class DailySnapshotService {
          pnl_cumulative = EXCLUDED.pnl_cumulative, drawdown_pct = EXCLUDED.drawdown_pct`,
       [portfolio.id, today, totalEquity, pnlDaily, pnlCumulative, benchmarkChange, drawdownPct],
     );
-    this.logger.log(`Snapshot created for portfolio ${portfolio.id}: equity=${totalEquity}`);
+    log.done({ totalEquity, pnlDaily, drawdownPct });
   }
 
   private async getPrice(symbol: string): Promise<number> {

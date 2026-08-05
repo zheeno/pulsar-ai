@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { Logger } from '@nestjs/common';
 import { AppModule } from './app.module';
+import { LoggingInterceptor } from './common/logging.interceptor';
 
 function getAllowedOrigins(): string[] {
   const raw = process.env.CORS_ORIGIN || 'http://localhost:3000';
@@ -12,6 +13,7 @@ async function bootstrap() {
   const allowedOrigins = getAllowedOrigins();
 
   const app = await NestFactory.create(AppModule);
+  app.useGlobalInterceptors(new LoggingInterceptor());
   app.enableCors({
     origin: (origin, callback) => {
       // Allow non-browser clients (no Origin header) and whitelisted web origins

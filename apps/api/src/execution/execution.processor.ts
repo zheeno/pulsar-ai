@@ -2,6 +2,7 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { ExecutionService } from './execution.service';
+import { logStart } from '../common/log.util';
 
 @Processor('sandbox-execution')
 export class ExecutionProcessor extends WorkerHost {
@@ -12,7 +13,9 @@ export class ExecutionProcessor extends WorkerHost {
   }
 
   async process(job: Job<{ signalIds: string[] }>): Promise<number> {
-    this.logger.log(`Processing ${job.data.signalIds.length} signals for execution`);
-    return this.service.processSignals(job.data.signalIds);
+    const log = logStart(this.logger, 'process', { jobId: job.id, signalCount: job.data.signalIds.length });
+    const executed = await this.service.processSignals(job.data.signalIds);
+    log.done({ executed });
+    return executed;
   }
 }

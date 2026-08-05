@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ChatOpenAI } from '@langchain/openai';
 import { LlmSignalOutputSchema, PROMPT_VERSION } from '@ngx/shared';
 import { buildSignalPrompt } from './prompt/v1.0.0';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class LlmService {
@@ -29,11 +30,14 @@ export class LlmService {
     rawResponse: string;
     modelName: string;
   }> {
+    const symbol = context.symbol as string | undefined;
+    const log = logStart(this.logger, 'generateSignal', { symbol, mock: this.useMock });
     const prompt = buildSignalPrompt(context);
     const modelName = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
     if (this.useMock) {
       const output = this.mockResponse(context);
+      log.done({ action: output.action, confidence: output.confidence, model: 'mock-llm' });
       return { output, prompt, rawResponse: JSON.stringify(output), modelName: 'mock-llm' };
     }
 
@@ -44,13 +48,16 @@ export class LlmService {
         rawResponse = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
         const parsed = this.parseJson(rawResponse);
         const validated = LlmSignalOutputSchema.parse(parsed);
+        log.done({ action: validated.action, confidence: validated.confidence, model: modelName });
         return { output: validated, prompt, rawResponse, modelName };
       } catch (err) {
-        this.logger.warn(`LLM parse attempt ${attempt + 1} failed: ${err}`);
+        log.warn(`parse attempt ${attempt + 1} failed`, { error: err instanceof Error ? err.message : String(err) });
       }
     }
 
     const fallback = { action: 'HOLD' as const, confidence: 0, rationale: 'LLM output invalid after retries' };
+    log.warn('using fallback HOLD');
+    log.done({ action: 'HOLD', confidence: 0 });
     return { output: fallback, prompt, rawResponse, modelName };
   }
 

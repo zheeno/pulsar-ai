@@ -1,10 +1,13 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Logger, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { DatabaseService } from '../database/database.service';
+import { logStart } from '../common/log.util';
 
 @Controller('signals')
 @UseGuards(JwtAuthGuard)
 export class SignalsController {
+  private readonly logger = new Logger(SignalsController.name);
+
   constructor(private readonly db: DatabaseService) {}
 
   @Get()
@@ -14,6 +17,7 @@ export class SignalsController {
     @Query('page') page = '1',
     @Query('limit') limit = '20',
   ) {
+    const log = logStart(this.logger, 'list', { symbol, action, page, limit });
     const offset = (Number(page) - 1) * Number(limit);
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -30,6 +34,8 @@ export class SignalsController {
       params,
     );
     const count = await this.db.query(`SELECT COUNT(*) FROM signals ${where}`, params.slice(0, -2));
-    return { data: r.rows, total: Number(count.rows[0].count), page: Number(page), limit: Number(limit) };
+    const result = { data: r.rows, total: Number(count.rows[0].count), page: Number(page), limit: Number(limit) };
+    log.done({ total: result.total });
+    return result;
   }
 }

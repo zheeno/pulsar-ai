@@ -5,6 +5,7 @@ import { IndicatorService } from './indicator.service';
 import { LlmService } from './llm.service';
 import { PROMPT_VERSION } from '@ngx/shared';
 import { EventsGateway } from '../events/events.gateway';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class SignalGenerationService {
@@ -19,9 +20,11 @@ export class SignalGenerationService {
   ) {}
 
   async generateForPortfolio(portfolioId?: string): Promise<string[]> {
+    const log = logStart(this.logger, 'generateForPortfolio', { portfolioId });
     const paramSet = await this.getActiveParamSet(portfolioId);
     if (!paramSet) {
-      this.logger.warn('No active strategy param set — skipping signal generation');
+      log.warn('no active strategy param set');
+      log.done({ signals: 0 });
       return [];
     }
     const symbols = (paramSet.allowed_symbols as string[] | null) || [];
@@ -29,22 +32,29 @@ export class SignalGenerationService {
 
     for (const symbol of symbols) {
       try {
-        const signalId = await this.generateForSymbol(symbol, paramSet);
+        const signalId = await this.generateForSymbol(symbol, paramSet as { allowed_symbols: string[] | null });
         if (signalId) signalIds.push(signalId);
       } catch (err) {
-        this.logger.error(`Signal generation failed for ${symbol}: ${err}`);
+        log.fail(err);
       }
     }
+    log.done({ signals: signalIds.length, symbols: symbols.length });
     return signalIds;
   }
 
   async generateForSymbol(symbol: string, paramSet?: { allowed_symbols: string[] | null }): Promise<string | null> {
+    const log = logStart(this.logger, 'generateForSymbol', { symbol });
     const instrument = await this.db.query('SELECT * FROM instruments WHERE symbol = $1 AND is_active = true', [symbol]);
-    if (instrument.rows.length === 0) return null;
+    if (instrument.rows.length === 0) {
+      log.debug('skipped', { reason: 'instrument not found' });
+      log.done({ signalId: null });
+      return null;
+    }
 
     const technical = await this.indicators.compute(symbol);
     if (!technical) {
-      this.logger.debug(`Insufficient price history for ${symbol}`);
+      log.debug('skipped', { reason: 'insufficient price history' });
+      log.done({ signalId: null });
       return null;
     }
 
@@ -93,6 +103,7 @@ export class SignalGenerationService {
     await this.redis.publish('signals:new', JSON.stringify({ id: signalId, symbol, action: output.action }));
     this.events.broadcastSignal({ id: signalId, symbol, action: output.action, confidence: output.confidence, rationale: output.rationale });
 
+    log.done({ signalId, action: output.action, confidence: output.confidence });
     return signalId;
   }
 

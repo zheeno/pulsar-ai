@@ -5,6 +5,7 @@ import { LlmService } from '../signal-generation/llm.service';
 import { RiskPolicyService, ParamSet } from '../strategy/risk-policy.service';
 import { FillSimulatorService } from '../execution/fill-simulator.service';
 import { PROMPT_VERSION } from '@ngx/shared';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class BacktestService {
@@ -19,6 +20,7 @@ export class BacktestService {
   ) {}
 
   async startRun(strategyParamSetId: string, startDate: string, endDate: string): Promise<string> {
+    const log = logStart(this.logger, 'startRun', { strategyParamSetId, startDate, endDate });
     const result = await this.db.query(
       `INSERT INTO backtest_runs (strategy_param_set_id, start_date, end_date, status)
        VALUES ($1, $2, $3, 'running') RETURNING id`,
@@ -29,15 +31,20 @@ export class BacktestService {
       this.logger.error(`Backtest ${runId} failed: ${err}`);
       this.db.query(`UPDATE backtest_runs SET status = 'failed', completed_at = now() WHERE id = $1`, [runId]);
     });
+    log.done({ runId });
     return runId;
   }
 
   async getRun(runId: string) {
+    const log = logStart(this.logger, 'getRun', { runId });
     const r = await this.db.query('SELECT * FROM backtest_runs WHERE id = $1', [runId]);
-    return r.rows[0] || null;
+    const run = r.rows[0] || null;
+    log.done({ found: !!run, status: run?.status });
+    return run;
   }
 
   private async runAsync(runId: string, paramSetId: string, startDate: string, endDate: string) {
+    const log = logStart(this.logger, 'runAsync', { runId, startDate, endDate });
     const paramResult = await this.db.query('SELECT * FROM strategy_param_sets WHERE id = $1', [paramSetId]);
     const paramSet = paramResult.rows[0] as ParamSet;
     const symbols: string[] = paramSet.allowed_symbols || [];
@@ -130,6 +137,7 @@ export class BacktestService {
       `UPDATE backtest_runs SET status = 'completed', results = $1, completed_at = now() WHERE id = $2`,
       [JSON.stringify(results), runId],
     );
+    log.done({ totalReturn, trades, winRate });
   }
 
   private async getTechnicalAtDate(symbol: string, date: string) {

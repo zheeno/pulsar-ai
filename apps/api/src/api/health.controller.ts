@@ -6,6 +6,7 @@ import { ExecutionService } from '../execution/execution.service';
 import { DailySnapshotService } from '../orchestrator/daily-snapshot.service';
 import { RateLimitService } from '../market-data/rate-limit.service';
 import { PortfolioService } from './portfolio.service';
+import { logStart } from '../common/log.util';
 
 @Controller()
 export class HealthController {
@@ -26,6 +27,7 @@ export class HealthController {
 
   @Post('cycle/run')
   async runCycle() {
+    const log = logStart(this.logger, 'runCycle');
     const forceIngest = { force: true };
 
     const ingested = await this.ingestion.ingestStocks(forceIngest);
@@ -44,36 +46,47 @@ export class HealthController {
     const portfolioId = await this.portfolio.getDefaultPortfolioId();
     const portfolio = portfolioId ? await this.portfolio.getPortfolio(portfolioId) : null;
 
-    return {
-      ingested,
-      signals: signalIds.length,
-      executed,
-      portfolio,
-      warnings: ingested === 0
-        ? ['Live market ingestion failed or was skipped — cycle continued using existing price data.']
-        : [],
-    };
+    const warnings = ingested === 0
+      ? ['Live market ingestion failed or was skipped — cycle continued using existing price data.']
+      : [];
+
+    const result = { ingested, signals: signalIds.length, executed, portfolio, warnings };
+    log.done({ ingested, signals: signalIds.length, executed, warnings: warnings.length });
+    return result;
   }
 }
 
 @Controller('auth')
 export class AuthController {
+  private readonly logger = new Logger(AuthController.name);
+
   constructor(private readonly auth: AuthService) {}
 
   @Post('login')
   async login(@Body() body: { email: string; password: string }) {
+    const log = logStart(this.logger, 'login', { email: body.email });
     const result = await this.auth.login(body.email, body.password);
-    if (!result) return { error: 'Invalid credentials' };
+    if (!result) {
+      log.warn('invalid credentials');
+      log.done({ success: false });
+      return { error: 'Invalid credentials' };
+    }
+    log.done({ success: true });
     return result;
   }
 }
 
 @Controller('usage')
 export class UsageController {
+  private readonly logger = new Logger(UsageController.name);
+
   constructor(private readonly rateLimit: RateLimitService) {}
 
   @Get('ngx-pulse')
   async getUsage() {
-    return this.rateLimit.getUsageToday();
+    const log = logStart(this.logger, 'getUsage');
+    const usage = await this.rateLimit.getUsageToday();
+    log.done(usage);
+    return usage;
   }
 }

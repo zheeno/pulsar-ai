@@ -2,6 +2,7 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { IngestionService } from './ingestion.service';
+import { logStart } from '../common/log.util';
 
 @Processor('market-data-ingest')
 export class IngestionProcessor extends WorkerHost {
@@ -12,18 +13,26 @@ export class IngestionProcessor extends WorkerHost {
   }
 
   async process(job: Job<{ type: string }>): Promise<unknown> {
-    this.logger.log(`Processing job ${job.name}: ${job.data.type}`);
+    const log = logStart(this.logger, 'process', { jobId: job.id, type: job.data.type });
+    let result: unknown;
     switch (job.data.type) {
       case 'stocks':
-        return this.ingestion.ingestStocks();
+        result = await this.ingestion.ingestStocks();
+        break;
       case 'market':
-        return this.ingestion.ingestMarket();
+        result = await this.ingestion.ingestMarket();
+        break;
       case 'indices':
-        return this.ingestion.ingestIndices();
+        result = await this.ingestion.ingestIndices();
+        break;
       case 'backfill':
-        return this.ingestion.backfillSymbols(5);
+        result = await this.ingestion.backfillSymbols(5);
+        break;
       default:
-        return null;
+        log.warn('unknown job type');
+        result = null;
     }
+    log.done({ result });
+    return result;
   }
 }

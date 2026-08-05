@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { RateLimitService } from './rate-limit.service';
+import { logStart } from '../common/log.util';
 
 export interface NgxStock {
   symbol: string;
@@ -43,31 +44,53 @@ export class NgxPulseClient {
   }
 
   async getStocks(): Promise<NgxStock[]> {
-    if (this.useMock) return this.mockStocks();
-    return this.fetch<NgxStock[]>('/ngxdata/stocks', 'stocks');
+    const log = logStart(this.logger, 'getStocks', { mock: this.useMock });
+    const result = this.useMock ? this.mockStocks() : await this.fetch<NgxStock[]>('/ngxdata/stocks', 'stocks');
+    log.done({ count: result.length });
+    return result;
   }
 
   async getMarket(): Promise<NgxMarketOverview> {
-    if (this.useMock) return { asi: { value: 98000, change_percent: 0.5 } };
-    return this.fetch<NgxMarketOverview>('/ngxdata/market', 'market');
+    const log = logStart(this.logger, 'getMarket', { mock: this.useMock });
+    const result = this.useMock
+      ? { asi: { value: 98000, change_percent: 0.5 } }
+      : await this.fetch<NgxMarketOverview>('/ngxdata/market', 'market');
+    log.done({ asi: result.asi?.value });
+    return result;
   }
 
   async getIndices(): Promise<NgxIndex[]> {
-    if (this.useMock) return [{ code: 'ASI', value: 98000, points: 120 }];
-    return this.fetch<NgxIndex[]>('/ngxdata/indices', 'indices');
+    const log = logStart(this.logger, 'getIndices', { mock: this.useMock });
+    const result = this.useMock
+      ? [{ code: 'ASI', value: 98000, points: 120 }]
+      : await this.fetch<NgxIndex[]>('/ngxdata/indices', 'indices');
+    log.done({ count: result.length });
+    return result;
   }
 
   async getSymbolPrice(symbol: string, from?: string, to?: string): Promise<{ date: string; price: number; volume?: number }[]> {
-    if (this.useMock) return this.mockHistorical(symbol);
+    const log = logStart(this.logger, 'getSymbolPrice', { symbol, from, to, mock: this.useMock });
+    if (this.useMock) {
+      const result = this.mockHistorical(symbol);
+      log.done({ count: result.length });
+      return result;
+    }
     const params = new URLSearchParams();
     if (from) params.set('from', from);
     if (to) params.set('to', to);
     const qs = params.toString();
-    return this.fetch(`/ngxdata/prices/${symbol}${qs ? `?${qs}` : ''}`, `prices/${symbol}`);
+    const result = await this.fetch<{ date: string; price: number; volume?: number }[]>(
+      `/ngxdata/prices/${symbol}${qs ? `?${qs}` : ''}`,
+      `prices/${symbol}`,
+    );
+    log.done({ count: result.length });
+    return result;
   }
 
   private async fetch<T>(path: string, endpoint: string): Promise<T> {
+    const log = logStart(this.logger, 'fetch', { endpoint });
     if (!(await this.rateLimit.canMakeRequest())) {
+      log.fail(new Error('NGX Pulse rate limit exceeded'));
       throw new Error('NGX Pulse rate limit exceeded');
     }
     const url = `${this.baseUrl}${path}`;
@@ -75,8 +98,12 @@ export class NgxPulseClient {
       headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/json' },
     });
     await this.rateLimit.recordRequest(endpoint);
-    if (!res.ok) throw new Error(`NGX Pulse error: ${res.status} ${res.statusText}`);
+    if (!res.ok) {
+      log.fail(new Error(`NGX Pulse error: ${res.status} ${res.statusText}`));
+      throw new Error(`NGX Pulse error: ${res.status} ${res.statusText}`);
+    }
     const data = await res.json();
+    log.done({ status: res.status });
     return (data.data ?? data) as T;
   }
 
