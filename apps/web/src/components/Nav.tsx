@@ -9,6 +9,7 @@ const nav = [
   { href: '/trades', label: 'Trades' },
   { href: '/strategy', label: 'Strategy' },
   { href: '/backtest', label: 'Backtest' },
+  { href: '/manual', label: 'Manual' },
 ];
 
 export default function Nav() {
