@@ -1,19 +1,27 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { SMA, RSI } from 'technicalindicators';
 import { DatabaseService } from '../database/database.service';
 import { TechnicalSnapshot } from '@ngx/shared';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class IndicatorService {
+  private readonly logger = new Logger(IndicatorService.name);
+
   constructor(private readonly db: DatabaseService) {}
 
   async compute(symbol: string): Promise<TechnicalSnapshot | null> {
+    const log = logStart(this.logger, 'compute', { symbol });
     const result = await this.db.query(
       `SELECT trade_date, price, volume FROM price_history
        WHERE symbol = $1 ORDER BY trade_date DESC LIMIT 250`,
       [symbol],
     );
-    if (result.rows.length < 60) return null;
+    if (result.rows.length < 60) {
+      log.debug('insufficient data', { rows: result.rows.length });
+      log.done({ computed: false });
+      return null;
+    }
 
     const rows = result.rows.reverse();
     const prices = rows.map((r) => Number(r.price));
@@ -38,6 +46,7 @@ export class IndicatorService {
     const currentVolume = volumes[volumes.length - 1];
     const volumeAnomaly = avgVolume > 0 ? currentVolume / avgVolume : null;
 
+    log.done({ currentPrice, rsi14, momentum });
     return { sma50, sma200, rsi14, momentum, volumeAnomaly, currentPrice };
   }
 }

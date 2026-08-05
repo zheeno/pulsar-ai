@@ -3,6 +3,7 @@ import { DatabaseService } from '../database/database.service';
 import { RedisService } from '../redis/redis.service';
 import { NgxPulseClient, NgxStock } from './ngx-pulse.client';
 import { TradingCalendarService } from './trading-calendar.service';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class IngestionService {
@@ -16,9 +17,11 @@ export class IngestionService {
   ) {}
 
   async ingestStocks(options?: { force?: boolean }): Promise<number> {
+    const log = logStart(this.logger, 'ingestStocks', { force: options?.force });
     const force = options?.force || process.env.FORCE_INGEST === 'true';
     if (!force && !this.calendar.isMarketOpen() && !this.isPostCloseWindow()) {
-      this.logger.log('Market closed — skipping stock ingestion');
+      log.debug('skipped', { reason: 'market closed' });
+      log.done({ count: 0 });
       return 0;
     }
     try {
@@ -29,16 +32,22 @@ export class IngestionService {
         await this.upsertStock(stock, tradeDate);
         count++;
       }
-      this.logger.log(`Ingested ${count} stocks for ${tradeDate}`);
+      log.done({ count, tradeDate });
       return count;
     } catch (err) {
-      this.logger.warn(`Stock ingestion skipped: ${err instanceof Error ? err.message : err}`);
+      log.warn('skipped', { error: err instanceof Error ? err.message : String(err) });
+      log.done({ count: 0 });
       return 0;
     }
   }
 
   async ingestMarket(options?: { force?: boolean }): Promise<void> {
-    if (!options?.force && !this.calendar.isTradingDay()) return;
+    const log = logStart(this.logger, 'ingestMarket', { force: options?.force });
+    if (!options?.force && !this.calendar.isTradingDay()) {
+      log.debug('skipped', { reason: 'not a trading day' });
+      log.done();
+      return;
+    }
     try {
       const market = await this.ngx.getMarket();
       const tradeDate = this.calendar.todayWAT();
@@ -50,13 +59,20 @@ export class IngestionService {
           [tradeDate, market.asi.value, market.asi.change_percent || 0],
         );
       }
+      log.done({ tradeDate, asi: market.asi?.value });
     } catch (err) {
-      this.logger.warn(`Market ingestion skipped: ${err instanceof Error ? err.message : err}`);
+      log.warn('skipped', { error: err instanceof Error ? err.message : String(err) });
+      log.done();
     }
   }
 
   async ingestIndices(options?: { force?: boolean }): Promise<void> {
-    if (!options?.force && !this.calendar.isTradingDay()) return;
+    const log = logStart(this.logger, 'ingestIndices', { force: options?.force });
+    if (!options?.force && !this.calendar.isTradingDay()) {
+      log.debug('skipped', { reason: 'not a trading day' });
+      log.done();
+      return;
+    }
     try {
       const indices = await this.ngx.getIndices();
       const tradeDate = this.calendar.todayWAT();
@@ -68,14 +84,18 @@ export class IngestionService {
           [idx.code, tradeDate, idx.value, idx.points, idx.week_change, idx.month_change, idx.year_change],
         );
       }
+      log.done({ count: indices.length, tradeDate });
     } catch (err) {
-      this.logger.warn(`Indices ingestion skipped: ${err instanceof Error ? err.message : err}`);
+      log.warn('skipped', { error: err instanceof Error ? err.message : String(err) });
+      log.done();
     }
   }
 
   async backfillSymbols(limit = 5): Promise<number> {
+    const log = logStart(this.logger, 'backfillSymbols', { limit });
     if (this.calendar.isTradingDay()) {
-      this.logger.log('Trading day — skipping backfill');
+      log.debug('skipped', { reason: 'trading day' });
+      log.done({ count: 0 });
       return 0;
     }
     const result = await this.db.query(
@@ -112,6 +132,7 @@ export class IngestionService {
       );
       count++;
     }
+    log.done({ count });
     return count;
   }
 

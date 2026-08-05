@@ -5,6 +5,7 @@ import { RedisService } from '../redis/redis.service';
 import { RiskPolicyService, ParamSet } from '../strategy/risk-policy.service';
 import { FillSimulatorService } from './fill-simulator.service';
 import { EventsGateway } from '../events/events.gateway';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class ExecutionService {
@@ -19,26 +20,37 @@ export class ExecutionService {
   ) {}
 
   async processSignals(signalIds: string[]): Promise<number> {
+    const log = logStart(this.logger, 'processSignals', { count: signalIds.length });
     let executed = 0;
     for (const signalId of signalIds) {
       try {
         const didExecute = await this.processSignal(signalId);
         if (didExecute) executed++;
       } catch (err) {
-        this.logger.error(`Execution failed for signal ${signalId}: ${err}`);
+        log.fail(err);
       }
     }
+    log.done({ executed, total: signalIds.length });
     return executed;
   }
 
   async processSignal(signalId: string): Promise<boolean> {
+    const log = logStart(this.logger, 'processSignal', { signalId });
     const signalResult = await this.db.query('SELECT * FROM signals WHERE id = $1', [signalId]);
     const signal = signalResult.rows[0];
-    if (!signal) return false;
+    if (!signal) {
+      log.debug('skipped', { reason: 'signal not found' });
+      log.done({ executed: false });
+      return false;
+    }
 
     const portfolioResult = await this.db.query(`SELECT * FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1`);
     const portfolio = portfolioResult.rows[0];
-    if (!portfolio) return false;
+    if (!portfolio) {
+      log.debug('skipped', { reason: 'portfolio not found' });
+      log.done({ executed: false });
+      return false;
+    }
 
     const paramResult = await this.db.query('SELECT * FROM strategy_param_sets WHERE id = $1', [portfolio.strategy_param_set_id]);
     const paramSet = paramResult.rows[0] as ParamSet;
@@ -74,10 +86,17 @@ export class ExecutionService {
 
     await this.db.query('UPDATE signals SET risk_policy_result = $1 WHERE id = $2', [result, signalId]);
 
-    if (result !== 'APPROVED' || quantity <= 0) return false;
+    if (result !== 'APPROVED' || quantity <= 0) {
+      log.done({ executed: false, riskPolicyResult: result });
+      return false;
+    }
 
     const currentPrice = prices[signal.symbol as string];
-    if (!currentPrice) return false;
+    if (!currentPrice) {
+      log.debug('skipped', { reason: 'no current price', symbol: signal.symbol });
+      log.done({ executed: false });
+      return false;
+    }
 
     await this.db.transaction(async (client) => {
       await this.executeTrade(client, portfolio, signal, quantity, currentPrice);
@@ -86,6 +105,7 @@ export class ExecutionService {
     await this.db.query('UPDATE signals SET executed = true WHERE id = $1', [signalId]);
     await this.redis.publish('trades:new', JSON.stringify({ signalId, symbol: signal.symbol }));
     this.events.broadcastTrade({ signalId, symbol: signal.symbol, side: signal.action, quantity });
+    log.done({ executed: true, symbol: signal.symbol, side: signal.action, quantity });
     return true;
   }
 

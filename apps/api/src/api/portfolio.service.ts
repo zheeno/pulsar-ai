@@ -1,17 +1,24 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { RedisService } from '../redis/redis.service';
+import { logStart } from '../common/log.util';
 
 @Injectable()
 export class PortfolioService {
+  private readonly logger = new Logger(PortfolioService.name);
+
   constructor(
     private readonly db: DatabaseService,
     private readonly redis: RedisService,
   ) {}
 
   async getPortfolio(id: string) {
+    const log = logStart(this.logger, 'getPortfolio', { id });
     const portfolio = await this.db.query('SELECT * FROM sandbox_portfolios WHERE id = $1', [id]);
-    if (!portfolio.rows[0]) return null;
+    if (!portfolio.rows[0]) {
+      log.done({ found: false });
+      return null;
+    }
 
     const positions = await this.db.query('SELECT * FROM sandbox_positions WHERE portfolio_id = $1', [id]);
     let marketValue = 0;
@@ -32,6 +39,7 @@ export class PortfolioService {
       [id, today],
     );
 
+    log.done({ totalEquity, positions: enrichedPositions.length });
     return {
       portfolio: portfolio.rows[0],
       positions: enrichedPositions,
@@ -42,17 +50,22 @@ export class PortfolioService {
   }
 
   async getPerformance(id: string) {
+    const log = logStart(this.logger, 'getPerformance', { id });
     const r = await this.db.query(
       `SELECT snapshot_date, total_equity, pnl_daily, pnl_cumulative, benchmark_asi_change_pct, drawdown_pct
        FROM daily_performance_snapshot WHERE portfolio_id = $1 ORDER BY snapshot_date`,
       [id],
     );
+    log.done({ snapshots: r.rows.length });
     return r.rows;
   }
 
   async getDefaultPortfolioId(): Promise<string | null> {
+    const log = logStart(this.logger, 'getDefaultPortfolioId');
     const r = await this.db.query(`SELECT id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1`);
-    return r.rows[0]?.id || null;
+    const id = r.rows[0]?.id || null;
+    log.done({ id });
+    return id;
   }
 
   private async getPrice(symbol: string): Promise<number> {
