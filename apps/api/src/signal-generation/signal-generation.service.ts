@@ -19,8 +19,12 @@ export class SignalGenerationService {
   ) {}
 
   async generateForPortfolio(portfolioId?: string): Promise<string[]> {
-    const paramSet = await this.getActiveParamSet(portfolioId) as { allowed_symbols: string[] | null };
-    const symbols = paramSet.allowed_symbols || [];
+    const paramSet = await this.getActiveParamSet(portfolioId);
+    if (!paramSet) {
+      this.logger.warn('No active strategy param set — skipping signal generation');
+      return [];
+    }
+    const symbols = (paramSet.allowed_symbols as string[] | null) || [];
     const signalIds: string[] = [];
 
     for (const symbol of symbols) {

@@ -126,12 +126,13 @@ export class ExecutionService {
         );
       }
     } else {
-      cashBalance += notional - fee;
       const posResult = await client.query(
         'SELECT * FROM sandbox_positions WHERE portfolio_id = $1 AND symbol = $2',
         [portfolio.id, signal.symbol],
       );
       const pos = posResult.rows[0];
+      if (!pos) throw new Error(`No position to sell for ${signal.symbol}`);
+      cashBalance += notional - fee;
       const newQty = Number(pos.quantity) - quantity;
       if (newQty <= 0) {
         await client.query('DELETE FROM sandbox_positions WHERE id = $1', [pos.id]);
