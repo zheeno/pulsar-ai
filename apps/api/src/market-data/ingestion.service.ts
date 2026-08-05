@@ -15,48 +15,61 @@ export class IngestionService {
     private readonly calendar: TradingCalendarService,
   ) {}
 
-  async ingestStocks(): Promise<number> {
-    const force = process.env.FORCE_INGEST === 'true';
+  async ingestStocks(options?: { force?: boolean }): Promise<number> {
+    const force = options?.force || process.env.FORCE_INGEST === 'true';
     if (!force && !this.calendar.isMarketOpen() && !this.isPostCloseWindow()) {
       this.logger.log('Market closed — skipping stock ingestion');
       return 0;
     }
-    const stocks = await this.ngx.getStocks();
-    const tradeDate = this.calendar.todayWAT();
-    let count = 0;
-    for (const stock of stocks) {
-      await this.upsertStock(stock, tradeDate);
-      count++;
-    }
-    this.logger.log(`Ingested ${count} stocks for ${tradeDate}`);
-    return count;
-  }
-
-  async ingestMarket(): Promise<void> {
-    if (!this.calendar.isTradingDay()) return;
-    const market = await this.ngx.getMarket();
-    const tradeDate = this.calendar.todayWAT();
-    if (market.asi) {
-      await this.db.query(
-        `INSERT INTO index_history (index_code, trade_date, value, points)
-         VALUES ('ASI', $1, $2, $3)
-         ON CONFLICT (index_code, trade_date) DO UPDATE SET value = EXCLUDED.value`,
-        [tradeDate, market.asi.value, market.asi.change_percent || 0],
-      );
+    try {
+      const stocks = await this.ngx.getStocks();
+      const tradeDate = this.calendar.todayWAT();
+      let count = 0;
+      for (const stock of stocks) {
+        await this.upsertStock(stock, tradeDate);
+        count++;
+      }
+      this.logger.log(`Ingested ${count} stocks for ${tradeDate}`);
+      return count;
+    } catch (err) {
+      this.logger.warn(`Stock ingestion skipped: ${err instanceof Error ? err.message : err}`);
+      return 0;
     }
   }
 
-  async ingestIndices(): Promise<void> {
-    if (!this.calendar.isTradingDay()) return;
-    const indices = await this.ngx.getIndices();
-    const tradeDate = this.calendar.todayWAT();
-    for (const idx of indices) {
-      await this.db.query(
-        `INSERT INTO index_history (index_code, trade_date, value, points, week_change, month_change, year_change)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (index_code, trade_date) DO UPDATE SET value = EXCLUDED.value`,
-        [idx.code, tradeDate, idx.value, idx.points, idx.week_change, idx.month_change, idx.year_change],
-      );
+  async ingestMarket(options?: { force?: boolean }): Promise<void> {
+    if (!options?.force && !this.calendar.isTradingDay()) return;
+    try {
+      const market = await this.ngx.getMarket();
+      const tradeDate = this.calendar.todayWAT();
+      if (market.asi) {
+        await this.db.query(
+          `INSERT INTO index_history (index_code, trade_date, value, points)
+           VALUES ('ASI', $1, $2, $3)
+           ON CONFLICT (index_code, trade_date) DO UPDATE SET value = EXCLUDED.value`,
+          [tradeDate, market.asi.value, market.asi.change_percent || 0],
+        );
+      }
+    } catch (err) {
+      this.logger.warn(`Market ingestion skipped: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  async ingestIndices(options?: { force?: boolean }): Promise<void> {
+    if (!options?.force && !this.calendar.isTradingDay()) return;
+    try {
+      const indices = await this.ngx.getIndices();
+      const tradeDate = this.calendar.todayWAT();
+      for (const idx of indices) {
+        await this.db.query(
+          `INSERT INTO index_history (index_code, trade_date, value, points, week_change, month_change, year_change)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (index_code, trade_date) DO UPDATE SET value = EXCLUDED.value`,
+          [idx.code, tradeDate, idx.value, idx.points, idx.week_change, idx.month_change, idx.year_change],
+        );
+      }
+    } catch (err) {
+      this.logger.warn(`Indices ingestion skipped: ${err instanceof Error ? err.message : err}`);
     }
   }
 

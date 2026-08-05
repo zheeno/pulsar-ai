@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
+import { Body, Controller, Get, Logger, Post } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
 import { IngestionService } from '../market-data/ingestion.service';
 import { SignalGenerationService } from '../signal-generation/signal-generation.service';
@@ -9,6 +9,8 @@ import { PortfolioService } from './portfolio.service';
 
 @Controller()
 export class HealthController {
+  private readonly logger = new Logger(HealthController.name);
+
   constructor(
     private readonly ingestion: IngestionService,
     private readonly signals: SignalGenerationService,
@@ -24,15 +26,33 @@ export class HealthController {
 
   @Post('cycle/run')
   async runCycle() {
-    const ingested = await this.ingestion.ingestStocks();
-    await this.ingestion.ingestMarket();
-    await this.ingestion.ingestIndices();
+    const forceIngest = { force: true };
+
+    const ingested = await this.ingestion.ingestStocks(forceIngest);
+    await this.ingestion.ingestMarket(forceIngest);
+    await this.ingestion.ingestIndices(forceIngest);
+
     const signalIds = await this.signals.generateForPortfolio();
     const executed = await this.execution.processSignals(signalIds);
-    await this.snapshot.createSnapshot();
+
+    try {
+      await this.snapshot.createSnapshot();
+    } catch (err) {
+      this.logger.warn(`Daily snapshot failed: ${err instanceof Error ? err.message : err}`);
+    }
+
     const portfolioId = await this.portfolio.getDefaultPortfolioId();
     const portfolio = portfolioId ? await this.portfolio.getPortfolio(portfolioId) : null;
-    return { ingested, signals: signalIds.length, executed, portfolio };
+
+    return {
+      ingested,
+      signals: signalIds.length,
+      executed,
+      portfolio,
+      warnings: ingested === 0
+        ? ['Live market ingestion failed or was skipped — cycle continued using existing price data.']
+        : [],
+    };
   }
 }
 

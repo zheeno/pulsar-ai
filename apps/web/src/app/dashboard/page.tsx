@@ -41,7 +41,12 @@ export default function DashboardPage() {
   async function runCycle() {
     const res = await apiFetch('/cycle/run', { method: 'POST' });
     const result = await res.json();
-    alert(`Cycle complete: ${result.signals} signals, ${result.executed} executed`);
+    if (!res.ok) {
+      alert(`Cycle failed: ${result.message || res.statusText}`);
+      return;
+    }
+    const warning = result.warnings?.length ? `\n\nNote: ${result.warnings[0]}` : '';
+    alert(`Cycle complete: ${result.signals} signals, ${result.executed} executed${warning}`);
     loadData();
   }
 
