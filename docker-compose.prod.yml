@@ -41,6 +41,7 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       CORS_ORIGIN: ${CORS_ORIGIN:-https://pulsar.antimony.com.ng}
+      WEB_DOMAIN: ${WEB_DOMAIN:-pulsar.antimony.com.ng}
       API_PORT: "3001"
     depends_on:
       postgres:

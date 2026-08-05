@@ -32,14 +32,18 @@ if ! command -v nginx &>/dev/null; then
 fi
 
 log "Installing nginx site configs..."
-sudo cp "${PROJECT_DIR}/deploy/nginx/host/pulsar-cors-map.conf" /etc/nginx/conf.d/pulsar-cors-map.conf
 sudo cp "${PROJECT_DIR}/deploy/nginx/host/pulsar-web.conf" "/etc/nginx/sites-available/${WEB_DOMAIN}.conf"
 sudo cp "${PROJECT_DIR}/deploy/nginx/host/pulsar-api.conf" "/etc/nginx/sites-available/${API_DOMAIN}.conf"
+
+# Remove legacy CORS map — CORS is now handled by the API (CORS_ORIGIN env)
+if [ -f /etc/nginx/conf.d/pulsar-cors-map.conf ]; then
+  sudo rm -f /etc/nginx/conf.d/pulsar-cors-map.conf
+  log "Removed legacy pulsar-cors-map.conf (CORS handled by API)."
+fi
 
 # Patch server_name if domains differ from defaults in template files
 sudo sed -i "s/pulsar.antimony.com.ng/${WEB_DOMAIN}/g" "/etc/nginx/sites-available/${WEB_DOMAIN}.conf"
 sudo sed -i "s/pulsar-api.antimony.com.ng/${API_DOMAIN}/g" "/etc/nginx/sites-available/${API_DOMAIN}.conf"
-sudo sed -i "s/pulsar.antimony.com.ng/${WEB_DOMAIN}/g" /etc/nginx/conf.d/pulsar-cors-map.conf
 sudo sed -i "s/127.0.0.1:3955/127.0.0.1:${WEB_HOST_PORT}/g" "/etc/nginx/sites-available/${WEB_DOMAIN}.conf"
 sudo sed -i "s/127.0.0.1:3954/127.0.0.1:${API_HOST_PORT}/g" "/etc/nginx/sites-available/${API_DOMAIN}.conf"
 sudo sed -i "s|/etc/letsencrypt/live/pulsar.antimony.com.ng/|/etc/letsencrypt/live/${WEB_DOMAIN}/|g" \
