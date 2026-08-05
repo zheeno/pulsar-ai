@@ -12,7 +12,20 @@
     "test": "turbo run test",
     "lint": "turbo run lint",
     "db:migrate": "node scripts/migrate.js",
-    "db:seed": "node scripts/seed.js"
+    "db:seed": "node scripts/seed.js",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "deploy": "bash deploy/deploy.sh",
+    "deploy:nginx": "bash deploy/setup-nginx.sh",
+    "deploy:build": "docker compose -p pulsar -f docker-compose.prod.yml build",
+    "deploy:up": "docker compose -p pulsar -f docker-compose.prod.yml up -d",
+    "deploy:down": "docker compose -p pulsar -f docker-compose.prod.yml down",
+    "deploy:restart": "docker compose -p pulsar -f docker-compose.prod.yml restart",
+    "deploy:ps": "docker compose -p pulsar -f docker-compose.prod.yml ps",
+    "deploy:logs": "docker compose -p pulsar -f docker-compose.prod.yml logs -f",
+    "deploy:logs:api": "docker compose -p pulsar -f docker-compose.prod.yml logs -f api",
+    "deploy:logs:web": "docker compose -p pulsar -f docker-compose.prod.yml logs -f web"
   },
   "devDependencies": {
     "turbo": "^2.3.3",
