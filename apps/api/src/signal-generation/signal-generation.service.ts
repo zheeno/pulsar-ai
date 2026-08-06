@@ -3,7 +3,7 @@ import { DatabaseService } from '../database/database.service';
 import { RedisService } from '../redis/redis.service';
 import { IndicatorService } from './indicator.service';
 import { LlmService } from './llm.service';
-import { PORTFOLIO_PROMPT_VERSION, PROMPT_VERSION } from '@ngx/shared';
+import { PORTFOLIO_PROMPT_VERSION, PROMPT_VERSION, TechnicalSnapshot } from '@ngx/shared';
 import { EventsGateway } from '../events/events.gateway';
 import { logStart } from '../common/log.util';
 
@@ -152,7 +152,7 @@ export class SignalGenerationService {
       rawResponse: string;
       modelName: string;
       symbolOverride?: string;
-      technical?: Record<string, unknown> | null;
+      technical?: TechnicalSnapshot | null;
       promptVersion: string;
     },
   ): Promise<string | null> {
