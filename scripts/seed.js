@@ -105,11 +105,15 @@ async function seed() {
     const paramResult = await client.query(
       `INSERT INTO strategy_param_sets (name, max_position_pct, max_daily_trades, stop_loss_pct,
         min_confidence_to_trade, max_daily_drawdown_pct, allowed_symbols, position_size_pct, is_active)
-       VALUES ('default-sandbox', 0.10, 5, 0.05, 0.65, 0.03, $1, 0.05, true)
+       VALUES ('default-sandbox', 0.10, 5, 0.05, 0.65, 0.03, NULL, 0.05, true)
        RETURNING id`,
-      [CURATED_SYMBOLS.map((s) => s.symbol)],
     );
     paramId = paramResult.rows[0].id;
+  } else {
+    await client.query(
+      `UPDATE strategy_param_sets SET allowed_symbols = NULL WHERE id = $1`,
+      [paramId],
+    );
   }
 
   await client.query(`UPDATE strategy_param_sets SET is_active = false WHERE id != $1`, [paramId]);

@@ -1,7 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ChatOpenAI } from '@langchain/openai';
-import { LlmSignalOutputSchema, PROMPT_VERSION } from '@ngx/shared';
+import { LlmSignalOutputSchema, LlmPortfolioSignalOutputSchema, PROMPT_VERSION } from '@ngx/shared';
 import { buildSignalPrompt } from './prompt/v1.0.0';
+import { buildPortfolioSignalPrompt } from './prompt/v2.0.0';
 import { logStart } from '../common/log.util';
 
 @Injectable()
@@ -59,6 +60,92 @@ export class LlmService {
     log.warn('using fallback HOLD');
     log.done({ action: 'HOLD', confidence: 0 });
     return { output: fallback, prompt, rawResponse, modelName };
+  }
+
+  async generatePortfolioSignals(context: Record<string, unknown>): Promise<{
+    output: { signals: { symbol: string; action: 'BUY' | 'SELL' | 'HOLD'; confidence: number; rationale: string }[] };
+    prompt: string;
+    rawResponse: string;
+    modelName: string;
+  }> {
+    const log = logStart(this.logger, 'generatePortfolioSignals', { mock: this.useMock });
+    const prompt = buildPortfolioSignalPrompt(context);
+    const modelName = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+    if (this.useMock) {
+      const output = this.mockPortfolioResponse(context);
+      log.done({ count: output.signals.length, model: 'mock-llm' });
+      return { output, prompt, rawResponse: JSON.stringify(output), modelName: 'mock-llm' };
+    }
+
+    let rawResponse = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await this.model!.invoke(prompt);
+        rawResponse = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+        const parsed = this.parseJson(rawResponse);
+        const validated = LlmPortfolioSignalOutputSchema.parse(parsed);
+        log.done({ count: validated.signals.length, model: modelName });
+        return { output: validated, prompt, rawResponse, modelName };
+      } catch (err) {
+        log.warn(`portfolio parse attempt ${attempt + 1} failed`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const fallback = { signals: [] as { symbol: string; action: 'HOLD'; confidence: number; rationale: string }[] };
+    log.warn('using empty portfolio fallback');
+    log.done({ count: 0 });
+    return { output: fallback, prompt, rawResponse, modelName };
+  }
+
+  private mockPortfolioResponse(context: Record<string, unknown>): {
+    signals: { symbol: string; action: 'BUY' | 'SELL' | 'HOLD'; confidence: number; rationale: string }[];
+  } {
+    const universe = (context.universe as Array<{
+      symbol: string;
+      price?: number;
+      change_percent?: number;
+      volume?: number;
+    }>) || [];
+    const positions = (context.positions as Array<{ symbol: string; quantity: number }>) || [];
+    const maxPicks = Number(context.maxPicks || 5);
+    const signals: { symbol: string; action: 'BUY' | 'SELL' | 'HOLD'; confidence: number; rationale: string }[] = [];
+    const held = new Set(positions.map((p) => p.symbol));
+
+    const ranked = [...universe]
+      .filter((s) => s.price && s.price > 0)
+      .sort((a, b) => (b.change_percent || 0) - (a.change_percent || 0));
+
+    for (const stock of ranked.filter((s) => (s.change_percent || 0) > 0.5).slice(0, 2)) {
+      signals.push({
+        symbol: stock.symbol,
+        action: 'BUY',
+        confidence: 0.7,
+        rationale: `${stock.symbol} up ${(stock.change_percent || 0).toFixed(2)}% with price ${stock.price}`,
+      });
+    }
+
+    for (const stock of ranked.filter((s) => (s.change_percent || 0) < -1 && held.has(s.symbol)).slice(0, 1)) {
+      signals.push({
+        symbol: stock.symbol,
+        action: 'SELL',
+        confidence: 0.66,
+        rationale: `${stock.symbol} down ${(stock.change_percent || 0).toFixed(2)}% while held in portfolio`,
+      });
+    }
+
+    if (signals.length === 0 && ranked[0]) {
+      signals.push({
+        symbol: ranked[0].symbol,
+        action: 'HOLD',
+        confidence: 0.45,
+        rationale: `No strong setups; ${ranked[0].symbol} is the top mover at ${(ranked[0].change_percent || 0).toFixed(2)}%`,
+      });
+    }
+
+    return { signals: signals.slice(0, maxPicks) };
   }
 
   private parseJson(text: string): unknown {

@@ -28,4 +28,18 @@ describe('LlmService', () => {
     });
     expect(result.output.action).toBe('HOLD');
   });
+
+  it('should pick symbols from the full universe in portfolio mode', async () => {
+    const result = await service.generatePortfolioSignals({
+      maxPicks: 3,
+      universe: [
+        { symbol: 'DANGCEM', price: 1015, change_percent: 2.5, volume: 100000 },
+        { symbol: 'MTNN', price: 845, change_percent: -1.2, volume: 50000 },
+        { symbol: 'GTCO', price: 46, change_percent: 0.1, volume: 20000 },
+      ],
+      positions: [],
+    });
+    expect(result.output.signals.length).toBeGreaterThan(0);
+    expect(result.output.signals[0].symbol).toBeTruthy();
+  });
 });

@@ -47,7 +47,7 @@ export class BacktestService {
     const log = logStart(this.logger, 'runAsync', { runId, startDate, endDate });
     const paramResult = await this.db.query('SELECT * FROM strategy_param_sets WHERE id = $1', [paramSetId]);
     const paramSet = paramResult.rows[0] as ParamSet;
-    const symbols: string[] = paramSet.allowed_symbols || [];
+    const symbols = await this.resolveSymbols(paramSet);
 
     let cash = 10000000;
     const positions: Record<string, { quantity: number; avg_cost: number }> = {};
@@ -154,6 +154,14 @@ export class BacktestService {
       ? ((currentPrice - prices[prices.length - 21]) / prices[prices.length - 21]) * 100
       : 0;
     return { currentPrice, momentum, rsi14: 50, sma50: currentPrice, sma200: currentPrice, volumeAnomaly: 1 };
+  }
+
+  private async resolveSymbols(paramSet: ParamSet): Promise<string[]> {
+    if (paramSet.allowed_symbols && paramSet.allowed_symbols.length > 0) {
+      return paramSet.allowed_symbols;
+    }
+    const r = await this.db.query('SELECT symbol FROM instruments WHERE is_active = true ORDER BY symbol');
+    return r.rows.map((row) => row.symbol as string);
   }
 
   private async getCachedLlm(symbol: string, date: string) {
