@@ -16,7 +16,12 @@ interface PortfolioData {
 export default function DashboardPage() {
   const [data, setData] = useState<PortfolioData | null>(null);
   const [performance, setPerformance] = useState<{ snapshot_date: string; total_equity: number }[]>([]);
-  const [usage, setUsage] = useState<{ daily: number; limit: number; remaining: number } | null>(null);
+  const [usage, setUsage] = useState<{
+    daily: number;
+    limit: number | null;
+    remaining: number | null;
+    authMode?: string;
+  } | null>(null);
 
   useEffect(() => {
     loadData();
@@ -74,7 +79,12 @@ export default function DashboardPage() {
 
         {usage && (
           <div style={{ background: '#1e293b', padding: 16, borderRadius: 8, marginBottom: 24 }}>
-            <span>NGX Pulse API: {usage.daily}/{usage.limit} requests today ({usage.remaining} remaining)</span>
+            <span>
+              NGX Pulse ({usage.authMode ?? 'api_key'}): {usage.daily}
+              {usage.limit != null
+                ? `/${usage.limit} requests today (${usage.remaining} remaining)`
+                : ' requests today (unlimited session auth)'}
+            </span>
           </div>
         )}
 

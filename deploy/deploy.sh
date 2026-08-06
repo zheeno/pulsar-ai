@@ -40,7 +40,7 @@ if [ ! -f .env ]; then
     sed -i "s/change-me-jwt-secret-min-32-chars/${JWT_SECRET}/" .env
     sed -i "s/change-me-strong-password/${PG_PASS}/" .env
     warn "Created .env from template with generated secrets."
-    warn "Review .env and set CERTBOT_EMAIL, NGX_PULSE_API_KEY, OPENAI_API_KEY"
+    warn "Review .env and set CERTBOT_EMAIL, NGX_PULSE session credentials (or API key), OPENAI_API_KEY"
   else
     err ".env not found. Copy .env.production.example to .env first."
     exit 1

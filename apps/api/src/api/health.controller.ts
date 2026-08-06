@@ -5,6 +5,7 @@ import { SignalGenerationService } from '../signal-generation/signal-generation.
 import { ExecutionService } from '../execution/execution.service';
 import { DailySnapshotService } from '../orchestrator/daily-snapshot.service';
 import { RateLimitService } from '../market-data/rate-limit.service';
+import { NgxPulseClient } from '../market-data/ngx-pulse.client';
 import { PortfolioService } from './portfolio.service';
 import { logStart } from '../common/log.util';
 
@@ -80,12 +81,16 @@ export class AuthController {
 export class UsageController {
   private readonly logger = new Logger(UsageController.name);
 
-  constructor(private readonly rateLimit: RateLimitService) {}
+  constructor(
+    private readonly rateLimit: RateLimitService,
+    private readonly ngx: NgxPulseClient,
+  ) {}
 
   @Get('ngx-pulse')
   async getUsage() {
     const log = logStart(this.logger, 'getUsage');
-    const usage = await this.rateLimit.getUsageToday();
+    const authMode = this.ngx.getAuthMode();
+    const usage = await this.rateLimit.getUsageToday(authMode);
     log.done(usage);
     return usage;
   }

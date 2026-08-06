@@ -35,22 +35,40 @@ export class RateLimitService {
     return allowed;
   }
 
-  async recordRequest(endpoint: string): Promise<void> {
-    const log = logStart(this.logger, 'recordRequest', { endpoint });
+  async recordRequest(endpoint: string, authMode: 'session' | 'api_key' | 'mock' = 'api_key'): Promise<void> {
+    const log = logStart(this.logger, 'recordRequest', { endpoint, authMode });
     const dailyKey = this.dailyKey();
     const minuteKey = this.minuteKey();
     await this.redis.incr(dailyKey);
     await this.redis.expire(dailyKey, 86400);
     await this.redis.incr(minuteKey);
     await this.redis.expire(minuteKey, 120);
-    await this.db.query('INSERT INTO ngx_pulse_usage_log (endpoint) VALUES ($1)', [endpoint]);
+    await this.db.query(
+      'INSERT INTO ngx_pulse_usage_log (endpoint) VALUES ($1)',
+      [`${authMode}:${endpoint}`],
+    );
     log.done();
   }
 
-  async getUsageToday(): Promise<{ daily: number; limit: number; remaining: number }> {
-    const log = logStart(this.logger, 'getUsageToday');
+  async getUsageToday(authMode: 'session' | 'api_key' | 'mock' = 'api_key'): Promise<{
+    daily: number;
+    limit: number | null;
+    remaining: number | null;
+    authMode: string;
+  }> {
+    const log = logStart(this.logger, 'getUsageToday', { authMode });
     const daily = Number(await this.redis.get(this.dailyKey()) || 0);
-    const usage = { daily, limit: DAILY_LIMIT, remaining: Math.max(0, DAILY_LIMIT - daily) };
+    if (authMode === 'session') {
+      const usage = { daily, limit: null, remaining: null, authMode };
+      log.done(usage);
+      return usage;
+    }
+    const usage = {
+      daily,
+      limit: DAILY_LIMIT,
+      remaining: Math.max(0, DAILY_LIMIT - daily),
+      authMode,
+    };
     log.done(usage);
     return usage;
   }

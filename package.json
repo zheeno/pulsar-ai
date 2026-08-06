@@ -13,6 +13,7 @@
     "lint": "turbo run lint",
     "db:migrate": "node scripts/migrate.js",
     "db:seed": "node scripts/seed.js",
+    "ngx-pulse:session-test": "node scripts/ngx-pulse-session-test.js",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f",
