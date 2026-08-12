@@ -18,6 +18,8 @@ mod seed;
 mod settings;
 mod signals;
 
+use std::path::PathBuf;
+
 use tauri::Manager;
 
 use app_state::AppState;
@@ -25,9 +27,46 @@ use db::Database;
 use seed::SeedService;
 use settings::get_settings;
 
+/// Load repo-root `.env` for Pulse Supabase / base URL (email+password stay user-entered).
+fn load_dotenv() {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    for start in candidates {
+        let mut path = start;
+        for _ in 0..6 {
+            let candidate = path.join(".env");
+            if candidate.is_file() {
+                match dotenvy::from_path(&candidate) {
+                    Ok(_) => {
+                        tracing::info!("loaded env from {}", candidate.display());
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to load {}: {e}", candidate.display());
+                    }
+                }
+            }
+            if !path.pop() {
+                break;
+            }
+        }
+    }
+    tracing::warn!("no .env found; NGX_PULSE_SUPABASE_* must be set in the process environment");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ngx_pulse=debug")),
+        )
+        .init();
+    load_dotenv();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -53,8 +92,10 @@ pub fn run() {
             commands::ping,
             commands::settings_get,
             commands::settings_set,
+            commands::logout,
             commands::test_pulse_login,
             commands::test_llm,
+            commands::complete_onboarding,
             commands::portfolio_default,
             commands::portfolio_performance,
             commands::usage_ngx_pulse,

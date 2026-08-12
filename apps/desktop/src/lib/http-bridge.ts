@@ -154,7 +154,11 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         pulseApiKey?: string;
         llmApiKey?: string;
       };
-      saveSettingsLocal({ ...loadSettings(), ...(payload.settings || {}) });
+      const current = loadSettings();
+      const next = { ...current, ...(payload.settings || {}) };
+      // Match Rust: only complete_onboarding may flip this to true.
+      next.onboardingComplete = current.onboardingComplete;
+      saveSettingsLocal(next);
       saveSecrets({
         pulsePassword: payload.pulsePassword,
         pulseApiKey: payload.pulseApiKey,
@@ -163,8 +167,42 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       return undefined as T;
     }
 
-    case 'test_pulse_login':
+    case 'logout': {
+      const next = {
+        ...loadSettings(),
+        pulseEmail: undefined,
+        pulseConfigured: false,
+        llmConfigured: false,
+        onboardingComplete: false,
+      };
+      delete next.pulseEmail;
+      saveSettingsLocal(next);
+      localStorage.removeItem(SECRETS_KEY);
       return undefined as T;
+    }
+
+    case 'test_pulse_login':
+      return {
+        ok: false,
+        authMode: 'mock',
+        supabaseHost: null,
+        pulseBaseUrl: 'https://ngxpulse.ng/api',
+        hasEmail: Boolean(loadSettings().pulseEmail),
+        email: loadSettings().pulseEmail ?? null,
+        hasPassword: Boolean(loadSecrets().pulsePassword),
+        hasAnonKey: false,
+        loginUrl: null,
+        httpStatus: null,
+        tokenExpiresAt: null,
+        tokenPreview: null,
+        message: 'Browser mock — use Tauri desktop for real Pulse auth',
+        logs: ['browser-mock: no network call'],
+      } as T;
+
+    case 'complete_onboarding':
+      throw new Error(
+        'complete_onboarding requires Tauri desktop (Pulse session + LLM verification)',
+      );
 
     case 'test_llm':
       return { message: 'OK (browser mock — use Tauri for real LLM)' } as T;

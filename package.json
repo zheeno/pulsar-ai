@@ -11,7 +11,7 @@
     "dev": "npm run desktop:ui",
     "test": "turbo run test",
     "lint": "turbo run lint",
-    "desktop:dev": "export PATH=\"$HOME/.cargo/bin:$PATH\" && npm run desktop:dev -w @ngx/desktop",
+    "desktop:dev": "export PATH=\"$HOME/.cargo/bin:$PATH\" RUST_LOG=\"info,ngx_pulse=debug\" && npm run desktop:dev -w @ngx/desktop",
     "desktop:ui": "npm run dev -w @ngx/desktop",
     "desktop:build": "export PATH=\"$HOME/.cargo/bin:$PATH\" && npm run desktop:build -w @ngx/desktop",
     "agent:build": "npm run build -w @ngx/agent",

@@ -12,7 +12,9 @@ use crate::portfolio::PortfolioService;
 use crate::rate_limit::RateLimiter;
 use crate::runtime_util::block_on_local;
 use crate::secrets::{delete_secret, get_secret, set_secret, SECRET_LLM_API_KEY, SECRET_PULSE_API_KEY, SECRET_PULSE_PASSWORD};
-use crate::settings::{get_settings, save_settings, AppSettings};
+use crate::settings::{
+    clear_session_settings, get_settings, mark_onboarding_complete, save_settings, AppSettings,
+};
 use crate::signals::{run_cycle, SignalGenerationService};
 
 #[derive(Debug, Deserialize)]
@@ -60,21 +62,40 @@ pub fn settings_set(payload: SettingsUpdate, state: State<'_, Arc<AppState>>) ->
     if let Some(key) = payload.llm_api_key {
         set_secret(SECRET_LLM_API_KEY, &key).map_err(|e| e.to_string())?;
     }
+
+    // onboarding_complete may only be set by complete_onboarding (or cleared by logout).
+    let mut settings = payload.settings;
+    let current = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+    settings.onboarding_complete = current.onboarding_complete;
+
     state
         .db
-        .with_conn(|conn| save_settings(conn, &payload.settings))
+        .with_conn(|conn| save_settings(conn, &settings))
+        .map_err(|e| e.to_string())
+}
+
+/// Clear Pulse + LLM secrets and session flags; keeps portfolio / market data.
+#[tauri::command]
+pub fn logout(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // Best-effort keychain clears — missing entries should not block logout.
+    let _ = delete_secret(SECRET_PULSE_PASSWORD);
+    let _ = delete_secret(SECRET_PULSE_API_KEY);
+    let _ = delete_secret(SECRET_LLM_API_KEY);
+    state
+        .db
+        .with_conn(clear_session_settings)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn test_pulse_login(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn test_pulse_login(state: State<'_, Arc<AppState>>) -> Result<crate::ngx::PulseAuthReport, String> {
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
         let password = get_secret(SECRET_PULSE_PASSWORD).map_err(|e| e.to_string())?;
         let api_key = get_secret(SECRET_PULSE_API_KEY).map_err(|e| e.to_string())?;
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
-        block_on_local(client.test_login()).map_err(|e| e.to_string())
+        Ok(block_on_local(client.diagnose_login()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -84,6 +105,39 @@ pub async fn test_pulse_login(state: State<'_, Arc<AppState>>) -> Result<(), Str
 pub async fn test_llm(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
     state.agent.test_llm(&settings).await.map_err(|e| e.to_string())
+}
+
+/// Verify Pulse session + LLM, then mark onboarding complete. Rejects mock / failed auth.
+#[tauri::command]
+pub async fn complete_onboarding(state: State<'_, Arc<AppState>>) -> Result<crate::ngx::PulseAuthReport, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(SECRET_PULSE_PASSWORD).map_err(|e| e.to_string())?;
+        let api_key = get_secret(SECRET_PULSE_API_KEY).map_err(|e| e.to_string())?;
+        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+        let report = block_on_local(client.diagnose_login());
+        if !report.ok || report.auth_mode != "session" {
+            return Err(format!(
+                "Pulse session required before completing setup: {}",
+                report.message
+            ));
+        }
+
+        state
+            .agent
+            .test_llm_sync(&settings)
+            .map_err(|e| format!("LLM verification failed: {e}"))?;
+
+        state
+            .db
+            .with_conn(mark_onboarding_complete)
+            .map_err(|e| e.to_string())?;
+
+        Ok(report)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

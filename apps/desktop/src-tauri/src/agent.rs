@@ -69,12 +69,16 @@ impl AgentBridge {
         if api_key.is_empty() {
             return Err(anyhow!("LLM API key not configured"));
         }
-        Ok(json!({
+        let mut llm = json!({
             "provider": settings.llm_provider,
             "model": settings.llm_model,
             "apiKey": api_key,
-            "baseUrl": settings.llm_base_url,
-        }))
+        });
+        // Zod optional() rejects null — omit empty/unset baseUrl for OpenAI defaults.
+        if let Some(url) = settings.llm_base_url.as_ref().filter(|u| !u.is_empty()) {
+            llm["baseUrl"] = json!(url);
+        }
+        Ok(llm)
     }
 
     fn call(&self, mut payload: Value) -> Result<Value> {

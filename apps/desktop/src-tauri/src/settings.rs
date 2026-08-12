@@ -133,3 +133,20 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Clear user session fields after logout (keeps LLM provider/model preferences and portfolio DB).
+pub fn clear_session_settings(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = 'pulse_email'", [])?;
+    set_setting(conn, "pulse_configured", "false")?;
+    set_setting(conn, "llm_configured", "false")?;
+    set_setting(conn, "onboarding_complete", "false")?;
+    Ok(())
+}
+
+/// Mark setup complete after Pulse session + LLM verification succeed.
+pub fn mark_onboarding_complete(conn: &Connection) -> Result<()> {
+    set_setting(conn, "pulse_configured", "true")?;
+    set_setting(conn, "llm_configured", "true")?;
+    set_setting(conn, "onboarding_complete", "true")?;
+    Ok(())
+}

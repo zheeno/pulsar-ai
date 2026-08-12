@@ -7,7 +7,7 @@ export const LlmConfigSchema = z.object({
   provider: LlmProviderSchema,
   model: z.string().min(1),
   apiKey: z.string().min(1),
-  baseUrl: z.string().url().optional(),
+  baseUrl: z.string().url().nullish(),
 });
 export type LlmConfig = z.infer<typeof LlmConfigSchema>;
 

@@ -64,10 +64,45 @@ pub enum AuthMode {
     Mock,
 }
 
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::Session => "session",
+            AuthMode::ApiKey => "api_key",
+            AuthMode::Mock => "mock",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PulseAuthReport {
+    pub ok: bool,
+    pub auth_mode: String,
+    pub supabase_host: Option<String>,
+    pub pulse_base_url: String,
+    pub has_email: bool,
+    pub email: Option<String>,
+    pub has_password: bool,
+    pub has_anon_key: bool,
+    pub login_url: Option<String>,
+    pub http_status: Option<u16>,
+    pub token_expires_at: Option<i64>,
+    pub token_preview: Option<String>,
+    pub message: String,
+    pub logs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct SessionTokens {
     access_token: String,
     refresh_token: String,
     expires_at: i64,
+}
+
+fn token_preview(token: &str) -> String {
+    let prefix: String = token.chars().take(12).collect();
+    format!("{prefix}…")
 }
 
 pub struct NgxPulseClient {
@@ -84,10 +119,24 @@ pub struct NgxPulseClient {
 
 impl NgxPulseClient {
     pub fn from_settings(settings: &AppSettings, password: Option<String>, api_key: Option<String>) -> Self {
-        let auth_mode = if settings.pulse_supabase_url.is_some()
-            && settings.pulse_supabase_anon_key.is_some()
+        // Prefer process/.env config; fall back to legacy SQLite settings for older installs.
+        let supabase_url = std::env::var("NGX_PULSE_SUPABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| settings.pulse_supabase_url.clone());
+        let anon_key = std::env::var("NGX_PULSE_SUPABASE_ANON_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| settings.pulse_supabase_anon_key.clone());
+        let base_url = std::env::var("NGX_PULSE_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| settings.pulse_base_url.clone());
+
+        let auth_mode = if supabase_url.is_some()
+            && anon_key.is_some()
             && settings.pulse_email.is_some()
-            && password.is_some()
+            && password.as_ref().is_some_and(|p| !p.is_empty())
         {
             AuthMode::Session
         } else if api_key.as_ref().is_some_and(|k| !k.is_empty()) {
@@ -98,11 +147,11 @@ impl NgxPulseClient {
 
         Self {
             http: Client::new(),
-            base_url: settings.pulse_base_url.clone(),
+            base_url,
             auth_mode,
             api_key,
-            supabase_url: settings.pulse_supabase_url.clone(),
-            anon_key: settings.pulse_supabase_anon_key.clone(),
+            supabase_url,
+            anon_key,
             email: settings.pulse_email.clone(),
             password,
             tokens: Arc::new(Mutex::new(None)),
@@ -113,12 +162,183 @@ impl NgxPulseClient {
         self.auth_mode
     }
 
-    pub async fn test_login(&self) -> Result<()> {
-        if self.auth_mode == AuthMode::Mock {
-            return Ok(());
+    /// Attempt session/API-key auth and return a diagnostic report (safe for UI + logs).
+    pub async fn diagnose_login(&self) -> PulseAuthReport {
+        let mut logs = Vec::new();
+        let supabase_host = self
+            .supabase_url
+            .as_ref()
+            .and_then(|u| reqwest::Url::parse(u).ok())
+            .map(|u| u.host_str().unwrap_or("").to_string())
+            .filter(|s| !s.is_empty());
+        let login_url = self.supabase_url.as_ref().map(|u| {
+            format!("{}/auth/v1/token?grant_type=password", u.trim_end_matches('/'))
+        });
+
+        logs.push(format!(
+            "auth_mode={} base_url={} supabase_host={:?} email={:?} has_password={} has_anon_key={}",
+            self.auth_mode.as_str(),
+            self.base_url,
+            supabase_host,
+            self.email,
+            self.password.as_ref().is_some_and(|p| !p.is_empty()),
+            self.anon_key.as_ref().is_some_and(|k| !k.is_empty()),
+        ));
+
+        match self.auth_mode {
+            AuthMode::Mock => {
+                let message = String::from(
+                    "Auth mode is mock — missing session ingredients (env Supabase URL/anon key, Pulse email, and/or keychain password). No network call was made.",
+                );
+                logs.push(message.clone());
+                tracing::warn!(target: "ngx_pulse", "{}", message);
+                return PulseAuthReport {
+                    ok: false,
+                    auth_mode: self.auth_mode.as_str().into(),
+                    supabase_host,
+                    pulse_base_url: self.base_url.clone(),
+                    has_email: self.email.is_some(),
+                    email: self.email.clone(),
+                    has_password: self.password.as_ref().is_some_and(|p| !p.is_empty()),
+                    has_anon_key: self.anon_key.as_ref().is_some_and(|k| !k.is_empty()),
+                    login_url,
+                    http_status: None,
+                    token_expires_at: None,
+                    token_preview: None,
+                    message,
+                    logs,
+                };
+            }
+            AuthMode::ApiKey => {
+                logs.push("Using API key auth (not Supabase password grant)".into());
+                return match self.get_access_token().await {
+                    Ok(token) => {
+                        let preview = token_preview(&token);
+                        logs.push(format!("API key present, preview={preview}"));
+                        PulseAuthReport {
+                            ok: true,
+                            auth_mode: self.auth_mode.as_str().into(),
+                            supabase_host,
+                            pulse_base_url: self.base_url.clone(),
+                            has_email: self.email.is_some(),
+                            email: self.email.clone(),
+                            has_password: false,
+                            has_anon_key: self.anon_key.is_some(),
+                            login_url: None,
+                            http_status: None,
+                            token_expires_at: None,
+                            token_preview: Some(preview),
+                            message: "API key auth configured".into(),
+                            logs,
+                        }
+                    }
+                    Err(e) => PulseAuthReport {
+                        ok: false,
+                        auth_mode: self.auth_mode.as_str().into(),
+                        supabase_host,
+                        pulse_base_url: self.base_url.clone(),
+                        has_email: self.email.is_some(),
+                        email: self.email.clone(),
+                        has_password: false,
+                        has_anon_key: self.anon_key.is_some(),
+                        login_url: None,
+                        http_status: None,
+                        token_expires_at: None,
+                        token_preview: None,
+                        message: e.to_string(),
+                        logs,
+                    },
+                };
+            }
+            AuthMode::Session => {}
         }
-        let _ = self.get_access_token().await?;
-        Ok(())
+
+        let Some(url) = login_url.clone() else {
+            let message = String::from("Missing Supabase URL");
+            logs.push(message.clone());
+            return PulseAuthReport {
+                ok: false,
+                auth_mode: self.auth_mode.as_str().into(),
+                supabase_host,
+                pulse_base_url: self.base_url.clone(),
+                has_email: self.email.is_some(),
+                email: self.email.clone(),
+                has_password: self.password.as_ref().is_some_and(|p| !p.is_empty()),
+                has_anon_key: self.anon_key.is_some(),
+                login_url: None,
+                http_status: None,
+                token_expires_at: None,
+                token_preview: None,
+                message,
+                logs,
+            };
+        };
+
+        tracing::info!(target: "ngx_pulse", method = "POST", %url, email = ?self.email, "pulse supabase password grant");
+        logs.push(format!("POST {url} (email={:?}, password=[redacted])", self.email));
+
+        match self.login_with_status().await {
+            Ok((status, tokens)) => {
+                let preview = token_preview(&tokens.access_token);
+                logs.push(format!(
+                    "response status={status} expires_at={} token_preview={preview}",
+                    tokens.expires_at
+                ));
+                tracing::info!(
+                    target: "ngx_pulse",
+                    %status,
+                    expires_at = tokens.expires_at,
+                    token_preview = %preview,
+                    "pulse login ok"
+                );
+                *self.tokens.lock().unwrap() = Some(tokens.clone());
+                PulseAuthReport {
+                    ok: true,
+                    auth_mode: self.auth_mode.as_str().into(),
+                    supabase_host,
+                    pulse_base_url: self.base_url.clone(),
+                    has_email: true,
+                    email: self.email.clone(),
+                    has_password: true,
+                    has_anon_key: true,
+                    login_url: Some(url),
+                    http_status: Some(status),
+                    token_expires_at: Some(tokens.expires_at),
+                    token_preview: Some(preview),
+                    message: "Supabase session login succeeded".into(),
+                    logs,
+                }
+            }
+            Err((status, err)) => {
+                logs.push(format!("response status={:?} error={err}", status));
+                tracing::error!(target: "ngx_pulse", ?status, error = %err, "pulse login failed");
+                PulseAuthReport {
+                    ok: false,
+                    auth_mode: self.auth_mode.as_str().into(),
+                    supabase_host,
+                    pulse_base_url: self.base_url.clone(),
+                    has_email: self.email.is_some(),
+                    email: self.email.clone(),
+                    has_password: self.password.as_ref().is_some_and(|p| !p.is_empty()),
+                    has_anon_key: self.anon_key.is_some(),
+                    login_url: Some(url),
+                    http_status: status,
+                    token_expires_at: None,
+                    token_preview: None,
+                    message: err,
+                    logs,
+                }
+            }
+        }
+    }
+
+    pub async fn test_login(&self) -> Result<()> {
+        let report = self.diagnose_login().await;
+        if report.ok {
+            Ok(())
+        } else {
+            Err(anyhow!(report.message))
+        }
     }
 
     pub async fn get_market_status(&self, conn: &rusqlite::Connection) -> Result<NgxMarketStatus> {
@@ -206,6 +426,14 @@ impl NgxPulseClient {
 
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let token = self.get_access_token().await?;
+        tracing::info!(
+            target: "ngx_pulse",
+            method = "GET",
+            %url,
+            auth_mode = self.auth_mode.as_str(),
+            token_preview = %token_preview(&token),
+            "pulse API request"
+        );
         let mut res = self
             .http
             .get(&url)
@@ -215,6 +443,7 @@ impl NgxPulseClient {
             .context("ngx pulse request")?;
 
         if res.status().as_u16() == 401 && self.auth_mode == AuthMode::Session {
+            tracing::warn!(target: "ngx_pulse", %url, "401 — clearing session and retrying");
             *self.tokens.lock().unwrap() = None;
             let retry_token = self.get_access_token().await?;
             res = self
@@ -226,15 +455,14 @@ impl NgxPulseClient {
                 .context("ngx pulse retry")?;
         }
 
-        let auth_str = match self.auth_mode {
-            AuthMode::Session => "session",
-            AuthMode::ApiKey => "api_key",
-            AuthMode::Mock => "mock",
-        };
+        let status = res.status();
+        tracing::info!(target: "ngx_pulse", %url, %status, endpoint, "pulse API response");
+
+        let auth_str = self.auth_mode.as_str();
         RateLimiter::record_request(conn, endpoint, auth_str)?;
 
-        if !res.status().is_success() {
-            return Err(anyhow!("NGX Pulse error: {}", res.status()));
+        if !status.is_success() {
+            return Err(anyhow!("NGX Pulse error: {status}"));
         }
 
         res.json().await.context("parse ngx response")
@@ -290,17 +518,43 @@ impl NgxPulseClient {
     }
 
     async fn login(&self) -> Result<()> {
-        let supabase_url = self.supabase_url.as_ref().context("supabase url")?;
-        let anon_key = self.anon_key.as_ref().context("anon key")?;
-        let email = self.email.as_ref().context("email")?;
-        let password = self.password.as_ref().context("password")?;
+        let (_, tokens) = self
+            .login_with_status()
+            .await
+            .map_err(|(_, e)| anyhow!(e))?;
+        *self.tokens.lock().unwrap() = Some(tokens);
+        Ok(())
+    }
 
-        let url = format!("{}/auth/v1/token?grant_type=password", supabase_url.trim_end_matches('/'));
+    async fn login_with_status(&self) -> Result<(u16, SessionTokens), (Option<u16>, String)> {
+        let supabase_url = self
+            .supabase_url
+            .as_ref()
+            .ok_or_else(|| (None, "supabase url missing".into()))?;
+        let anon_key = self
+            .anon_key
+            .as_ref()
+            .ok_or_else(|| (None, "anon key missing".into()))?;
+        let email = self
+            .email
+            .as_ref()
+            .ok_or_else(|| (None, "email missing".into()))?;
+        let password = self
+            .password
+            .as_ref()
+            .ok_or_else(|| (None, "password missing".into()))?;
+
+        let url = format!(
+            "{}/auth/v1/token?grant_type=password",
+            supabase_url.trim_end_matches('/')
+        );
         let body = serde_json::json!({
             "email": email,
             "password": password,
             "gotrue_meta_security": {}
         });
+
+        tracing::info!(target: "ngx_pulse", method = "POST", %url, %email, "sending password grant");
 
         let res = self
             .http
@@ -309,11 +563,13 @@ impl NgxPulseClient {
             .json(&body)
             .send()
             .await
-            .context("pulse login")?;
+            .map_err(|e| (None, format!("pulse login request failed: {e}")))?;
 
-        let tokens = parse_auth_response(res).await?;
-        *self.tokens.lock().unwrap() = Some(tokens);
-        Ok(())
+        let status = res.status().as_u16();
+        parse_auth_response(res)
+            .await
+            .map(|tokens| (status, tokens))
+            .map_err(|e| (Some(status), e.to_string()))
     }
 
     async fn refresh_session(&self, refresh_token: &str) -> Result<()> {
@@ -321,6 +577,8 @@ impl NgxPulseClient {
         let anon_key = self.anon_key.as_ref().context("anon key")?;
         let url = format!("{}/auth/v1/token?grant_type=refresh_token", supabase_url.trim_end_matches('/'));
         let body = serde_json::json!({ "refresh_token": refresh_token });
+
+        tracing::info!(target: "ngx_pulse", method = "POST", %url, "sending refresh grant");
 
         let res = self
             .http
@@ -330,6 +588,8 @@ impl NgxPulseClient {
             .send()
             .await
             .context("pulse refresh")?;
+
+        tracing::info!(target: "ngx_pulse", status = %res.status(), "pulse refresh response");
 
         let tokens = parse_auth_response(res).await?;
         *self.tokens.lock().unwrap() = Some(tokens);
