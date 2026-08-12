@@ -1,54 +1,58 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DatabaseService } from '../database/database.service';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
 import { StrategyParamSetSchema } from '@ngx/shared';
+import { StrategyParamSet, StrategyParamSetDocument } from '../database/schemas';
+import { docToApi, docsToApi } from '../database/mongo.util';
 import { logStart } from '../common/log.util';
 
 @Injectable()
 export class StrategyParamsService {
   private readonly logger = new Logger(StrategyParamsService.name);
 
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    @InjectModel(StrategyParamSet.name) private readonly paramModel: Model<StrategyParamSetDocument>,
+  ) {}
 
   async getActive(): Promise<Record<string, unknown> | null> {
     const log = logStart(this.logger, 'getActive');
-    const r = await this.db.query(`SELECT * FROM strategy_param_sets WHERE is_active = true LIMIT 1`);
-    const active = r.rows[0] || null;
-    log.done({ found: !!active, id: active?.id });
-    return active;
+    const active = await this.paramModel.findOne({ is_active: true }).exec();
+    const result = docToApi(active);
+    log.done({ found: !!result, id: result?.id });
+    return result;
   }
 
   async getAll(): Promise<Record<string, unknown>[]> {
     const log = logStart(this.logger, 'getAll');
-    const r = await this.db.query(`SELECT * FROM strategy_param_sets ORDER BY created_at DESC`);
-    log.done({ count: r.rows.length });
-    return r.rows;
+    const rows = await this.paramModel.find().sort({ created_at: -1 }).exec();
+    log.done({ count: rows.length });
+    return docsToApi(rows);
   }
 
   async create(data: unknown): Promise<Record<string, unknown>> {
     const log = logStart(this.logger, 'create');
     const parsed = StrategyParamSetSchema.parse(data);
-    const r = await this.db.query(
-      `INSERT INTO strategy_param_sets (name, max_position_pct, max_daily_trades, stop_loss_pct,
-        take_profit_pct, min_confidence_to_trade, max_daily_drawdown_pct, allowed_symbols, position_size_pct, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false) RETURNING *`,
-      [
-        parsed.name, parsed.max_position_pct, parsed.max_daily_trades, parsed.stop_loss_pct,
-        parsed.take_profit_pct ?? null, parsed.min_confidence_to_trade, parsed.max_daily_drawdown_pct,
-        parsed.allowed_symbols ?? null, parsed.position_size_pct ?? 0.05,
-      ],
-    );
-    log.done({ id: r.rows[0].id, name: parsed.name });
-    return r.rows[0];
+    const created = await this.paramModel.create({
+      name: parsed.name,
+      max_position_pct: parsed.max_position_pct,
+      max_daily_trades: parsed.max_daily_trades,
+      stop_loss_pct: parsed.stop_loss_pct,
+      take_profit_pct: parsed.take_profit_pct ?? null,
+      min_confidence_to_trade: parsed.min_confidence_to_trade,
+      max_daily_drawdown_pct: parsed.max_daily_drawdown_pct,
+      allowed_symbols: parsed.allowed_symbols ?? null,
+      position_size_pct: parsed.position_size_pct ?? 0.05,
+      is_active: false,
+    });
+    log.done({ id: created._id, name: parsed.name });
+    return docToApi(created)!;
   }
 
   async activate(id: string): Promise<Record<string, unknown>> {
     const log = logStart(this.logger, 'activate', { id });
-    await this.db.query(`UPDATE strategy_param_sets SET is_active = false`);
-    const r = await this.db.query(
-      `UPDATE strategy_param_sets SET is_active = true WHERE id = $1 RETURNING *`,
-      [id],
-    );
-    log.done({ id, name: r.rows[0]?.name });
-    return r.rows[0];
+    await this.paramModel.updateMany({}, { is_active: false }).exec();
+    const updated = await this.paramModel.findByIdAndUpdate(id, { is_active: true }, { new: true }).exec();
+    log.done({ id, name: updated?.name });
+    return docToApi(updated)!;
   }
 }

@@ -1,6 +1,18 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DatabaseService } from '../database/database.service';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import {
+  SandboxPortfolio,
+  SandboxPortfolioDocument,
+  SandboxPosition,
+  SandboxPositionDocument,
+  PriceHistory,
+  PriceHistoryDocument,
+  DailyPerformanceSnapshot,
+  DailyPerformanceSnapshotDocument,
+} from '../database/schemas';
 import { RedisService } from '../redis/redis.service';
+import { docToApi, docsToApi } from '../database/mongo.util';
 import { logStart } from '../common/log.util';
 
 @Injectable()
@@ -8,62 +20,57 @@ export class PortfolioService {
   private readonly logger = new Logger(PortfolioService.name);
 
   constructor(
-    private readonly db: DatabaseService,
+    @InjectModel(SandboxPortfolio.name) private readonly portfolioModel: Model<SandboxPortfolioDocument>,
+    @InjectModel(SandboxPosition.name) private readonly positionModel: Model<SandboxPositionDocument>,
+    @InjectModel(PriceHistory.name) private readonly priceModel: Model<PriceHistoryDocument>,
+    @InjectModel(DailyPerformanceSnapshot.name) private readonly snapshotModel: Model<DailyPerformanceSnapshotDocument>,
     private readonly redis: RedisService,
   ) {}
 
   async getPortfolio(id: string) {
     const log = logStart(this.logger, 'getPortfolio', { id });
-    const portfolio = await this.db.query('SELECT * FROM sandbox_portfolios WHERE id = $1', [id]);
-    if (!portfolio.rows[0]) {
+    const portfolio = await this.portfolioModel.findById(id).exec();
+    if (!portfolio) {
       log.done({ found: false });
       return null;
     }
 
-    const positions = await this.db.query('SELECT * FROM sandbox_positions WHERE portfolio_id = $1', [id]);
+    const positions = await this.positionModel.find({ portfolio_id: id }).exec();
     let marketValue = 0;
     const enrichedPositions = [];
-    for (const pos of positions.rows) {
-      const price = await this.getPrice(pos.symbol as string);
+    for (const pos of positions) {
+      const price = await this.getPrice(pos.symbol);
       const value = Number(pos.quantity) * price;
       marketValue += value;
-      enrichedPositions.push({ ...pos, current_price: price, market_value: value });
+      enrichedPositions.push({ ...docToApi(pos), current_price: price, market_value: value });
     }
 
-    const cashBalance = Number(portfolio.rows[0].cash_balance);
+    const cashBalance = Number(portfolio.cash_balance);
     const totalEquity = cashBalance + marketValue;
-
     const today = new Date().toISOString().split('T')[0];
-    const todaySnapshot = await this.db.query(
-      `SELECT pnl_daily FROM daily_performance_snapshot WHERE portfolio_id = $1 AND snapshot_date = $2`,
-      [id, today],
-    );
+    const todaySnapshot = await this.snapshotModel.findOne({ portfolio_id: id, snapshot_date: today }).exec();
 
     log.done({ totalEquity, positions: enrichedPositions.length });
     return {
-      portfolio: portfolio.rows[0],
+      portfolio: docToApi(portfolio),
       positions: enrichedPositions,
       total_equity: totalEquity,
       market_value: marketValue,
-      pnl_today: Number(todaySnapshot.rows[0]?.pnl_daily || 0),
+      pnl_today: Number(todaySnapshot?.pnl_daily || 0),
     };
   }
 
   async getPerformance(id: string) {
     const log = logStart(this.logger, 'getPerformance', { id });
-    const r = await this.db.query(
-      `SELECT snapshot_date, total_equity, pnl_daily, pnl_cumulative, benchmark_asi_change_pct, drawdown_pct
-       FROM daily_performance_snapshot WHERE portfolio_id = $1 ORDER BY snapshot_date`,
-      [id],
-    );
-    log.done({ snapshots: r.rows.length });
-    return r.rows;
+    const rows = await this.snapshotModel.find({ portfolio_id: id }).sort({ snapshot_date: 1 }).exec();
+    log.done({ snapshots: rows.length });
+    return docsToApi(rows);
   }
 
   async getDefaultPortfolioId(): Promise<string | null> {
     const log = logStart(this.logger, 'getDefaultPortfolioId');
-    const r = await this.db.query(`SELECT id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1`);
-    const id = r.rows[0]?.id || null;
+    const portfolio = await this.portfolioModel.findOne({ name: 'default-sandbox' }).exec();
+    const id = portfolio?._id || null;
     log.done({ id });
     return id;
   }
@@ -71,7 +78,7 @@ export class PortfolioService {
   private async getPrice(symbol: string): Promise<number> {
     const cached = await this.redis.get(`price:${symbol}`);
     if (cached) return JSON.parse(cached).price;
-    const r = await this.db.query('SELECT price FROM price_history WHERE symbol = $1 ORDER BY trade_date DESC LIMIT 1', [symbol]);
-    return Number(r.rows[0]?.price || 0);
+    const row = await this.priceModel.findOne({ symbol }).sort({ trade_date: -1 }).exec();
+    return Number(row?.price || 0);
   }
 }

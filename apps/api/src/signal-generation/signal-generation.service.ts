@@ -1,10 +1,32 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DatabaseService } from '../database/database.service';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import {
+  Instrument,
+  InstrumentDocument,
+  IndexHistory,
+  IndexHistoryDocument,
+  FundamentalsSnapshot,
+  FundamentalsSnapshotDocument,
+  News,
+  NewsDocument,
+  Signal,
+  SignalDocument,
+  SignalLlmLog,
+  SignalLlmLogDocument,
+  SandboxPortfolio,
+  SandboxPortfolioDocument,
+  SandboxPosition,
+  SandboxPositionDocument,
+  StrategyParamSet,
+  StrategyParamSetDocument,
+} from '../database/schemas';
 import { RedisService } from '../redis/redis.service';
 import { IndicatorService } from './indicator.service';
 import { LlmService } from './llm.service';
 import { PORTFOLIO_PROMPT_VERSION, PROMPT_VERSION, TechnicalSnapshot } from '@ngx/shared';
 import { EventsGateway } from '../events/events.gateway';
+import { docToApi } from '../database/mongo.util';
 import { logStart } from '../common/log.util';
 
 interface ParamSetRow {
@@ -26,7 +48,15 @@ export class SignalGenerationService {
   private readonly logger = new Logger(SignalGenerationService.name);
 
   constructor(
-    private readonly db: DatabaseService,
+    @InjectModel(Instrument.name) private readonly instrumentModel: Model<InstrumentDocument>,
+    @InjectModel(IndexHistory.name) private readonly indexModel: Model<IndexHistoryDocument>,
+    @InjectModel(FundamentalsSnapshot.name) private readonly fundamentalsModel: Model<FundamentalsSnapshotDocument>,
+    @InjectModel(News.name) private readonly newsModel: Model<NewsDocument>,
+    @InjectModel(Signal.name) private readonly signalModel: Model<SignalDocument>,
+    @InjectModel(SignalLlmLog.name) private readonly llmLogModel: Model<SignalLlmLogDocument>,
+    @InjectModel(SandboxPortfolio.name) private readonly portfolioModel: Model<SandboxPortfolioDocument>,
+    @InjectModel(SandboxPosition.name) private readonly positionModel: Model<SandboxPositionDocument>,
+    @InjectModel(StrategyParamSet.name) private readonly paramModel: Model<StrategyParamSetDocument>,
     private readonly redis: RedisService,
     private readonly indicators: IndicatorService,
     private readonly llm: LlmService,
@@ -50,16 +80,12 @@ export class SignalGenerationService {
     }
 
     const positions = await this.getPortfolioPositions(portfolioId);
-    const indexData = await this.db.query(
-      `SELECT index_code, value, week_change FROM index_history
-       WHERE index_code = 'ASI' ORDER BY trade_date DESC LIMIT 1`,
-    );
-
+    const indexData = await this.indexModel.findOne({ index_code: 'ASI' }).sort({ trade_date: -1 }).exec();
     const maxPicks = Number((paramSet as ParamSetRow).max_daily_trades || 5);
     const context = {
       universe,
       positions,
-      marketContext: indexData.rows[0] || null,
+      marketContext: indexData ? docToApi(indexData) : null,
       maxPicks,
     };
 
@@ -71,12 +97,10 @@ export class SignalGenerationService {
     for (const pick of output.signals) {
       if (seen.has(pick.symbol)) continue;
       seen.add(pick.symbol);
-
       if (!validSymbols.has(pick.symbol)) {
         log.warn('LLM picked unknown symbol', { symbol: pick.symbol });
         continue;
       }
-
       try {
         const signalId = await this.persistSignal(pick, {
           prompt,
@@ -96,8 +120,8 @@ export class SignalGenerationService {
 
   async generateForSymbol(symbol: string): Promise<string | null> {
     const log = logStart(this.logger, 'generateForSymbol', { symbol });
-    const instrument = await this.db.query('SELECT * FROM instruments WHERE symbol = $1 AND is_active = true', [symbol]);
-    if (instrument.rows.length === 0) {
+    const instrument = await this.instrumentModel.findOne({ symbol, is_active: true }).exec();
+    if (!instrument) {
       log.debug('skipped', { reason: 'instrument not found' });
       log.done({ signalId: null });
       return null;
@@ -110,26 +134,17 @@ export class SignalGenerationService {
       return null;
     }
 
-    const fundamental = await this.db.query(
-      `SELECT * FROM fundamentals_snapshot WHERE symbol = $1 ORDER BY snapshot_date DESC LIMIT 1`,
-      [symbol],
-    );
-    const news = await this.db.query(
-      `SELECT headline, category, published_at FROM news
-       WHERE symbol = $1 AND published_at > now() - interval '48 hours' LIMIT 5`,
-      [symbol],
-    );
-    const indexData = await this.db.query(
-      `SELECT index_code, value, week_change FROM index_history
-       WHERE index_code = 'ASI' ORDER BY trade_date DESC LIMIT 1`,
-    );
+    const fundamental = await this.fundamentalsModel.findOne({ symbol }).sort({ snapshot_date: -1 }).exec();
+    const since = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const news = await this.newsModel.find({ symbol, published_at: { $gte: since } }).limit(5).exec();
+    const indexData = await this.indexModel.findOne({ index_code: 'ASI' }).sort({ trade_date: -1 }).exec();
 
     const context = {
       symbol,
       technical,
-      fundamental: fundamental.rows[0] || null,
-      news: news.rows,
-      marketContext: indexData.rows[0] || null,
+      fundamental: fundamental ? docToApi(fundamental) : null,
+      news: news.map((n) => docToApi(n)),
+      marketContext: indexData ? docToApi(indexData) : null,
     };
 
     const { output, prompt, rawResponse, modelName } = await this.llm.generateSignal(context);
@@ -160,106 +175,91 @@ export class SignalGenerationService {
     if (!symbol) return null;
 
     const technical = options.technical ?? await this.indicators.compute(symbol);
-    const fundamental = await this.db.query(
-      `SELECT * FROM fundamentals_snapshot WHERE symbol = $1 ORDER BY snapshot_date DESC LIMIT 1`,
-      [symbol],
-    );
+    const fundamental = await this.fundamentalsModel.findOne({ symbol }).sort({ snapshot_date: -1 }).exec();
 
-    const result = await this.db.query(
-      `INSERT INTO signals (symbol, action, confidence, rationale, technical_snapshot, fundamental_snapshot,
-        model_name, prompt_version, risk_policy_result, executed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'BLOCKED_OTHER', false)
-       RETURNING id`,
-      [
-        symbol,
-        pick.action,
-        pick.confidence,
-        pick.rationale,
-        JSON.stringify(technical),
-        fundamental.rows[0] ? JSON.stringify(fundamental.rows[0]) : null,
-        options.modelName,
-        options.promptVersion,
-      ],
-    );
-    const signalId = result.rows[0].id as string;
+    const signal = await this.signalModel.create({
+      symbol,
+      action: pick.action,
+      confidence: pick.confidence,
+      rationale: pick.rationale,
+      technical_snapshot: technical || {},
+      fundamental_snapshot: fundamental ? docToApi(fundamental) : null,
+      model_name: options.modelName,
+      prompt_version: options.promptVersion,
+      risk_policy_result: 'BLOCKED_OTHER',
+      executed: false,
+    });
 
-    await this.db.query(
-      `INSERT INTO signal_llm_logs (signal_id, prompt, raw_response) VALUES ($1, $2, $3)`,
-      [signalId, options.prompt, options.rawResponse],
-    );
+    await this.llmLogModel.create({
+      signal_id: signal._id,
+      prompt: options.prompt,
+      raw_response: options.rawResponse,
+    });
 
-    await this.redis.publish('signals:new', JSON.stringify({ id: signalId, symbol, action: pick.action }));
+    await this.redis.publish('signals:new', JSON.stringify({ id: signal._id, symbol, action: pick.action }));
     this.events.broadcastSignal({
-      id: signalId,
+      id: signal._id,
       symbol,
       action: pick.action,
       confidence: pick.confidence,
       rationale: pick.rationale,
     });
 
-    return signalId;
+    return signal._id;
   }
 
   private async buildMarketUniverse(paramSet: ParamSetRow): Promise<UniverseRow[]> {
-    const allowedFilter = paramSet.allowed_symbols?.length
-      ? 'AND i.symbol = ANY($1::text[])'
-      : '';
-    const params = paramSet.allowed_symbols?.length ? [paramSet.allowed_symbols] : [];
+    const match: Record<string, unknown> = { is_active: true };
+    if (paramSet.allowed_symbols?.length) {
+      match.symbol = { $in: paramSet.allowed_symbols };
+    }
 
-    const result = await this.db.query(
-      `SELECT i.symbol, i.name, i.sector, ph.price, ph.change_percent, ph.volume
-       FROM instruments i
-       LEFT JOIN LATERAL (
-         SELECT price, change_percent, volume
-         FROM price_history
-         WHERE symbol = i.symbol
-         ORDER BY trade_date DESC
-         LIMIT 1
-       ) ph ON true
-       WHERE i.is_active = true
-       ${allowedFilter}
-       ORDER BY ph.volume DESC NULLS LAST, i.symbol ASC`,
-      params,
-    );
+    const rows = await this.instrumentModel.aggregate([
+      { $match: match },
+      {
+        $lookup: {
+          from: 'price_history',
+          let: { sym: '$symbol' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$symbol', '$$sym'] } } },
+            { $sort: { trade_date: -1 } },
+            { $limit: 1 },
+          ],
+          as: 'latestPrice',
+        },
+      },
+      { $unwind: { path: '$latestPrice', preserveNullAndEmptyArrays: true } },
+      { $sort: { 'latestPrice.volume': -1, symbol: 1 } },
+    ]);
 
-    return result.rows.map((row) => ({
+    return rows.map((row) => ({
       symbol: row.symbol as string,
       name: row.name as string | null,
       sector: row.sector as string | null,
-      price: row.price != null ? Number(row.price) : null,
-      change_percent: row.change_percent != null ? Number(row.change_percent) : null,
-      volume: row.volume != null ? Number(row.volume) : null,
+      price: row.latestPrice?.price != null ? Number(row.latestPrice.price) : null,
+      change_percent: row.latestPrice?.change_percent != null ? Number(row.latestPrice.change_percent) : null,
+      volume: row.latestPrice?.volume != null ? Number(row.latestPrice.volume) : null,
     }));
   }
 
   private async getPortfolioPositions(portfolioId?: string) {
     if (portfolioId) {
-      const r = await this.db.query(
-        `SELECT symbol, quantity, avg_cost FROM sandbox_positions WHERE portfolio_id = $1`,
-        [portfolioId],
-      );
-      return r.rows;
+      const rows = await this.positionModel.find({ portfolio_id: portfolioId }).exec();
+      return rows.map((r) => docToApi(r));
     }
-    const r = await this.db.query(
-      `SELECT sp.symbol, sp.quantity, sp.avg_cost
-       FROM sandbox_positions sp
-       JOIN sandbox_portfolios p ON p.id = sp.portfolio_id
-       WHERE p.name = 'default-sandbox'`,
-    );
-    return r.rows;
+    const portfolio = await this.portfolioModel.findOne({ name: 'default-sandbox' }).exec();
+    if (!portfolio) return [];
+    const rows = await this.positionModel.find({ portfolio_id: portfolio._id }).exec();
+    return rows.map((r) => docToApi(r));
   }
 
   private async getActiveParamSet(portfolioId?: string) {
     if (portfolioId) {
-      const r = await this.db.query(
-        `SELECT s.* FROM strategy_param_sets s
-         JOIN sandbox_portfolios p ON p.strategy_param_set_id = s.id
-         WHERE p.id = $1`,
-        [portfolioId],
-      );
-      if (r.rows[0]) return r.rows[0];
+      const portfolio = await this.portfolioModel.findById(portfolioId).exec();
+      if (portfolio) {
+        return this.paramModel.findById(portfolio.strategy_param_set_id).exec();
+      }
     }
-    const r = await this.db.query(`SELECT * FROM strategy_param_sets WHERE is_active = true LIMIT 1`);
-    return r.rows[0];
+    return this.paramModel.findOne({ is_active: true }).exec();
   }
 }

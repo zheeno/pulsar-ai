@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-const { Client } = require('pg');
-const crypto = require('crypto');
+const { MongoClient } = require('mongodb');
+const bcrypt = require('bcrypt');
+const { randomUUID } = require('crypto');
 
 const CURATED_SYMBOLS = [
   { symbol: 'DANGCEM', name: 'Dangote Cement', sector: 'Industrial Goods' },
@@ -25,9 +26,12 @@ const CURATED_SYMBOLS = [
   { symbol: 'INTBREW', name: 'International Breweries', sector: 'Consumer Goods' },
 ];
 
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(password).digest('hex');
-}
+const BASE_PRICES = {
+  DANGCEM: 280, GTCO: 45, ZENITHBANK: 38, MTNN: 220, BUACEMENT: 95,
+  ACCESSCORP: 22, UBA: 28, FBNH: 18, SEPLAT: 3200, NESTLE: 1200,
+  BUAFOODS: 150, AIRTELAFRI: 2100, WAPCO: 35, GUARANTY: 55, STANBIC: 65,
+  FLOURMILL: 42, PRESCO: 280, OKOMUOIL: 350, NASCON: 18, INTBREW: 5,
+};
 
 function generatePriceHistory(symbol, basePrice, days = 120) {
   const rows = [];
@@ -40,6 +44,7 @@ function generatePriceHistory(symbol, basePrice, days = 120) {
     const change = (Math.random() - 0.48) * 0.03;
     price = Math.max(price * (1 + change), 1);
     rows.push({
+      _id: randomUUID(),
       symbol,
       trade_date: d.toISOString().split('T')[0],
       price: Math.round(price * 100) / 100,
@@ -50,39 +55,34 @@ function generatePriceHistory(symbol, basePrice, days = 120) {
   return rows;
 }
 
-const BASE_PRICES = {
-  DANGCEM: 280, GTCO: 45, ZENITHBANK: 38, MTNN: 220, BUACEMENT: 95,
-  ACCESSCORP: 22, UBA: 28, FBNH: 18, SEPLAT: 3200, NESTLE: 1200,
-  BUAFOODS: 150, AIRTELAFRI: 2100, WAPCO: 35, GUARANTY: 55, STANBIC: 65,
-  FLOURMILL: 42, PRESCO: 280, OKOMUOIL: 350, NASCON: 18, INTBREW: 5,
-};
-
 async function seed() {
-  const databaseUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/ngx_trading';
-  const client = new Client({ connectionString: databaseUrl });
+  const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017/pulsar';
+  const client = new MongoClient(uri);
   await client.connect();
+  const db = client.db();
 
   for (const inst of CURATED_SYMBOLS) {
-    await client.query(
-      `INSERT INTO instruments (symbol, name, sector, is_active) VALUES ($1, $2, $3, true)
-       ON CONFLICT (symbol) DO UPDATE SET name = EXCLUDED.name, sector = EXCLUDED.sector`,
-      [inst.symbol, inst.name, inst.sector],
+    await db.collection('instruments').updateOne(
+      { symbol: inst.symbol },
+      {
+        $setOnInsert: { _id: randomUUID(), added_at: new Date() },
+        $set: { symbol: inst.symbol, name: inst.name, sector: inst.sector, is_active: true },
+      },
+      { upsert: true },
     );
   }
 
   for (const inst of CURATED_SYMBOLS) {
     const prices = generatePriceHistory(inst.symbol, BASE_PRICES[inst.symbol] || 100);
     for (const p of prices) {
-      await client.query(
-        `INSERT INTO price_history (symbol, trade_date, price, change_percent, volume)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (symbol, trade_date) DO UPDATE SET price = EXCLUDED.price`,
-        [p.symbol, p.trade_date, p.price, p.change_percent, p.volume],
+      await db.collection('price_history').updateOne(
+        { symbol: p.symbol, trade_date: p.trade_date },
+        { $set: p },
+        { upsert: true },
       );
     }
   }
 
-  // ASI index history
   const today = new Date();
   let asiValue = 95000;
   for (let i = 60; i >= 0; i--) {
@@ -90,53 +90,77 @@ async function seed() {
     d.setDate(d.getDate() - i);
     if (d.getDay() === 0 || d.getDay() === 6) continue;
     asiValue *= 1 + (Math.random() - 0.48) * 0.01;
-    await client.query(
-      `INSERT INTO index_history (index_code, trade_date, value, points)
-       VALUES ('ASI', $1, $2, $3)
-       ON CONFLICT (index_code, trade_date) DO NOTHING`,
-      [d.toISOString().split('T')[0], Math.round(asiValue), Math.round((Math.random() - 0.5) * 200)],
+    const tradeDate = d.toISOString().split('T')[0];
+    await db.collection('index_history').updateOne(
+      { index_code: 'ASI', trade_date: tradeDate },
+      {
+        $setOnInsert: { _id: randomUUID() },
+        $set: {
+          index_code: 'ASI',
+          trade_date: tradeDate,
+          value: Math.round(asiValue),
+          points: Math.round((Math.random() - 0.5) * 200),
+        },
+      },
+      { upsert: true },
     );
   }
 
-  const existing = await client.query(`SELECT id FROM strategy_param_sets WHERE name = 'default-sandbox' LIMIT 1`);
-  let paramId = existing.rows[0]?.id;
-
-  if (!paramId) {
-    const paramResult = await client.query(
-      `INSERT INTO strategy_param_sets (name, max_position_pct, max_daily_trades, stop_loss_pct,
-        min_confidence_to_trade, max_daily_drawdown_pct, allowed_symbols, position_size_pct, is_active)
-       VALUES ('default-sandbox', 0.10, 5, 0.05, 0.65, 0.03, NULL, 0.05, true)
-       RETURNING id`,
-    );
-    paramId = paramResult.rows[0].id;
+  let param = await db.collection('strategy_param_sets').findOne({ name: 'default-sandbox' });
+  if (!param) {
+    param = {
+      _id: randomUUID(),
+      name: 'default-sandbox',
+      max_position_pct: 0.1,
+      max_daily_trades: 5,
+      stop_loss_pct: 0.05,
+      min_confidence_to_trade: 0.65,
+      max_daily_drawdown_pct: 0.03,
+      allowed_symbols: null,
+      position_size_pct: 0.05,
+      is_active: true,
+      created_at: new Date(),
+    };
+    await db.collection('strategy_param_sets').insertOne(param);
   } else {
-    await client.query(
-      `UPDATE strategy_param_sets SET allowed_symbols = NULL WHERE id = $1`,
-      [paramId],
+    await db.collection('strategy_param_sets').updateOne(
+      { _id: param._id },
+      { $set: { allowed_symbols: null, is_active: true } },
     );
   }
 
-  await client.query(`UPDATE strategy_param_sets SET is_active = false WHERE id != $1`, [paramId]);
-  await client.query(`UPDATE strategy_param_sets SET is_active = true WHERE id = $1`, [paramId]);
-
-  const startingCapital = Number(process.env.DEFAULT_STARTING_CAPITAL || 10000000);
-  const existingPortfolio = await client.query(`SELECT id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1`);
-  if (existingPortfolio.rows.length === 0) {
-    await client.query(
-      `INSERT INTO sandbox_portfolios (name, starting_capital, cash_balance, strategy_param_set_id)
-       VALUES ('default-sandbox', $1, $1, $2)`,
-      [startingCapital, paramId],
-    );
-  }
-
-  await client.query(
-    `INSERT INTO app_users (email, password_hash) VALUES ($1, $2)
-     ON CONFLICT (email) DO NOTHING`,
-    ['admin@ngx.local', hashPassword('admin123')],
+  await db.collection('strategy_param_sets').updateMany(
+    { _id: { $ne: param._id } },
+    { $set: { is_active: false } },
   );
 
-  await client.end();
-  console.log('Seed complete.');
+  const startingCapital = Number(process.env.DEFAULT_STARTING_CAPITAL || 10000000);
+  await db.collection('sandbox_portfolios').updateOne(
+    { name: 'default-sandbox' },
+    {
+      $setOnInsert: { _id: randomUUID(), created_at: new Date() },
+      $set: {
+        name: 'default-sandbox',
+        starting_capital: startingCapital,
+        cash_balance: startingCapital,
+        strategy_param_set_id: param._id,
+      },
+    },
+    { upsert: true },
+  );
+
+  const passwordHash = await bcrypt.hash('admin123', 10);
+  await db.collection('users').updateOne(
+    { email: 'admin@ngx.local' },
+    {
+      $setOnInsert: { _id: randomUUID(), created_at: new Date() },
+      $set: { email: 'admin@ngx.local', password_hash: passwordHash },
+    },
+    { upsert: true },
+  );
+
+  await client.close();
+  console.log('MongoDB seed complete.');
 }
 
 seed().catch((err) => {

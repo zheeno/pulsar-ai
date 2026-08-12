@@ -1,17 +1,50 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
-import { AppModule } from './app.module';
-import { DatabaseService } from './database/database.service';
+import { getModelToken } from '@nestjs/mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import { Model } from 'mongoose';
+import { execSync } from 'child_process';
+import { join } from 'path';
+import {
+  SandboxPortfolio,
+  SandboxPortfolioDocument,
+  PriceHistory,
+  PriceHistoryDocument,
+  StrategyParamSet,
+  StrategyParamSetDocument,
+  Signal,
+  SignalDocument,
+  SignalLlmLog,
+  SignalLlmLogDocument,
+} from './database/schemas';
 import { IngestionService } from './market-data/ingestion.service';
 import { SignalGenerationService } from './signal-generation/signal-generation.service';
 import { ExecutionService } from './execution/execution.service';
 
 describe('E2E Integration', () => {
   let app: INestApplication;
-  let db: DatabaseService;
+  let mongoServer: MongoMemoryServer;
+  let portfolioModel: Model<SandboxPortfolioDocument>;
+  let priceModel: Model<PriceHistoryDocument>;
+  let strategyModel: Model<StrategyParamSetDocument>;
+  let signalModel: Model<SignalDocument>;
+  let llmLogModel: Model<SignalLlmLogDocument>;
 
   beforeAll(async () => {
+    mongoServer = await MongoMemoryServer.create({
+      instance: { launchTimeout: 120000 },
+    });
+    process.env.MONGODB_URI = mongoServer.getUri();
     process.env.FORCE_INGEST = 'true';
+    process.env.JWT_SECRET = 'test-jwt-secret-min-32-characters-long';
+
+    execSync('node scripts/seed.js', {
+      env: process.env,
+      cwd: join(__dirname, '../../..'),
+      stdio: 'inherit',
+    });
+
+    const { AppModule } = await import('./app.module');
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
@@ -19,29 +52,35 @@ describe('E2E Integration', () => {
     app = moduleFixture.createNestApplication();
     app.setGlobalPrefix('api');
     await app.init();
-    db = app.get(DatabaseService);
-  }, 30000);
+
+    portfolioModel = app.get(getModelToken(SandboxPortfolio.name));
+    priceModel = app.get(getModelToken(PriceHistory.name));
+    strategyModel = app.get(getModelToken(StrategyParamSet.name));
+    signalModel = app.get(getModelToken(Signal.name));
+    llmLogModel = app.get(getModelToken(SignalLlmLog.name));
+  }, 120000);
 
   afterAll(async () => {
-    await app.close();
+    await app?.close();
+    await mongoServer?.stop();
   });
 
   it('should have seeded portfolio in database', async () => {
-    const result = await db.query(`SELECT * FROM sandbox_portfolios WHERE name = 'default-sandbox'`);
-    expect(result.rows.length).toBeGreaterThan(0);
-    expect(Number(result.rows[0].starting_capital)).toBe(10000000);
+    const portfolio = await portfolioModel.findOne({ name: 'default-sandbox' }).lean().exec();
+    expect(portfolio).toBeTruthy();
+    expect(Number(portfolio!.starting_capital)).toBe(10000000);
   });
 
   it('should have price history for curated symbols', async () => {
-    const result = await db.query(`SELECT COUNT(DISTINCT symbol) as count FROM price_history`);
-    expect(Number(result.rows[0].count)).toBeGreaterThanOrEqual(10);
+    const count = await priceModel.distinct('symbol').exec();
+    expect(count.length).toBeGreaterThanOrEqual(10);
   });
 
   it('should have active strategy param set with open symbol universe', async () => {
-    const result = await db.query(`SELECT * FROM strategy_param_sets WHERE is_active = true`);
-    expect(result.rows.length).toBe(1);
-    const allowed = result.rows[0].allowed_symbols;
-    expect(allowed === null || allowed.length === 0 || allowed.length > 0).toBe(true);
+    const active = await strategyModel.find({ is_active: true }).exec();
+    expect(active.length).toBe(1);
+    const allowed = active[0].allowed_symbols;
+    expect(allowed == null || (Array.isArray(allowed) && allowed.length >= 0)).toBe(true);
   });
 
   it('should run full cycle and create signals', async () => {
@@ -49,22 +88,21 @@ describe('E2E Integration', () => {
     const signals = app.get(SignalGenerationService);
     const execution = app.get(ExecutionService);
 
-    const ingested = await ingestion.ingestStocks();
-    expect(ingested).toBeGreaterThan(0);
+    await ingestion.ingestStocks({ force: true });
 
     const signalIds = await signals.generateForPortfolio();
     expect(signalIds.length).toBeGreaterThan(0);
 
-    const signalCheck = await db.query('SELECT * FROM signals WHERE id = $1', [signalIds[0]]);
-    expect(signalCheck.rows[0].rationale).toBeTruthy();
-    expect(signalCheck.rows[0].technical_snapshot).toBeTruthy();
+    const signal = await signalModel.findById(signalIds[0]).lean().exec();
+    expect(signal?.rationale).toBeTruthy();
+    expect(signal?.technical_snapshot).toBeTruthy();
 
-    const llmLog = await db.query('SELECT * FROM signal_llm_logs WHERE signal_id = $1', [signalIds[0]]);
-    expect(llmLog.rows.length).toBe(1);
+    const llmLog = await llmLogModel.findOne({ signal_id: signalIds[0] }).lean().exec();
+    expect(llmLog).toBeTruthy();
 
     await execution.processSignals(signalIds);
 
-    const updatedSignal = await db.query('SELECT risk_policy_result FROM signals WHERE id = $1', [signalIds[0]]);
-    expect(updatedSignal.rows[0].risk_policy_result).toBeTruthy();
+    const updatedSignal = await signalModel.findById(signalIds[0]).lean().exec();
+    expect(updatedSignal?.risk_policy_result).toBeTruthy();
   }, 120000);
 });

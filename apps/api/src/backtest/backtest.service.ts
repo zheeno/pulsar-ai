@@ -1,10 +1,24 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DatabaseService } from '../database/database.service';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import {
+  BacktestRun,
+  BacktestRunDocument,
+  StrategyParamSet,
+  StrategyParamSetDocument,
+  Instrument,
+  InstrumentDocument,
+  PriceHistory,
+  PriceHistoryDocument,
+  Signal,
+  SignalDocument,
+} from '../database/schemas';
 import { IndicatorService } from '../signal-generation/indicator.service';
 import { LlmService } from '../signal-generation/llm.service';
 import { RiskPolicyService, ParamSet } from '../strategy/risk-policy.service';
 import { FillSimulatorService } from '../execution/fill-simulator.service';
 import { PROMPT_VERSION } from '@ngx/shared';
+import { startOfDay, endOfDay } from '../database/mongo.util';
 import { logStart } from '../common/log.util';
 
 @Injectable()
@@ -12,7 +26,11 @@ export class BacktestService {
   private readonly logger = new Logger(BacktestService.name);
 
   constructor(
-    private readonly db: DatabaseService,
+    @InjectModel(BacktestRun.name) private readonly backtestModel: Model<BacktestRunDocument>,
+    @InjectModel(StrategyParamSet.name) private readonly paramModel: Model<StrategyParamSetDocument>,
+    @InjectModel(Instrument.name) private readonly instrumentModel: Model<InstrumentDocument>,
+    @InjectModel(PriceHistory.name) private readonly priceModel: Model<PriceHistoryDocument>,
+    @InjectModel(Signal.name) private readonly signalModel: Model<SignalDocument>,
     private readonly indicators: IndicatorService,
     private readonly llm: LlmService,
     private readonly riskPolicy: RiskPolicyService,
@@ -21,15 +39,16 @@ export class BacktestService {
 
   async startRun(strategyParamSetId: string, startDate: string, endDate: string): Promise<string> {
     const log = logStart(this.logger, 'startRun', { strategyParamSetId, startDate, endDate });
-    const result = await this.db.query(
-      `INSERT INTO backtest_runs (strategy_param_set_id, start_date, end_date, status)
-       VALUES ($1, $2, $3, 'running') RETURNING id`,
-      [strategyParamSetId, startDate, endDate],
-    );
-    const runId = result.rows[0].id as string;
+    const run = await this.backtestModel.create({
+      strategy_param_set_id: strategyParamSetId,
+      start_date: startDate,
+      end_date: endDate,
+      status: 'running',
+    });
+    const runId = run._id;
     this.runAsync(runId, strategyParamSetId, startDate, endDate).catch((err) => {
       this.logger.error(`Backtest ${runId} failed: ${err}`);
-      this.db.query(`UPDATE backtest_runs SET status = 'failed', completed_at = now() WHERE id = $1`, [runId]);
+      this.backtestModel.findByIdAndUpdate(runId, { status: 'failed', completed_at: new Date() }).exec();
     });
     log.done({ runId });
     return runId;
@@ -37,17 +56,16 @@ export class BacktestService {
 
   async getRun(runId: string) {
     const log = logStart(this.logger, 'getRun', { runId });
-    const r = await this.db.query('SELECT * FROM backtest_runs WHERE id = $1', [runId]);
-    const run = r.rows[0] || null;
+    const run = await this.backtestModel.findById(runId).exec();
     log.done({ found: !!run, status: run?.status });
-    return run;
+    return run ? { ...run.toObject(), id: run._id } : null;
   }
 
   private async runAsync(runId: string, paramSetId: string, startDate: string, endDate: string) {
     const log = logStart(this.logger, 'runAsync', { runId, startDate, endDate });
-    const paramResult = await this.db.query('SELECT * FROM strategy_param_sets WHERE id = $1', [paramSetId]);
-    const paramSet = paramResult.rows[0] as ParamSet;
-    const symbols = await this.resolveSymbols(paramSet);
+    const paramSet = await this.paramModel.findById(paramSetId).exec();
+    if (!paramSet) throw new Error('Strategy param set not found');
+    const symbols = await this.resolveSymbols(paramSet.toObject() as ParamSet);
 
     let cash = 10000000;
     const positions: Record<string, { quantity: number; avg_cost: number }> = {};
@@ -55,21 +73,19 @@ export class BacktestService {
     let trades = 0;
     let wins = 0;
 
-    const datesResult = await this.db.query(
-      `SELECT DISTINCT trade_date FROM price_history
-       WHERE trade_date BETWEEN $1 AND $2 ORDER BY trade_date`,
-      [startDate, endDate],
-    );
+    const dates = await this.priceModel.distinct('trade_date', {
+      trade_date: { $gte: startDate, $lte: endDate },
+    });
+    dates.sort();
 
-    for (const row of datesResult.rows) {
-      const date = row.trade_date as string;
+    for (const date of dates) {
       const prices: Record<string, number> = {};
       for (const symbol of symbols) {
-        const pr = await this.db.query(
-          'SELECT price FROM price_history WHERE symbol = $1 AND trade_date <= $2 ORDER BY trade_date DESC LIMIT 1',
-          [symbol, date],
-        );
-        if (pr.rows[0]) prices[symbol] = Number(pr.rows[0].price);
+        const row = await this.priceModel
+          .findOne({ symbol, trade_date: { $lte: date } })
+          .sort({ trade_date: -1 })
+          .exec();
+        if (row) prices[symbol] = Number(row.price);
       }
 
       for (const symbol of symbols) {
@@ -80,7 +96,6 @@ export class BacktestService {
         const context = { symbol, technical, date };
         const cached = await this.getCachedLlm(symbol, date);
         const output = cached || (await this.llm.generateSignal(context)).output;
-
         if (output.action === 'HOLD') continue;
 
         const posList = Object.entries(positions).map(([s, p]) => ({ symbol: s, ...p }));
@@ -89,7 +104,7 @@ export class BacktestService {
 
         const { result, quantity } = await this.riskPolicy.evaluate(
           { id: 'backtest', symbol, action: output.action, confidence: output.confidence },
-          paramSet,
+          paramSet.toObject() as ParamSet,
           { cash_balance: cash, id: 'backtest' },
           posList,
           prices,
@@ -133,22 +148,23 @@ export class BacktestService {
     const winRate = trades > 0 ? (wins / trades) * 100 : 0;
 
     const results = { totalReturn, maxDrawdown, winRate, trades, equityCurve, finalEquity };
-    await this.db.query(
-      `UPDATE backtest_runs SET status = 'completed', results = $1, completed_at = now() WHERE id = $2`,
-      [JSON.stringify(results), runId],
-    );
+    await this.backtestModel.findByIdAndUpdate(runId, {
+      status: 'completed',
+      results,
+      completed_at: new Date(),
+    }).exec();
     log.done({ totalReturn, trades, winRate });
   }
 
   private async getTechnicalAtDate(symbol: string, date: string) {
-    const result = await this.db.query(
-      `SELECT trade_date, price, volume FROM price_history
-       WHERE symbol = $1 AND trade_date <= $2 ORDER BY trade_date DESC LIMIT 250`,
-      [symbol, date],
-    );
-    if (result.rows.length < 60) return null;
-    const rows = result.rows.reverse();
-    const prices = rows.map((r) => Number(r.price));
+    const rows = await this.priceModel
+      .find({ symbol, trade_date: { $lte: date } })
+      .sort({ trade_date: -1 })
+      .limit(250)
+      .exec();
+    if (rows.length < 60) return null;
+    const ordered = [...rows].reverse();
+    const prices = ordered.map((r) => Number(r.price));
     const currentPrice = prices[prices.length - 1];
     const momentum = prices.length > 20
       ? ((currentPrice - prices[prices.length - 21]) / prices[prices.length - 21]) * 100
@@ -160,17 +176,25 @@ export class BacktestService {
     if (paramSet.allowed_symbols && paramSet.allowed_symbols.length > 0) {
       return paramSet.allowed_symbols;
     }
-    const r = await this.db.query('SELECT symbol FROM instruments WHERE is_active = true ORDER BY symbol');
-    return r.rows.map((row) => row.symbol as string);
+    const rows = await this.instrumentModel.find({ is_active: true }).sort({ symbol: 1 }).exec();
+    return rows.map((row) => row.symbol);
   }
 
   private async getCachedLlm(symbol: string, date: string) {
-    const r = await this.db.query(
-      `SELECT s.action, s.confidence, s.rationale FROM signals s
-       WHERE s.symbol = $1 AND s.generated_at::date = $2 AND s.prompt_version = $3 LIMIT 1`,
-      [symbol, date, PROMPT_VERSION],
-    );
-    if (r.rows[0]) return r.rows[0] as { action: 'BUY' | 'SELL' | 'HOLD'; confidence: number; rationale: string };
+    const dayStart = startOfDay(new Date(date));
+    const dayEnd = endOfDay(new Date(date));
+    const signal = await this.signalModel.findOne({
+      symbol,
+      prompt_version: PROMPT_VERSION,
+      generated_at: { $gte: dayStart, $lte: dayEnd },
+    }).exec();
+    if (signal) {
+      return {
+        action: signal.action as 'BUY' | 'SELL' | 'HOLD',
+        confidence: Number(signal.confidence),
+        rationale: signal.rationale,
+      };
+    }
     return null;
   }
 

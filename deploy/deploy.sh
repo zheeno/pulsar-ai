@@ -56,7 +56,7 @@ API_HOST_PORT="${API_HOST_PORT:-${API_PORT:-3954}}"
 WEB_HOST_PORT="${WEB_HOST_PORT:-${WEB_PORT:-3955}}"
 
 # ── Build and start app stack (no Docker nginx) ───────────────────────────
-log "Building and starting Docker services (postgres, redis, api, web)..."
+log "Building and starting Docker services (redis, api, web)..."
 $COMPOSE -f docker-compose.prod.yml build
 $COMPOSE -f docker-compose.prod.yml up -d
 

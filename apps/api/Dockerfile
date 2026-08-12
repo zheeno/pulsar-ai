@@ -31,9 +31,8 @@ COPY --from=builder /app/node_modules ./node_modules
 # Ensure @ngx/shared workspace symlink resolves inside the container
 RUN rm -rf node_modules/@ngx/shared && ln -s ../../packages/shared node_modules/@ngx/shared
 
-# Migrations / seed scripts
+# Seed script
 COPY --from=builder /app/scripts ./scripts
-COPY --from=builder /app/supabase ./supabase
 COPY deploy/api-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

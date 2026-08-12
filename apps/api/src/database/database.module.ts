@@ -1,19 +1,63 @@
 import { Global, Module } from '@nestjs/common';
-import { Pool } from 'pg';
-import { DatabaseService } from './database.service';
+import { MongooseModule } from '@nestjs/mongoose';
+import {
+  User,
+  UserSchema,
+  Instrument,
+  InstrumentSchema,
+  PriceHistory,
+  PriceHistorySchema,
+  IndexHistory,
+  IndexHistorySchema,
+  FundamentalsSnapshot,
+  FundamentalsSnapshotSchema,
+  News,
+  NewsSchema,
+  StrategyParamSet,
+  StrategyParamSetSchema,
+  SandboxPortfolio,
+  SandboxPortfolioSchema,
+  SandboxPosition,
+  SandboxPositionSchema,
+  Signal,
+  SignalSchema,
+  SignalLlmLog,
+  SignalLlmLogSchema,
+  SandboxTrade,
+  SandboxTradeSchema,
+  DailyPerformanceSnapshot,
+  DailyPerformanceSnapshotSchema,
+  BackfillState,
+  BackfillStateSchema,
+  NgxPulseUsageLog,
+  NgxPulseUsageLogSchema,
+  BacktestRun,
+  BacktestRunSchema,
+} from './schemas';
 
 @Global()
 @Module({
-  providers: [
-    {
-      provide: 'PG_POOL',
-      useFactory: () => {
-        const connectionString = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/ngx_trading';
-        return new Pool({ connectionString });
-      },
-    },
-    DatabaseService,
+  imports: [
+    MongooseModule.forRoot(process.env.MONGODB_URI || 'mongodb://localhost:27017/pulsar'),
+    MongooseModule.forFeature([
+      { name: User.name, schema: UserSchema },
+      { name: Instrument.name, schema: InstrumentSchema },
+      { name: PriceHistory.name, schema: PriceHistorySchema },
+      { name: IndexHistory.name, schema: IndexHistorySchema },
+      { name: FundamentalsSnapshot.name, schema: FundamentalsSnapshotSchema },
+      { name: News.name, schema: NewsSchema },
+      { name: StrategyParamSet.name, schema: StrategyParamSetSchema },
+      { name: SandboxPortfolio.name, schema: SandboxPortfolioSchema },
+      { name: SandboxPosition.name, schema: SandboxPositionSchema },
+      { name: Signal.name, schema: SignalSchema },
+      { name: SignalLlmLog.name, schema: SignalLlmLogSchema },
+      { name: SandboxTrade.name, schema: SandboxTradeSchema },
+      { name: DailyPerformanceSnapshot.name, schema: DailyPerformanceSnapshotSchema },
+      { name: BackfillState.name, schema: BackfillStateSchema },
+      { name: NgxPulseUsageLog.name, schema: NgxPulseUsageLogSchema },
+      { name: BacktestRun.name, schema: BacktestRunSchema },
+    ]),
   ],
-  exports: ['PG_POOL', DatabaseService],
+  exports: [MongooseModule],
 })
 export class DatabaseModule {}

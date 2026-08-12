@@ -12,7 +12,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: process.env.SUPABASE_JWT_SECRET || 'dev-jwt-secret-change-in-production',
+      secretOrKey: process.env.JWT_SECRET || process.env.SUPABASE_JWT_SECRET || 'dev-jwt-secret-change-in-production',
     });
   }
 
@@ -23,7 +23,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       log.warn('unauthorized');
       throw new UnauthorizedException();
     }
-    log.done({ userId: user.id });
+    log.done({ email: user.email });
     return user;
   }
 }

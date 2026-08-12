@@ -8,11 +8,11 @@ import { JwtStrategy } from './jwt.strategy';
   imports: [
     PassportModule,
     JwtModule.register({
-      secret: process.env.SUPABASE_JWT_SECRET || 'dev-jwt-secret-change-in-production',
+      secret: process.env.JWT_SECRET || process.env.SUPABASE_JWT_SECRET || 'dev-jwt-secret-change-in-production',
       signOptions: { expiresIn: '7d' },
     }),
   ],
   providers: [AuthService, JwtStrategy],
-  exports: [AuthService, JwtModule],
+  exports: [AuthService],
 })
 export class AuthModule {}

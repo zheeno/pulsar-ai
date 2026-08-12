@@ -1,10 +1,28 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { PoolClient } from 'pg';
-import { DatabaseService } from '../database/database.service';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model } from 'mongoose';
+import {
+  Signal,
+  SignalDocument,
+  SandboxPortfolio,
+  SandboxPortfolioDocument,
+  SandboxPosition,
+  SandboxPositionDocument,
+  SandboxTrade,
+  SandboxTradeDocument,
+  StrategyParamSet,
+  StrategyParamSetDocument,
+  PriceHistory,
+  PriceHistoryDocument,
+  DailyPerformanceSnapshot,
+  DailyPerformanceSnapshotDocument,
+} from '../database/schemas';
 import { RedisService } from '../redis/redis.service';
 import { RiskPolicyService, ParamSet } from '../strategy/risk-policy.service';
 import { FillSimulatorService } from './fill-simulator.service';
 import { EventsGateway } from '../events/events.gateway';
+import { docToApi } from '../database/mongo.util';
+import { startOfDay, endOfDay } from '../database/mongo.util';
 import { logStart } from '../common/log.util';
 
 @Injectable()
@@ -12,7 +30,14 @@ export class ExecutionService {
   private readonly logger = new Logger(ExecutionService.name);
 
   constructor(
-    private readonly db: DatabaseService,
+    @InjectConnection() private readonly connection: Connection,
+    @InjectModel(Signal.name) private readonly signalModel: Model<SignalDocument>,
+    @InjectModel(SandboxPortfolio.name) private readonly portfolioModel: Model<SandboxPortfolioDocument>,
+    @InjectModel(SandboxPosition.name) private readonly positionModel: Model<SandboxPositionDocument>,
+    @InjectModel(SandboxTrade.name) private readonly tradeModel: Model<SandboxTradeDocument>,
+    @InjectModel(StrategyParamSet.name) private readonly paramModel: Model<StrategyParamSetDocument>,
+    @InjectModel(PriceHistory.name) private readonly priceModel: Model<PriceHistoryDocument>,
+    @InjectModel(DailyPerformanceSnapshot.name) private readonly snapshotModel: Model<DailyPerformanceSnapshotDocument>,
     private readonly redis: RedisService,
     private readonly riskPolicy: RiskPolicyService,
     private readonly fillSimulator: FillSimulatorService,
@@ -36,73 +61,86 @@ export class ExecutionService {
 
   async processSignal(signalId: string): Promise<boolean> {
     const log = logStart(this.logger, 'processSignal', { signalId });
-    const signalResult = await this.db.query('SELECT * FROM signals WHERE id = $1', [signalId]);
-    const signal = signalResult.rows[0];
+    const signal = await this.signalModel.findById(signalId).exec();
     if (!signal) {
       log.debug('skipped', { reason: 'signal not found' });
       log.done({ executed: false });
       return false;
     }
 
-    const portfolioResult = await this.db.query(`SELECT * FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1`);
-    const portfolio = portfolioResult.rows[0];
+    const portfolio = await this.portfolioModel.findOne({ name: 'default-sandbox' }).exec();
     if (!portfolio) {
       log.debug('skipped', { reason: 'portfolio not found' });
       log.done({ executed: false });
       return false;
     }
 
-    const paramResult = await this.db.query('SELECT * FROM strategy_param_sets WHERE id = $1', [portfolio.strategy_param_set_id]);
-    const paramSet = paramResult.rows[0] as ParamSet;
-    const portfolioTyped = portfolio as { cash_balance: number; id: string };
+    const paramSet = await this.paramModel.findById(portfolio.strategy_param_set_id).exec();
+    if (!paramSet) {
+      log.debug('skipped', { reason: 'param set not found' });
+      log.done({ executed: false });
+      return false;
+    }
 
-    const positionsResult = await this.db.query('SELECT * FROM sandbox_positions WHERE portfolio_id = $1', [portfolio.id]);
-    const positions = positionsResult.rows as { symbol: string; quantity: number; avg_cost: number }[];
-
-    const prices = await this.getCurrentPrices(positions.map((p) => p.symbol as string).concat([signal.symbol as string]));
-
-    const today = new Date().toISOString().split('T')[0];
-    const tradesToday = await this.db.query(
-      `SELECT COUNT(*) as count FROM sandbox_trades WHERE portfolio_id = $1 AND executed_at::date = $2`,
-      [portfolio.id, today],
+    const positions = await this.positionModel.find({ portfolio_id: portfolio._id }).exec();
+    const prices = await this.getCurrentPrices(
+      positions.map((p) => p.symbol).concat([signal.symbol]),
     );
-    const dailyTrades = Number(tradesToday.rows[0].count);
 
-    const snapshot = await this.db.query(
-      `SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = $1 ORDER BY snapshot_date DESC LIMIT 1`,
-      [portfolio.id],
-    );
-    const dailyDrawdownPct = Number(snapshot.rows[0]?.drawdown_pct || 0);
+    const dailyTrades = await this.tradeModel.countDocuments({
+      portfolio_id: portfolio._id,
+      executed_at: { $gte: startOfDay(), $lte: endOfDay() },
+    }).exec();
+
+    const latestSnapshot = await this.snapshotModel
+      .findOne({ portfolio_id: portfolio._id })
+      .sort({ snapshot_date: -1 })
+      .exec();
+    const dailyDrawdownPct = Number(latestSnapshot?.drawdown_pct || 0);
+
+    const signalApi = docToApi(signal)!;
+    const portfolioApi = docToApi(portfolio)!;
+    const positionsApi = positions.map((p) => docToApi(p)!);
 
     const { result, quantity } = await this.riskPolicy.evaluate(
-      { id: signal.id, symbol: signal.symbol, action: signal.action, confidence: Number(signal.confidence) },
-      paramSet,
-      portfolioTyped,
-      positions,
+      {
+        id: signalApi.id as string,
+        symbol: signal.symbol,
+        action: signal.action as 'BUY' | 'SELL' | 'HOLD',
+        confidence: Number(signal.confidence),
+      },
+      paramSet.toObject() as ParamSet,
+      { cash_balance: Number(portfolio.cash_balance), id: portfolio._id },
+      positionsApi as { symbol: string; quantity: number; avg_cost: number }[],
       prices,
       dailyTrades,
       dailyDrawdownPct,
     );
 
-    await this.db.query('UPDATE signals SET risk_policy_result = $1 WHERE id = $2', [result, signalId]);
+    await this.signalModel.findByIdAndUpdate(signalId, { risk_policy_result: result }).exec();
 
     if (result !== 'APPROVED' || quantity <= 0) {
       log.done({ executed: false, riskPolicyResult: result });
       return false;
     }
 
-    const currentPrice = prices[signal.symbol as string];
+    const currentPrice = prices[signal.symbol];
     if (!currentPrice) {
       log.debug('skipped', { reason: 'no current price', symbol: signal.symbol });
       log.done({ executed: false });
       return false;
     }
 
-    await this.db.transaction(async (client) => {
-      await this.executeTrade(client, portfolio, signal, quantity, currentPrice);
-    });
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.executeTrade(session, portfolio, signal, quantity, currentPrice);
+      });
+    } finally {
+      await session.endSession();
+    }
 
-    await this.db.query('UPDATE signals SET executed = true WHERE id = $1', [signalId]);
+    await this.signalModel.findByIdAndUpdate(signalId, { executed: true }).exec();
     await this.redis.publish('trades:new', JSON.stringify({ signalId, symbol: signal.symbol }));
     this.events.broadcastTrade({ signalId, symbol: signal.symbol, side: signal.action, quantity });
     log.done({ executed: true, symbol: signal.symbol, side: signal.action, quantity });
@@ -110,9 +148,9 @@ export class ExecutionService {
   }
 
   private async executeTrade(
-    client: PoolClient,
-    portfolio: Record<string, unknown>,
-    signal: Record<string, unknown>,
+    session: import('mongoose').ClientSession,
+    portfolio: SandboxPortfolioDocument,
+    signal: SignalDocument,
     quantity: number,
     currentPrice: number,
   ): Promise<void> {
@@ -127,46 +165,61 @@ export class ExecutionService {
       if (cashBalance < totalCost) throw new Error('Insufficient cash');
       cashBalance -= totalCost;
 
-      const posResult = await client.query(
-        'SELECT * FROM sandbox_positions WHERE portfolio_id = $1 AND symbol = $2',
-        [portfolio.id, signal.symbol],
-      );
-      if (posResult.rows.length > 0) {
-        const pos = posResult.rows[0];
+      const pos = await this.positionModel.findOne({
+        portfolio_id: portfolio._id,
+        symbol: signal.symbol,
+      }).session(session).exec();
+
+      if (pos) {
         const newQty = Number(pos.quantity) + quantity;
         const newAvg = (Number(pos.avg_cost) * Number(pos.quantity) + fillPrice * quantity) / newQty;
-        await client.query(
-          'UPDATE sandbox_positions SET quantity = $1, avg_cost = $2, updated_at = now() WHERE id = $3',
-          [newQty, newAvg, pos.id],
-        );
+        await this.positionModel.findByIdAndUpdate(
+          pos._id,
+          { quantity: newQty, avg_cost: newAvg, updated_at: new Date() },
+          { session },
+        ).exec();
       } else {
-        await client.query(
-          'INSERT INTO sandbox_positions (portfolio_id, symbol, quantity, avg_cost) VALUES ($1, $2, $3, $4)',
-          [portfolio.id, signal.symbol, quantity, fillPrice],
-        );
+        await this.positionModel.create([{
+          portfolio_id: portfolio._id,
+          symbol: signal.symbol,
+          quantity,
+          avg_cost: fillPrice,
+        }], { session });
       }
     } else {
-      const posResult = await client.query(
-        'SELECT * FROM sandbox_positions WHERE portfolio_id = $1 AND symbol = $2',
-        [portfolio.id, signal.symbol],
-      );
-      const pos = posResult.rows[0];
+      const pos = await this.positionModel.findOne({
+        portfolio_id: portfolio._id,
+        symbol: signal.symbol,
+      }).session(session).exec();
       if (!pos) throw new Error(`No position to sell for ${signal.symbol}`);
       cashBalance += notional - fee;
       const newQty = Number(pos.quantity) - quantity;
       if (newQty <= 0) {
-        await client.query('DELETE FROM sandbox_positions WHERE id = $1', [pos.id]);
+        await this.positionModel.findByIdAndDelete(pos._id, { session }).exec();
       } else {
-        await client.query('UPDATE sandbox_positions SET quantity = $1, updated_at = now() WHERE id = $2', [newQty, pos.id]);
+        await this.positionModel.findByIdAndUpdate(pos._id, { quantity: newQty, updated_at: new Date() }, { session }).exec();
       }
     }
 
-    await client.query('UPDATE sandbox_portfolios SET cash_balance = $1 WHERE id = $2', [cashBalance, portfolio.id]);
-    await client.query(
-      `INSERT INTO sandbox_trades (portfolio_id, signal_id, symbol, side, quantity, fill_price, simulated_fee, simulated_slippage_bps, resulting_cash_balance)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [portfolio.id, signal.id, signal.symbol, side, quantity, fillPrice, fee, slippageBps, cashBalance],
-    );
+    await this.portfolioModel.findByIdAndUpdate(
+      portfolio._id,
+      { cash_balance: cashBalance },
+      { session },
+    ).exec();
+
+    await this.tradeModel.create([{
+      portfolio_id: portfolio._id,
+      signal_id: signal._id,
+      symbol: signal.symbol,
+      side,
+      quantity,
+      fill_price: fillPrice,
+      simulated_fee: fee,
+      simulated_slippage_bps: slippageBps,
+      resulting_cash_balance: cashBalance,
+    }], { session });
+
+    portfolio.cash_balance = cashBalance;
   }
 
   private async getCurrentPrices(symbols: string[]): Promise<Record<string, number>> {
@@ -178,11 +231,8 @@ export class ExecutionService {
         prices[symbol] = JSON.parse(cached).price;
         continue;
       }
-      const r = await this.db.query(
-        'SELECT price FROM price_history WHERE symbol = $1 ORDER BY trade_date DESC LIMIT 1',
-        [symbol],
-      );
-      if (r.rows[0]) prices[symbol] = Number(r.rows[0].price);
+      const row = await this.priceModel.findOne({ symbol }).sort({ trade_date: -1 }).exec();
+      if (row) prices[symbol] = Number(row.price);
     }
     return prices;
   }

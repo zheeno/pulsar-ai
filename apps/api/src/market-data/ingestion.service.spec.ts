@@ -1,7 +1,15 @@
 import { IngestionService } from './ingestion.service';
 
+function modelMock() {
+  return {
+    findOne: jest.fn(),
+    findOneAndUpdate: jest.fn(),
+    updateOne: jest.fn(),
+    bulkWrite: jest.fn(),
+  };
+}
+
 describe('IngestionService error handling', () => {
-  const db = { query: jest.fn() };
   const redis = { set: jest.fn() };
   const ngx = {
     getStocks: jest.fn(),
@@ -16,7 +24,10 @@ describe('IngestionService error handling', () => {
   };
 
   const service = new IngestionService(
-    db as never,
+    modelMock() as never,
+    modelMock() as never,
+    modelMock() as never,
+    modelMock() as never,
     redis as never,
     ngx as never,
     calendar as never,

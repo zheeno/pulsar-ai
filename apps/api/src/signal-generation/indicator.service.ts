@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
 import { SMA, RSI } from 'technicalindicators';
-import { DatabaseService } from '../database/database.service';
+import { PriceHistory, PriceHistoryDocument } from '../database/schemas';
 import { TechnicalSnapshot } from '@ngx/shared';
 import { logStart } from '../common/log.util';
 
@@ -8,24 +10,26 @@ import { logStart } from '../common/log.util';
 export class IndicatorService {
   private readonly logger = new Logger(IndicatorService.name);
 
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    @InjectModel(PriceHistory.name) private readonly priceModel: Model<PriceHistoryDocument>,
+  ) {}
 
   async compute(symbol: string): Promise<TechnicalSnapshot | null> {
     const log = logStart(this.logger, 'compute', { symbol });
-    const result = await this.db.query(
-      `SELECT trade_date, price, volume FROM price_history
-       WHERE symbol = $1 ORDER BY trade_date DESC LIMIT 250`,
-      [symbol],
-    );
-    if (result.rows.length < 60) {
-      log.debug('insufficient data', { rows: result.rows.length });
+    const rows = await this.priceModel
+      .find({ symbol })
+      .sort({ trade_date: -1 })
+      .limit(250)
+      .exec();
+    if (rows.length < 60) {
+      log.debug('insufficient data', { rows: rows.length });
       log.done({ computed: false });
       return null;
     }
 
-    const rows = result.rows.reverse();
-    const prices = rows.map((r) => Number(r.price));
-    const volumes = rows.map((r) => Number(r.volume));
+    const ordered = [...rows].reverse();
+    const prices = ordered.map((r) => Number(r.price));
+    const volumes = ordered.map((r) => Number(r.volume));
     const currentPrice = prices[prices.length - 1];
 
     const sma50Arr = SMA.calculate({ period: 50, values: prices });

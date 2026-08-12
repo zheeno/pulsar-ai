@@ -1,17 +1,15 @@
 #!/bin/sh
 set -e
 
-echo "Waiting for Postgres..."
+echo "Waiting for MongoDB..."
 until node -e "
-const { Client } = require('pg');
-const c = new Client({ connectionString: process.env.DATABASE_URL });
-c.connect().then(() => c.end()).then(() => process.exit(0)).catch(() => process.exit(1));
+const { MongoClient } = require('mongodb');
+const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017/pulsar';
+const c = new MongoClient(uri);
+c.connect().then(() => c.close()).then(() => process.exit(0)).catch(() => process.exit(1));
 " 2>/dev/null; do
   sleep 2
 done
-
-echo "Running migrations..."
-node /app/scripts/migrate.js
 
 if [ "${RUN_SEED:-false}" = "true" ]; then
   echo "Seeding database..."

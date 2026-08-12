@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { NgxPulseUsageLog, NgxPulseUsageLogDocument } from '../database/schemas';
 import { RedisService } from '../redis/redis.service';
-import { DatabaseService } from '../database/database.service';
 import { logStart } from '../common/log.util';
 
 const DAILY_LIMIT = 100;
@@ -12,7 +14,7 @@ export class RateLimitService {
 
   constructor(
     private readonly redis: RedisService,
-    private readonly db: DatabaseService,
+    @InjectModel(NgxPulseUsageLog.name) private readonly usageModel: Model<NgxPulseUsageLogDocument>,
   ) {}
 
   private dailyKey(): string {
@@ -43,10 +45,7 @@ export class RateLimitService {
     await this.redis.expire(dailyKey, 86400);
     await this.redis.incr(minuteKey);
     await this.redis.expire(minuteKey, 120);
-    await this.db.query(
-      'INSERT INTO ngx_pulse_usage_log (endpoint) VALUES ($1)',
-      [`${authMode}:${endpoint}`],
-    );
+    await this.usageModel.create({ endpoint: `${authMode}:${endpoint}` });
     log.done();
   }
 
