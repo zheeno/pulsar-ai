@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use crate::cache::PriceCache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PortfolioSummary {
     pub portfolio: serde_json::Value,
     pub positions: Vec<serde_json::Value>,

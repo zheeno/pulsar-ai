@@ -3,29 +3,50 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianG
 import Nav from '../components/Nav';
 import { api, type PortfolioData } from '../lib/api';
 
+type RawPortfolio = PortfolioData & {
+  totalEquity?: number;
+  marketValue?: number;
+  pnlToday?: number;
+};
+
+function normalizePortfolio(raw: RawPortfolio): PortfolioData {
+  return {
+    portfolio: raw.portfolio,
+    positions: raw.positions ?? [],
+    total_equity: Number(raw.total_equity ?? raw.totalEquity ?? 0),
+    market_value: Number(raw.market_value ?? raw.marketValue ?? 0),
+    pnl_today: Number(raw.pnl_today ?? raw.pnlToday ?? 0),
+  };
+}
+
 export default function DashboardPage() {
   const [data, setData] = useState<PortfolioData | null>(null);
   const [performance, setPerformance] = useState<{ snapshot_date: string; total_equity: number }[]>([]);
   const [usage, setUsage] = useState<{ daily: number; limit: number | null; remaining: number | null; authMode?: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 30000);
+    void loadData();
+    const interval = setInterval(() => void loadData(), 30000);
     return () => clearInterval(interval);
   }, []);
 
   async function loadData() {
     try {
-      const portfolio = await api<PortfolioData>('portfolio_default');
+      const portfolio = normalizePortfolio(await api<RawPortfolio>('portfolio_default'));
       setData(portfolio);
+      setError(null);
       if (portfolio.portfolio?.id) {
-        const perf = await api<{ snapshot_date: string; total_equity: number }[]>('portfolio_performance', { id: portfolio.portfolio.id });
+        const perf = await api<{ snapshot_date: string; total_equity: number }[]>(
+          'portfolio_performance',
+          { id: portfolio.portfolio.id },
+        );
         setPerformance(perf);
       }
       const usageData = await api<typeof usage>('usage_ngx_pulse');
       setUsage(usageData);
-    } catch {
-      /* portfolio may not exist yet */
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -33,13 +54,16 @@ export default function DashboardPage() {
     try {
       const result = await api<{ signals: number; executed: number; warnings: string[] }>('cycle_run');
       alert(`Cycle complete: ${result.signals} signals, ${result.executed} executed`);
-      loadData();
+      void loadData();
     } catch (e) {
       alert(`Cycle failed: ${e}`);
     }
   }
 
-  const formatNaira = (n: number) => `₦${n.toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
+  const formatNaira = (n: number | null | undefined) => {
+    const value = Number(n ?? 0);
+    return `₦${(Number.isFinite(value) ? value : 0).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
+  };
 
   return (
     <div>
@@ -47,18 +71,30 @@ export default function DashboardPage() {
       <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
           <h1>Portfolio Overview</h1>
-          <button onClick={runCycle} style={{ background: '#22c55e', color: 'white', border: 'none', padding: '10px 20px', borderRadius: 6, cursor: 'pointer' }}>
+          <button onClick={() => void runCycle()} style={{ background: '#22c55e', color: 'white', border: 'none', padding: '10px 20px', borderRadius: 6, cursor: 'pointer' }}>
             Run Cycle
           </button>
         </div>
 
-        {data && (
+        {error && (
+          <p style={{ color: '#f87171', marginBottom: 16 }}>{error}</p>
+        )}
+
+        {data ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 32 }}>
             <StatCard label="Total Equity" value={formatNaira(data.total_equity)} />
-            <StatCard label="Cash Balance" value={formatNaira(Number(data.portfolio.cash_balance))} />
+            <StatCard label="Cash Balance" value={formatNaira(Number(data.portfolio?.cash_balance))} />
             <StatCard label="Market Value" value={formatNaira(data.market_value)} />
-            <StatCard label="Today's P&L" value={formatNaira(data.pnl_today)} color={data.pnl_today >= 0 ? '#22c55e' : '#ef4444'} />
+            <StatCard
+              label="Today's P&L"
+              value={formatNaira(data.pnl_today)}
+              color={data.pnl_today >= 0 ? '#22c55e' : '#ef4444'}
+            />
           </div>
+        ) : (
+          <p style={{ color: '#94a3b8' }}>
+            {error ? 'Could not load portfolio.' : 'Loading portfolio…'}
+          </p>
         )}
 
         {usage && (
