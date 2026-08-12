@@ -265,6 +265,28 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
                     snap.holdings.iter().map(|h| h.current_value).sum()
                 };
                 let total_equity = cash + market_value;
+                let _ = state.db.with_conn(|conn| {
+                    crate::portfolio::EquityCurveService::upsert_point(
+                        conn,
+                        "wealth",
+                        total_equity,
+                        cash,
+                        market_value,
+                    )
+                });
+                let pnl_today = state
+                    .db
+                    .with_conn(|conn| {
+                        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                        Ok(conn
+                            .query_row(
+                                "SELECT pnl_daily FROM equity_curve_points WHERE venue = 'wealth' AND snapshot_date = ?1",
+                                [&today],
+                                |row| row.get::<_, f64>(0),
+                            )
+                            .unwrap_or(snap.profit))
+                    })
+                    .unwrap_or(snap.profit);
                 Ok(serde_json::json!({
                     "portfolio": {
                         "id": id,
@@ -277,7 +299,7 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
                     "positions": positions,
                     "total_equity": total_equity,
                     "market_value": market_value,
-                    "pnl_today": snap.profit,
+                    "pnl_today": pnl_today,
                     "tradingMode": "live",
                     "tradingVerified": status.trading_verified,
                     "wealthStatus": status,
@@ -401,7 +423,19 @@ pub async fn wealth_logout(state: State<'_, Arc<AppState>>) -> Result<(), String
 }
 
 #[tauri::command]
-pub fn portfolio_performance(id: String, state: State<'_, Arc<AppState>>) -> Result<Vec<serde_json::Value>, String> {
+pub fn portfolio_performance(
+    id: Option<String>,
+    venue: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let venue = venue.unwrap_or_else(|| "sandbox".into());
+    if venue == "wealth" || venue == "sandbox" {
+        return state
+            .db
+            .with_conn(|conn| crate::portfolio::EquityCurveService::get_curve(conn, &venue))
+            .map_err(|e| e.to_string());
+    }
+    let id = id.ok_or_else(|| "id or venue required".to_string())?;
     state
         .db
         .with_conn(|conn| PortfolioService::get_performance(conn, &id))
@@ -620,15 +654,48 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
+        let wealth = if settings.wealth_connected {
+            Some(crate::wealth::WealthClient::from_settings(
+                &settings,
+                wealth_password,
+            ))
+        } else {
+            None
+        };
+
         let ids = state
             .db
             .with_conn(|conn| {
-                block_on_local(SignalGenerationService::generate_for_portfolio(
-                    conn,
-                    &state.agent,
-                    &settings,
-                    None,
-                ))
+                block_on_local(async {
+                    let trading_mode = if let Some(ref w) = wealth {
+                        w.resolve_trading_mode(&settings).await
+                    } else {
+                        crate::wealth::TradingMode::Sandbox
+                    };
+                    let (cash, venue) = if trading_mode == crate::wealth::TradingMode::Live {
+                        let cash = if let Some(ref w) = wealth {
+                            match w.get_wallet().await {
+                                Ok(wallet) => Some(wallet.brokerage_balance),
+                                Err(_) => w.get_portfolio().await.ok().map(|s| s.balance),
+                            }
+                        } else {
+                            None
+                        };
+                        (cash, "wealth")
+                    } else {
+                        (None, "sandbox")
+                    };
+                    SignalGenerationService::generate_for_portfolio(
+                        conn,
+                        &state.agent,
+                        &settings,
+                        None,
+                        cash,
+                        venue,
+                    )
+                    .await
+                })
             })
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "signalIds": ids, "count": ids.len() }))

@@ -162,6 +162,7 @@ impl BacktestService {
                     &prices,
                     trades,
                     0.0,
+                    fill_sim.fee_pct,
                 );
 
                 if result != "APPROVED" || quantity <= 0.0 {

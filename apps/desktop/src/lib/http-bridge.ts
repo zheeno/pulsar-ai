@@ -248,8 +248,13 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       } as T;
     }
 
-    case 'portfolio_performance':
+    case 'portfolio_performance': {
+      const venue = String(args?.venue || 'sandbox');
+      if (venue === 'wealth') {
+        return [] as T;
+      }
       return loadStore().performance as T;
+    }
 
     case 'usage_ngx_pulse':
       return { daily: 0, limit: null, remaining: null, authMode: 'mock' } as T;

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -8,7 +8,7 @@ use crate::execution::ExecutionService;
 use crate::indicators::IndicatorService;
 use crate::settings::AppSettings;
 
-const PORTFOLIO_PROMPT_VERSION: &str = "v2.0.0";
+const PORTFOLIO_PROMPT_VERSION: &str = "v2.1.0";
 const PROMPT_VERSION: &str = "v1.0.0";
 
 pub struct SignalGenerationService;
@@ -19,6 +19,8 @@ impl SignalGenerationService {
         agent: &AgentBridge,
         settings: &AppSettings,
         portfolio_id: Option<&str>,
+        cash_balance: Option<f64>,
+        trading_venue: &str,
     ) -> Result<Vec<String>> {
         let param_set = Self::get_active_param_set(conn, portfolio_id)?;
         let Some(param_set) = param_set else {
@@ -34,11 +36,37 @@ impl SignalGenerationService {
         let market_context = Self::get_market_context(conn)?;
         let max_picks = param_set.max_daily_trades;
 
+        let mut memory_symbols: std::collections::HashSet<String> = positions
+            .iter()
+            .filter_map(|p| p.get("symbol").and_then(|s| s.as_str()).map(str::to_string))
+            .collect();
+        for sym in Self::recent_active_symbols(conn, 30)? {
+            memory_symbols.insert(sym);
+            if memory_symbols.len() >= 40 {
+                break;
+            }
+        }
+        let symbol_memory = Self::build_symbol_memory(conn, portfolio_id, &memory_symbols)?;
+
+        let cash = cash_balance.unwrap_or_else(|| {
+            conn.query_row(
+                "SELECT cash_balance FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap_or(0.0)
+        });
+
         let context = json!({
             "universe": universe,
             "positions": positions,
             "marketContext": market_context,
             "maxPicks": max_picks,
+            "symbolMemory": symbol_memory,
+            "cashBalance": cash,
+            "brokerageBalance": if trading_venue == "wealth" { Some(cash) } else { None::<f64> },
+            "tradingVenue": trading_venue,
+            "estimatedFeePct": settings.simulated_fee_pct,
         });
 
         let result = agent.portfolio_signals(settings, context).await?;
@@ -109,7 +137,15 @@ impl SignalGenerationService {
             return Ok(None);
         };
 
-        let context = json!({ "symbol": symbol, "technical": technical });
+        let mut mem_set = std::collections::HashSet::new();
+        mem_set.insert(symbol.to_string());
+        let symbol_memory = Self::build_symbol_memory(conn, None, &mem_set)?;
+
+        let context = json!({
+            "symbol": symbol,
+            "technical": technical,
+            "symbolMemory": symbol_memory.get(symbol).cloned().unwrap_or(json!({})),
+        });
         let result = agent.symbol_signal(settings, context).await?;
         let output = result.get("output").cloned().unwrap_or(result.clone());
         let prompt = result.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -220,11 +256,141 @@ impl SignalGenerationService {
             )?
         };
 
-        let mut stmt = conn.prepare("SELECT symbol, quantity FROM sandbox_positions WHERE portfolio_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT symbol, quantity, avg_cost FROM sandbox_positions WHERE portfolio_id = ?1",
+        )?;
         let rows = stmt.query_map([&pid], |row| {
-            Ok(json!({ "symbol": row.get::<_, String>(0)?, "quantity": row.get::<_, f64>(1)? }))
+            Ok(json!({
+                "symbol": row.get::<_, String>(0)?,
+                "quantity": row.get::<_, f64>(1)?,
+                "avgCost": row.get::<_, f64>(2)?,
+            }))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    fn recent_active_symbols(conn: &Connection, days: i64) -> Result<Vec<String>> {
+        let cutoff = format!("-{days} days");
+        let mut set = std::collections::HashSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT symbol FROM signals WHERE generated_at >= datetime('now', ?1)
+             UNION
+             SELECT symbol FROM sandbox_trades WHERE executed_at >= datetime('now', ?1)
+             UNION
+             SELECT symbol FROM broker_orders WHERE created_at >= datetime('now', ?1)
+             LIMIT 40",
+        )?;
+        for row in stmt.query_map([&cutoff], |row| row.get::<_, String>(0))? {
+            set.insert(row?);
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    fn build_symbol_memory(
+        conn: &Connection,
+        portfolio_id: Option<&str>,
+        symbols: &std::collections::HashSet<String>,
+    ) -> Result<serde_json::Map<String, Value>> {
+        let mut memory = serde_json::Map::new();
+        let pid = portfolio_id.map(|s| s.to_string()).or_else(|| {
+            conn.query_row(
+                "SELECT id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        });
+
+        for symbol in symbols {
+            let mut recent_signals = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT generated_at, action, confidence, rationale, executed, risk_policy_result
+                 FROM signals WHERE symbol = ?1 ORDER BY generated_at DESC LIMIT 5",
+            )?;
+            for row in stmt.query_map([symbol], |row| {
+                Ok(json!({
+                    "generatedAt": row.get::<_, String>(0)?,
+                    "action": row.get::<_, String>(1)?,
+                    "confidence": row.get::<_, f64>(2)?,
+                    "rationale": row.get::<_, String>(3)?,
+                    "executed": row.get::<_, i64>(4)? == 1,
+                    "riskPolicyResult": row.get::<_, String>(5)?,
+                }))
+            })? {
+                recent_signals.push(row?);
+            }
+
+            let mut recent_trades = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT side, quantity, fill_price, simulated_fee, executed_at
+                 FROM sandbox_trades WHERE symbol = ?1 ORDER BY executed_at DESC LIMIT 5",
+            )?;
+            for row in stmt.query_map([symbol], |row| {
+                Ok(json!({
+                    "side": row.get::<_, String>(0)?,
+                    "quantity": row.get::<_, f64>(1)?,
+                    "fillPrice": row.get::<_, f64>(2)?,
+                    "fee": row.get::<_, f64>(3)?,
+                    "executedAt": row.get::<_, String>(4)?,
+                    "venue": "sandbox",
+                }))
+            })? {
+                recent_trades.push(row?);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT side, quantity, fill_price, fee, created_at, status
+                 FROM broker_orders WHERE symbol = ?1 ORDER BY created_at DESC LIMIT 5",
+            )?;
+            for row in stmt.query_map([symbol], |row| {
+                Ok(json!({
+                    "side": row.get::<_, String>(0)?,
+                    "quantity": row.get::<_, f64>(1)?,
+                    "fillPrice": row.get::<_, Option<f64>>(2)?,
+                    "fee": row.get::<_, Option<f64>>(3)?,
+                    "executedAt": row.get::<_, String>(4)?,
+                    "status": row.get::<_, String>(5)?,
+                    "venue": "wealth",
+                }))
+            })? {
+                recent_trades.push(row?);
+            }
+            recent_trades.sort_by(|a, b| {
+                let da = a.get("executedAt").and_then(|v| v.as_str()).unwrap_or("");
+                let db = b.get("executedAt").and_then(|v| v.as_str()).unwrap_or("");
+                db.cmp(da)
+            });
+            recent_trades.truncate(5);
+
+            let position = if let Some(ref pid) = pid {
+                conn.query_row(
+                    "SELECT quantity, avg_cost FROM sandbox_positions WHERE portfolio_id = ?1 AND symbol = ?2",
+                    rusqlite::params![pid, symbol],
+                    |row| {
+                        Ok(json!({
+                            "quantity": row.get::<_, f64>(0)?,
+                            "avgCost": row.get::<_, f64>(1)?,
+                        }))
+                    },
+                )
+                .optional()?
+            } else {
+                None
+            };
+
+            if recent_signals.is_empty() && recent_trades.is_empty() && position.is_none() {
+                continue;
+            }
+
+            memory.insert(
+                symbol.clone(),
+                json!({
+                    "recentSignals": recent_signals,
+                    "recentTrades": recent_trades,
+                    "position": position,
+                }),
+            );
+        }
+        Ok(memory)
     }
 
     fn get_market_context(conn: &Connection) -> Result<Option<Value>> {
@@ -249,8 +415,6 @@ struct ParamSetRow {
     max_daily_trades: i64,
 }
 
-use rusqlite::OptionalExtension;
-
 pub async fn run_cycle(
     conn: &Connection,
     agent: &AgentBridge,
@@ -263,14 +427,42 @@ pub async fn run_cycle(
     let _ = crate::ingest::IngestionService::ingest_stocks(conn, client, cache, calendar, true).await;
     let _ = crate::ingest::IngestionService::ingest_market(conn, client, calendar, true).await;
 
-    let signal_ids = SignalGenerationService::generate_for_portfolio(conn, agent, settings, None).await?;
-
     let mut warnings: Vec<String> = Vec::new();
     let trading_mode = if let Some(w) = wealth {
         w.resolve_trading_mode(settings).await
     } else {
         crate::wealth::TradingMode::Sandbox
     };
+
+    let (cash_for_agent, trading_venue) = if trading_mode == crate::wealth::TradingMode::Live {
+        let cash = if let Some(w) = wealth {
+            match w.get_wallet().await {
+                Ok(wallet) => Some(wallet.brokerage_balance),
+                Err(e) => {
+                    warnings.push(format!("Could not load Wealth brokerage balance for agent: {e}"));
+                    match w.get_portfolio().await {
+                        Ok(snap) => Some(snap.balance),
+                        Err(_) => None,
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        (cash, "wealth")
+    } else {
+        (None, "sandbox")
+    };
+
+    let signal_ids = SignalGenerationService::generate_for_portfolio(
+        conn,
+        agent,
+        settings,
+        None,
+        cash_for_agent,
+        trading_venue,
+    )
+    .await?;
 
     let live_market_open = if trading_mode == crate::wealth::TradingMode::Live {
         match wealth {
@@ -301,6 +493,31 @@ pub async fn run_cycle(
 
     if trading_mode == crate::wealth::TradingMode::Sandbox {
         crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None)?;
+    } else if let Some(w) = wealth {
+        // Record Wealth equity for the Home curve (do not write sandbox history).
+        if let Ok((cash, snap)) = async {
+            let snap = w.get_portfolio().await?;
+            let cash = match w.get_wallet().await {
+                Ok(wallet) => wallet.brokerage_balance,
+                Err(_) => snap.balance,
+            };
+            Ok::<_, anyhow::Error>((cash, snap))
+        }
+        .await
+        {
+            let market_value = if snap.stock_value > 0.0 {
+                snap.stock_value
+            } else {
+                snap.holdings.iter().map(|h| h.current_value).sum()
+            };
+            let _ = crate::portfolio::EquityCurveService::upsert_point(
+                conn,
+                "wealth",
+                cash + market_value,
+                cash,
+                market_value,
+            );
+        }
     }
 
     Ok(json!({

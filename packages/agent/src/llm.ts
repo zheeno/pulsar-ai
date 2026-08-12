@@ -5,7 +5,7 @@ import {
 } from '@ngx/shared';
 import { createChatModel } from './model-factory';
 import { buildSignalPrompt } from './prompt/v1.0.0';
-import { buildPortfolioSignalPrompt } from './prompt/v2.0.0';
+import { buildPortfolioSignalPrompt } from './prompt/v2.1.0';
 
 function parseJson(text: string): unknown {
   const jsonMatch = text.match(/\{[\s\S]*\}/);

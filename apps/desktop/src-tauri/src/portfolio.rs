@@ -57,10 +57,17 @@ impl PortfolioService {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let pnl_today: f64 = conn
             .query_row(
-                "SELECT pnl_daily FROM daily_performance_snapshot WHERE portfolio_id = ?1 AND snapshot_date = ?2",
-                rusqlite::params![id, today],
+                "SELECT pnl_daily FROM equity_curve_points WHERE venue = 'sandbox' AND snapshot_date = ?1",
+                [&today],
                 |row| row.get(0),
             )
+            .or_else(|_| {
+                conn.query_row(
+                    "SELECT pnl_daily FROM daily_performance_snapshot WHERE portfolio_id = ?1 AND snapshot_date = ?2",
+                    rusqlite::params![id, today],
+                    |row| row.get(0),
+                )
+            })
             .unwrap_or(0.0);
 
         Ok(Some(PortfolioSummary {
@@ -107,7 +114,7 @@ impl PortfolioService {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    fn get_price(conn: &Connection, cache: &PriceCache, symbol: &str) -> f64 {
+    pub fn get_price(conn: &Connection, cache: &PriceCache, symbol: &str) -> f64 {
         if let Some(cached) = cache.get_price(symbol) {
             return cached.price;
         }
@@ -121,6 +128,58 @@ impl PortfolioService {
 }
 
 use rusqlite::OptionalExtension;
+
+pub struct EquityCurveService;
+
+impl EquityCurveService {
+    pub fn upsert_point(
+        conn: &Connection,
+        venue: &str,
+        total_equity: f64,
+        cash_balance: f64,
+        market_value: f64,
+    ) -> Result<()> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let prev_equity: f64 = conn
+            .query_row(
+                "SELECT total_equity FROM equity_curve_points
+                 WHERE venue = ?1 AND snapshot_date < ?2
+                 ORDER BY snapshot_date DESC LIMIT 1",
+                rusqlite::params![venue, today],
+                |row| row.get(0),
+            )
+            .unwrap_or(total_equity);
+        let pnl_daily = total_equity - prev_equity;
+        conn.execute(
+            "INSERT INTO equity_curve_points (venue, snapshot_date, total_equity, cash_balance, market_value, pnl_daily)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(venue, snapshot_date) DO UPDATE SET
+               total_equity = excluded.total_equity,
+               cash_balance = excluded.cash_balance,
+               market_value = excluded.market_value,
+               pnl_daily = excluded.pnl_daily",
+            rusqlite::params![venue, today, total_equity, cash_balance, market_value, pnl_daily],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_curve(conn: &Connection, venue: &str) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = conn.prepare(
+            "SELECT snapshot_date, total_equity, cash_balance, market_value, pnl_daily
+             FROM equity_curve_points WHERE venue = ?1 ORDER BY snapshot_date",
+        )?;
+        let rows = stmt.query_map([venue], |row| {
+            Ok(serde_json::json!({
+                "snapshot_date": row.get::<_, String>(0)?,
+                "total_equity": row.get::<_, f64>(1)?,
+                "cash_balance": row.get::<_, f64>(2)?,
+                "market_value": row.get::<_, f64>(3)?,
+                "pnl_daily": row.get::<_, f64>(4)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+}
 
 pub struct DailySnapshotService;
 
@@ -189,7 +248,11 @@ impl DailySnapshotService {
             .unwrap_or(starting_capital)
             .max(total_equity);
 
-        let drawdown_pct = if peak > 0.0 { (peak - total_equity) / peak } else { 0.0 };
+        let drawdown_pct = if peak > 0.0 {
+            (peak - total_equity) / peak
+        } else {
+            0.0
+        };
 
         let benchmark_change: f64 = conn
             .query_row(
@@ -205,8 +268,18 @@ impl DailySnapshotService {
              ON CONFLICT(portfolio_id, snapshot_date) DO UPDATE SET
                total_equity = excluded.total_equity, pnl_daily = excluded.pnl_daily,
                pnl_cumulative = excluded.pnl_cumulative, drawdown_pct = excluded.drawdown_pct",
-            rusqlite::params![portfolio_id, today, total_equity, pnl_daily, pnl_cumulative, benchmark_change, drawdown_pct],
+            rusqlite::params![
+                portfolio_id,
+                today,
+                total_equity,
+                pnl_daily,
+                pnl_cumulative,
+                benchmark_change,
+                drawdown_pct
+            ],
         )?;
+
+        EquityCurveService::upsert_point(conn, "sandbox", total_equity, cash_balance, market_value)?;
         Ok(())
     }
 }

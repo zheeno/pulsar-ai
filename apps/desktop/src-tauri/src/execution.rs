@@ -37,6 +37,7 @@ impl RiskPolicyService {
         prices: &std::collections::HashMap<String, f64>,
         daily_trades: i64,
         daily_drawdown_pct: f64,
+        fee_pct: f64,
     ) -> (String, f64) {
         if signal.action == "HOLD" {
             return ("BLOCKED_OTHER".into(), 0.0);
@@ -61,7 +62,12 @@ impl RiskPolicyService {
         let total_equity = cash_balance + market_value;
 
         if signal.action == "BUY" {
-            let quantity = Self::position_size(total_equity, current_price, param_set, position_value);
+            let mut quantity =
+                Self::position_size(total_equity, current_price, param_set, position_value);
+            quantity = Self::cap_qty_by_cash(quantity, current_price, cash_balance, fee_pct);
+            if quantity < 1.0 {
+                return ("BLOCKED_CASH".into(), 0.0);
+            }
             let new_exposure = if total_equity > 0.0 {
                 (position_value + quantity * current_price) / total_equity
             } else {
@@ -99,11 +105,24 @@ impl RiskPolicyService {
         let alloc_value = target_value.min(max_value.max(0.0));
         (alloc_value / current_price).floor()
     }
+
+    /// Cap quantity so (price * qty) * (1 + fee_pct) fits in spendable cash.
+    pub fn cap_qty_by_cash(qty: f64, price: f64, cash: f64, fee_pct: f64) -> f64 {
+        if price <= 0.0 || qty <= 0.0 || cash <= 0.0 {
+            return 0.0;
+        }
+        let unit_cost = price * (1.0 + fee_pct.max(0.0));
+        if unit_cost <= 0.0 {
+            return 0.0;
+        }
+        let max_qty = (cash / unit_cost).floor();
+        qty.min(max_qty).max(0.0)
+    }
 }
 
 pub struct FillSimulator {
-    slippage_bps: f64,
-    fee_pct: f64,
+    pub slippage_bps: f64,
+    pub fee_pct: f64,
 }
 
 impl FillSimulator {
@@ -260,6 +279,7 @@ impl ExecutionService {
             action: action.clone(),
             confidence,
         };
+        let fee_pct = settings.simulated_fee_pct.max(0.0);
         let (result, quantity) = RiskPolicyService::evaluate(
             &input,
             &param_set,
@@ -268,6 +288,7 @@ impl ExecutionService {
             &prices,
             daily_trades,
             daily_drawdown,
+            fee_pct,
         );
 
         conn.execute(
@@ -310,20 +331,29 @@ impl ExecutionService {
         signal_id: &str,
         symbol: &str,
         side: &str,
-        quantity: f64,
+        mut quantity: f64,
     ) -> Result<()> {
         let (stock_id, price) = client.resolve_stock_id(symbol).await?;
         if price <= 0.0 {
             return Err(anyhow::anyhow!("No Wealth price for {symbol}"));
         }
 
-        let fee = client.calculate_fee(stock_id, quantity, price).await?;
+        let mut fee = client.calculate_fee(stock_id, quantity, price).await?;
         if side == "BUY" {
             let wallet = client.get_wallet().await?;
-            let cost = price * quantity + fee.rounded_fee;
-            if wallet.brokerage_balance < cost {
+            let mut cost = price * quantity + fee.rounded_fee;
+            // Shrink-to-fit when brokerage balance cannot cover sized qty + fee.
+            while quantity >= 1.0 && wallet.brokerage_balance < cost {
+                quantity = (quantity - 1.0).floor();
+                if quantity < 1.0 {
+                    break;
+                }
+                fee = client.calculate_fee(stock_id, quantity, price).await?;
+                cost = price * quantity + fee.rounded_fee;
+            }
+            if quantity < 1.0 {
                 return Err(anyhow::anyhow!(
-                    "Insufficient brokerage balance for {symbol} (need ₦{cost:.2}, have ₦{:.2})",
+                    "Insufficient brokerage balance for {symbol} (have ₦{:.2})",
                     wallet.brokerage_balance
                 ));
             }

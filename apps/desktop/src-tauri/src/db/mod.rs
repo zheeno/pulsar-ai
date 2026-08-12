@@ -34,6 +34,9 @@ impl Database {
         let migration2 = include_str!("../../migrations/002_broker_orders.sql");
         conn.execute_batch(migration2)
             .context("run broker_orders migration")?;
+        let migration3 = include_str!("../../migrations/003_equity_curve_venue.sql");
+        conn.execute_batch(migration3)
+            .context("run equity_curve_venue migration")?;
         // Discontinue strategy symbol allowlists — universe is all active instruments.
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;

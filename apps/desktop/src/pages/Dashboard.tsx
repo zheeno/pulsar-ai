@@ -97,13 +97,12 @@ export default function DashboardPage() {
       setUsage(usageData);
       setMarket(marketData);
       setError(null);
-      if (portfolio.portfolio?.id) {
-        const perf = await api<{ snapshot_date: string; total_equity: number }[]>(
-          'portfolio_performance',
-          { id: portfolio.portfolio.id },
-        );
-        setPerformance(perf);
-      }
+      const venue = portfolio.tradingMode === 'live' ? 'wealth' : 'sandbox';
+      const perf = await api<{ snapshot_date: string; total_equity: number }[]>(
+        'portfolio_performance',
+        { venue, id: portfolio.portfolio?.id },
+      );
+      setPerformance(perf);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -291,7 +290,7 @@ export default function DashboardPage() {
         <p className="empty-state">{error ? 'Could not load portfolio.' : 'Loading portfolio…'}</p>
       )}
 
-      {performance.length > 0 && (
+      {performance.length > 0 ? (
         <div className="panel">
           <h2>Equity curve</h2>
           <ResponsiveContainer width="100%" height={280}>
@@ -330,7 +329,14 @@ export default function DashboardPage() {
             </AreaChart>
           </ResponsiveContainer>
         </div>
-      )}
+      ) : data?.tradingMode === 'live' ? (
+        <div className="panel">
+          <h2>Equity curve</h2>
+          <p className="muted" style={{ margin: 0 }}>
+            No Wealth equity history yet. Points are recorded when you open Home or complete a live cycle.
+          </p>
+        </div>
+      ) : null}
 
       {data && data.positions.length > 0 && (
         <div className="panel">
