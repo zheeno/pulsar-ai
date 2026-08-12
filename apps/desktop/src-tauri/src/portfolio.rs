@@ -105,7 +105,7 @@ impl PortfolioService {
                 "drawdown_pct": row.get::<_, f64>(5)?,
             }))
         })?;
-        rows.filter_map(|r| r.ok()).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     fn get_price(conn: &Connection, cache: &PriceCache, symbol: &str) -> f64 {
@@ -135,9 +135,11 @@ impl DailySnapshotService {
             )?]
         } else {
             let mut stmt = conn.prepare("SELECT id, cash_balance, starting_capital FROM sandbox_portfolios")?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            let list: Vec<(String, f64, f64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .filter_map(|r| r.ok())
-                .collect()
+                .collect();
+            list
         };
 
         for (pid, cash_balance, starting_capital) in portfolios {

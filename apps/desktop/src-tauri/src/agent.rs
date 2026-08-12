@@ -1,12 +1,10 @@
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::Arc;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use uuid::Uuid;
 
 use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
@@ -31,25 +29,39 @@ impl AgentBridge {
         }
     }
 
+    pub fn ping_sync(&self) -> Result<Value> {
+        self.call(json!({ "op": "ping" }))
+    }
+
     pub async fn ping(&self) -> Result<Value> {
-        self.call(json!({ "op": "ping" })).await
+        self.ping_sync()
+    }
+
+    pub fn test_llm_sync(&self, settings: &AppSettings) -> Result<Value> {
+        let llm = self.build_llm_config(settings)?;
+        self.call(json!({ "op": "test_llm", "llm": llm }))
     }
 
     pub async fn test_llm(&self, settings: &AppSettings) -> Result<Value> {
+        self.test_llm_sync(settings)
+    }
+
+    pub fn portfolio_signals_sync(&self, settings: &AppSettings, context: Value) -> Result<Value> {
         let llm = self.build_llm_config(settings)?;
-        self.call(json!({ "op": "test_llm", "llm": llm })).await
+        self.call(json!({ "op": "portfolio_signals", "context": context, "llm": llm }))
     }
 
     pub async fn portfolio_signals(&self, settings: &AppSettings, context: Value) -> Result<Value> {
+        self.portfolio_signals_sync(settings, context)
+    }
+
+    pub fn symbol_signal_sync(&self, settings: &AppSettings, context: Value) -> Result<Value> {
         let llm = self.build_llm_config(settings)?;
-        self.call(json!({ "op": "portfolio_signals", "context": context, "llm": llm }))
-            .await
+        self.call(json!({ "op": "symbol_signal", "context": context, "llm": llm }))
     }
 
     pub async fn symbol_signal(&self, settings: &AppSettings, context: Value) -> Result<Value> {
-        let llm = self.build_llm_config(settings)?;
-        self.call(json!({ "op": "symbol_signal", "context": context, "llm": llm }))
-            .await
+        self.symbol_signal_sync(settings, context)
     }
 
     fn build_llm_config(&self, settings: &AppSettings) -> Result<Value> {
@@ -65,28 +77,26 @@ impl AgentBridge {
         }))
     }
 
-    async fn call(&self, mut payload: Value) -> Result<Value> {
+    fn call(&self, mut payload: Value) -> Result<Value> {
         let id = Uuid::new_v4().to_string();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("id".into(), json!(id));
         }
 
         let line = serde_json::to_string(&payload)?;
-        let mut guard = self.child.lock();
-        let process = if guard.is_none() {
-            *guard = Some(spawn_worker(&self.worker_path).await?);
-            guard.as_mut().unwrap()
-        } else {
-            guard.as_mut().unwrap()
-        };
+        let mut guard = self.child.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(spawn_worker(&self.worker_path)?);
+        }
+        let process = guard.as_mut().unwrap();
 
-        process.stdin.write_all(line.as_bytes()).await?;
-        process.stdin.write_all(b"\n").await?;
-        process.stdin.flush().await?;
+        writeln!(process.stdin, "{line}").context("write agent")?;
+        process.stdin.flush()?;
 
         let mut response_line = String::new();
-        process.stdout.read_line(&mut response_line).await?;
-        let response: Value = serde_json::from_str(response_line.trim()).context("parse agent response")?;
+        process.stdout.read_line(&mut response_line).context("read agent")?;
+        let response: Value =
+            serde_json::from_str(response_line.trim()).context("parse agent response")?;
 
         if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let err = response
@@ -100,7 +110,7 @@ impl AgentBridge {
     }
 }
 
-async fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
+fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
     let mut child = Command::new("node")
         .arg(path)
         .stdin(Stdio::piped())

@@ -10,6 +10,7 @@ use crate::ingest::IngestionService;
 use crate::ngx::NgxPulseClient;
 use crate::portfolio::PortfolioService;
 use crate::rate_limit::RateLimiter;
+use crate::runtime_util::block_on_local;
 use crate::secrets::{delete_secret, get_secret, set_secret, SECRET_LLM_API_KEY, SECRET_PULSE_API_KEY, SECRET_PULSE_PASSWORD};
 use crate::settings::{get_settings, save_settings, AppSettings};
 use crate::signals::{run_cycle, SignalGenerationService};
@@ -67,11 +68,16 @@ pub fn settings_set(payload: SettingsUpdate, state: State<'_, Arc<AppState>>) ->
 
 #[tauri::command]
 pub async fn test_pulse_login(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
-    let password = get_secret(SECRET_PULSE_PASSWORD).map_err(|e| e.to_string())?;
-    let api_key = get_secret(SECRET_PULSE_API_KEY).map_err(|e| e.to_string())?;
-    let client = NgxPulseClient::from_settings(&settings, password, api_key);
-    client.test_login().await.map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(SECRET_PULSE_PASSWORD).map_err(|e| e.to_string())?;
+        let api_key = get_secret(SECRET_PULSE_API_KEY).map_err(|e| e.to_string())?;
+        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+        block_on_local(client.test_login()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -128,56 +134,78 @@ pub fn usage_ngx_pulse(state: State<'_, Arc<AppState>>) -> Result<serde_json::Va
 
 #[tauri::command]
 pub async fn cycle_run(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
-    let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
-    let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
-    let client = NgxPulseClient::from_settings(&settings, password, api_key);
-    let calendar = TradingCalendar::default();
-
-    let db = &state.db;
-    let cache = &state.cache;
-    let agent = &state.agent;
-
-    db.with_conn(|conn| {
-        tauri::async_runtime::block_on(async {
-            run_cycle(conn, agent, &settings, cache, &client, &calendar).await
-        })
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
+        let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
+        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+        let calendar = TradingCalendar::default();
+        state
+            .db
+            .with_conn(|conn| {
+                block_on_local(run_cycle(
+                    conn,
+                    &state.agent,
+                    &settings,
+                    &state.cache,
+                    &client,
+                    &calendar,
+                ))
+            })
+            .map_err(|e| e.to_string())
     })
-    .map_err(|e| e.to_string())
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn cycle_ingest(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
-    let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
-    let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
-    let client = NgxPulseClient::from_settings(&settings, password, api_key);
-    let calendar = TradingCalendar::default();
-
-    let count = state
-        .db
-        .with_conn(|conn| {
-            tauri::async_runtime::block_on(async {
-                IngestionService::ingest_stocks(conn, &client, &state.cache, &calendar, true).await
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
+        let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
+        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+        let calendar = TradingCalendar::default();
+        let count = state
+            .db
+            .with_conn(|conn| {
+                block_on_local(IngestionService::ingest_stocks(
+                    conn,
+                    &client,
+                    &state.cache,
+                    &calendar,
+                    true,
+                ))
             })
-        })
-        .map_err(|e| e.to_string())?;
-
-    Ok(serde_json::json!({ "count": count }))
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "count": count }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
-    let ids = state
-        .db
-        .with_conn(|conn| {
-            tauri::async_runtime::block_on(async {
-                SignalGenerationService::generate_for_portfolio(conn, &state.agent, &settings, None).await
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let ids = state
+            .db
+            .with_conn(|conn| {
+                block_on_local(SignalGenerationService::generate_for_portfolio(
+                    conn,
+                    &state.agent,
+                    &settings,
+                    None,
+                ))
             })
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "signalIds": ids, "count": ids.len() }))
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "signalIds": ids, "count": ids.len() }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -203,7 +231,7 @@ pub fn list_signals(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resu
                     "risk_policy_result": row.get::<_, String>(8)?,
                 }))
             })?;
-            rows.filter_map(|r| r.ok()).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         })
         .map_err(|e| e.to_string())
 }
@@ -230,7 +258,7 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
                     "resulting_cash_balance": row.get::<_, f64>(7)?,
                 }))
             })?;
-            rows.filter_map(|r| r.ok()).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         })
         .map_err(|e| e.to_string())
 }
@@ -240,7 +268,7 @@ pub fn get_strategy(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
     state
         .db
         .with_conn(|conn| {
-            conn.query_row(
+            Ok(conn.query_row(
                 "SELECT id, name, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct, allowed_symbols, is_active
                  FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
                 [],
@@ -255,11 +283,11 @@ pub fn get_strategy(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
                         "min_confidence_to_trade": row.get::<_, f64>(5)?,
                         "max_daily_drawdown_pct": row.get::<_, f64>(6)?,
                         "position_size_pct": row.get::<_, f64>(7)?,
-                        "allowed_symbols": allowed.and_then(|s| serde_json::from_str(&s).ok()),
+                        "allowed_symbols": allowed.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
                         "is_active": row.get::<_, i64>(9)? == 1,
                     }))
                 },
-            )
+            )?)
         })
         .map_err(|e| e.to_string())
 }
@@ -279,10 +307,10 @@ pub async fn start_backtest(
     let state_clone = state.inner().clone();
     let run_id_clone = run_id.clone();
     tauri::async_runtime::spawn(async move {
-        let settings = state_clone.db.with_conn(get_settings).unwrap_or_default();
-        let _ = state_clone.db.with_conn(|conn| {
-            tauri::async_runtime::block_on(async {
-                BacktestService::run_async(
+        let _ = tokio::task::spawn_blocking(move || {
+            let settings = state_clone.db.with_conn(get_settings).unwrap_or_default();
+            state_clone.db.with_conn(|conn| {
+                block_on_local(BacktestService::run_async(
                     conn,
                     &state_clone.agent,
                     &settings,
@@ -290,10 +318,10 @@ pub async fn start_backtest(
                     &strategy_param_set_id,
                     &start_date,
                     &end_date,
-                )
-                .await
+                ))
             })
-        });
+        })
+        .await;
     });
 
     Ok(run_id)

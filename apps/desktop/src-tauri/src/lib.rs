@@ -11,6 +11,7 @@ mod ingest;
 mod ngx;
 mod portfolio;
 mod rate_limit;
+mod runtime_util;
 mod scheduler;
 mod secrets;
 mod seed;

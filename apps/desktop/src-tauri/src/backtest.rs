@@ -39,7 +39,7 @@ impl BacktestService {
                     "start_date": row.get::<_, String>(2)?,
                     "end_date": row.get::<_, String>(3)?,
                     "status": row.get::<_, String>(4)?,
-                    "results": results.and_then(|s| serde_json::from_str(&s).ok()),
+                    "results": results.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "created_at": row.get::<_, String>(6)?,
                     "completed_at": row.get::<_, Option<String>>(7)?,
                 }))
@@ -250,8 +250,8 @@ fn resolve_symbols(conn: &Connection, param_set: &ParamSet) -> Result<Vec<String
         }
     }
     let mut stmt = conn.prepare("SELECT symbol FROM instruments WHERE is_active = 1")?;
-    let rows = stmt.query_map([], |row| row.get(0))?;
-    rows.filter_map(|r| r.ok()).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 fn get_technical_at_date(conn: &Connection, symbol: &str, date: &str) -> Result<Option<serde_json::Value>> {

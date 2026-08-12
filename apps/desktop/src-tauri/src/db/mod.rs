@@ -27,7 +27,7 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<()> {
-        let migration = include_str!("../migrations/001_initial.sql");
+        let migration = include_str!("../../migrations/001_initial.sql");
         let conn = self.conn.lock();
         conn.execute_batch(migration)
             .context("run migrations")?;

@@ -335,7 +335,7 @@ impl ExecutionService {
             "SELECT symbol, quantity, avg_cost FROM sandbox_positions WHERE portfolio_id = ?1",
         )?;
         let rows = stmt.query_map([portfolio_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        rows.filter_map(|r| r.ok()).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     fn get_prices(

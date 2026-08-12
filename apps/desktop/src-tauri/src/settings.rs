@@ -23,13 +23,19 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            pulse_supabase_url: None,
+            pulse_supabase_anon_key: None,
+            pulse_email: None,
             pulse_base_url: "https://ngxpulse.ng/api".into(),
             llm_provider: "openai".into(),
             llm_model: "gpt-4o-mini".into(),
+            llm_base_url: None,
+            pulse_configured: false,
+            llm_configured: false,
+            onboarding_complete: false,
             default_starting_capital: 10_000_000.0,
             simulated_slippage_bps: 10.0,
             simulated_fee_pct: 0.0015,
-            ..Default::default()
         }
     }
 }

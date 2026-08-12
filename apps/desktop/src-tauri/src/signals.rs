@@ -218,7 +218,7 @@ impl SignalGenerationService {
                 "volume": row.get::<_, Option<i64>>(5)?,
             }))
         })?;
-        rows.filter_map(|r| r.ok()).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     fn get_positions(conn: &Connection, portfolio_id: Option<&str>) -> Result<Vec<Value>> {
@@ -236,7 +236,7 @@ impl SignalGenerationService {
         let rows = stmt.query_map([&pid], |row| {
             Ok(json!({ "symbol": row.get::<_, String>(0)?, "quantity": row.get::<_, f64>(1)? }))
         })?;
-        rows.filter_map(|r| r.ok()).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     fn get_market_context(conn: &Connection) -> Result<Option<Value>> {

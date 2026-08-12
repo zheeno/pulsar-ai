@@ -1,7 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use parking_lot::Mutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -216,7 +215,7 @@ impl NgxPulseClient {
             .context("ngx pulse request")?;
 
         if res.status().as_u16() == 401 && self.auth_mode == AuthMode::Session {
-            *self.tokens.lock() = None;
+            *self.tokens.lock().unwrap() = None;
             let retry_token = self.get_access_token().await?;
             res = self
                 .http
@@ -251,7 +250,7 @@ impl NgxPulseClient {
 
     async fn ensure_session(&self) -> Result<String> {
         {
-            let guard = self.tokens.lock();
+            let guard = self.tokens.lock().unwrap();
             if let Some(tokens) = guard.as_ref() {
                 if !is_expiring_soon(tokens.expires_at) {
                     return Ok(tokens.access_token.clone());
@@ -259,15 +258,35 @@ impl NgxPulseClient {
             }
         }
 
-        if let Some(refresh) = self.tokens.lock().as_ref().map(|t| t.refresh_token.clone()) {
+        let refresh = self
+            .tokens
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|t| t.refresh_token.clone());
+        if let Some(refresh) = refresh {
             if self.refresh_session(&refresh).await.is_ok() {
-                return Ok(self.tokens.lock().as_ref().unwrap().access_token.clone());
+                return Ok(self
+                    .tokens
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .access_token
+                    .clone());
             }
-            *self.tokens.lock() = None;
+            *self.tokens.lock().unwrap() = None;
         }
 
         self.login().await?;
-        Ok(self.tokens.lock().as_ref().unwrap().access_token.clone())
+        Ok(self
+            .tokens
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .access_token
+            .clone())
     }
 
     async fn login(&self) -> Result<()> {
@@ -293,7 +312,7 @@ impl NgxPulseClient {
             .context("pulse login")?;
 
         let tokens = parse_auth_response(res).await?;
-        *self.tokens.lock() = Some(tokens);
+        *self.tokens.lock().unwrap() = Some(tokens);
         Ok(())
     }
 
@@ -313,7 +332,7 @@ impl NgxPulseClient {
             .context("pulse refresh")?;
 
         let tokens = parse_auth_response(res).await?;
-        *self.tokens.lock() = Some(tokens);
+        *self.tokens.lock().unwrap() = Some(tokens);
         Ok(())
     }
 }

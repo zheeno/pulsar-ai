@@ -20,7 +20,7 @@ pub fn get_secret(key: &str) -> Result<Option<String>> {
 
 pub fn delete_secret(key: &str) -> Result<()> {
     let entry = Entry::new(SERVICE, key).context("keyring entry")?;
-    match entry.delete_password() {
+    match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.into()),
