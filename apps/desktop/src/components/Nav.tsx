@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import { useCycle } from '../lib/cycle';
 import { useSession } from '../lib/session';
 import {
   IconBacktest,
@@ -23,6 +24,7 @@ const links = [
 export default function Nav() {
   const location = useLocation();
   const { logout } = useSession();
+  const { running: cycleRunning } = useCycle();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -64,6 +66,12 @@ export default function Nav() {
         })}
       </nav>
       <div className="nav-rail__footer">
+        {cycleRunning && (
+          <div className="cycle-indicator" role="status" aria-live="polite">
+            <IconSpinner size={14} />
+            <span className="nav-rail__link-label">Cycle running…</span>
+          </div>
+        )}
         {confirming && (
           <button
             type="button"

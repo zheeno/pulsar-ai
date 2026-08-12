@@ -266,6 +266,75 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       } as T;
     }
 
+    case 'cycle_status':
+      return { running: false } as T;
+
+    case 'symbol_detail': {
+      const symbol = String(args?.symbol || 'GTCO').toUpperCase();
+      const store = loadStore();
+      const pos = store.positions.find((p) => p.symbol === symbol);
+      return {
+        symbol,
+        name: pos ? `${symbol} Plc` : symbol,
+        sector: 'Financial Services',
+        found: true,
+        latest: { date: '2026-08-12', price: pos?.current_price ?? 45, changePercent: 1.2 },
+        prices: [
+          { date: '2026-08-01', price: 44 },
+          { date: '2026-08-05', price: 45 },
+          { date: '2026-08-10', price: pos?.current_price ?? 46 },
+        ],
+        position: pos
+          ? { quantity: pos.quantity, avgCost: pos.avg_cost }
+          : null,
+        signals: store.signals
+          .filter((s) => s.symbol === symbol)
+          .map((s) => ({
+            id: s.id,
+            generatedAt: s.generated_at,
+            action: s.action,
+            confidence: s.confidence,
+            rationale: s.rationale,
+            modelName: s.model_name,
+            executed: s.executed,
+            riskPolicyResult: s.risk_policy_result,
+          })),
+        trades: store.trades
+          .filter((t: Record<string, unknown>) => t.symbol === symbol)
+          .map((t: Record<string, unknown>) => ({
+            id: t.id,
+            side: t.side,
+            quantity: t.quantity,
+            fillPrice: t.fill_price,
+            simulatedFee: t.simulated_fee,
+            executedAt: t.executed_at,
+            resultingCashBalance: t.resulting_cash_balance,
+          })),
+        pulseQuote: {
+          price: pos?.current_price ?? 45,
+          changePercent: 1.2,
+          volume: 100000,
+        },
+        needsPulsePrices: false,
+      } as T;
+    }
+
+    case 'symbol_detail_pulse': {
+      const symbol = String(args?.symbol || 'GTCO').toUpperCase();
+      return {
+        symbol,
+        prices: [
+          { date: '2026-05-01', price: 40 },
+          { date: '2026-06-01', price: 42 },
+          { date: '2026-07-01', price: 44 },
+          { date: '2026-08-01', price: 45 },
+          { date: '2026-08-10', price: 46 },
+        ],
+        pulseQuote: { price: 46, changePercent: 2.2, volume: 120000, source: 'ngx_pulse' },
+        error: null,
+      } as T;
+    }
+
     case 'cycle_run':
     case 'cycle_ingest':
     case 'generate_signals': {

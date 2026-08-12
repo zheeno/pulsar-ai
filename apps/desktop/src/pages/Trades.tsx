@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { IconTrades } from '../components/Icons';
 import { api } from '../lib/api';
 import { useToast } from '../lib/toast';
@@ -69,7 +70,11 @@ export default function TradesPage() {
             <tbody>
               {trades.map((t) => (
                 <tr key={t.id}>
-                  <td className="mono">{t.symbol}</td>
+                  <td className="mono">
+                    <Link className="symbol-link" to={`/symbol/${encodeURIComponent(t.symbol)}`}>
+                      {t.symbol}
+                    </Link>
+                  </td>
                   <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
                   <td className="mono">{Number(t.quantity).toLocaleString()}</td>
                   <td className="mono">{formatNaira(Number(t.fill_price))}</td>

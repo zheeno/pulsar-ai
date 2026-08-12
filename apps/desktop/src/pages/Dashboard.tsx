@@ -10,7 +10,9 @@ import {
 } from 'recharts';
 import { IconShieldAlert, IconShieldCheck, IconSpinner } from '../components/Icons';
 import { api, type PortfolioData } from '../lib/api';
+import { useCycle } from '../lib/cycle';
 import { useToast } from '../lib/toast';
+import { Link } from 'react-router-dom';
 
 type RawPortfolio = PortfolioData & {
   totalEquity?: number;
@@ -56,6 +58,7 @@ function marketPhaseLabel(phase: string): string {
 
 export default function DashboardPage() {
   const toast = useToast();
+  const { running: cycleRunning } = useCycle();
   const [data, setData] = useState<PortfolioData | null>(null);
   const [performance, setPerformance] = useState<{ snapshot_date: string; total_equity: number }[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -97,22 +100,24 @@ export default function DashboardPage() {
   }
 
   async function runCycle() {
+    if (cycleRunning || cycleBusy) return;
     setCycleBusy(true);
-    toast.info('Running trading cycle…', 'Cycle');
     try {
-      const result = await api<{ signals: number; executed: number; warnings: string[] }>('cycle_run');
-      const warnings = result.warnings?.length ? ` Warnings: ${result.warnings.join('; ')}` : '';
-      toast.success(
-        `${result.signals} signals, ${result.executed} executed.${warnings}`,
-        'Cycle complete',
-      );
+      await api('cycle_run');
       void loadData();
     } catch (e) {
-      toast.error(String(e), 'Cycle failed');
+      const msg = String(e);
+      // Gate rejection has no cycle:complete event.
+      if (msg.toLowerCase().includes('already running')) {
+        toast.warning(msg, 'Cycle');
+      }
+      // Other failures emit cycle:complete (handled by CycleProvider).
     } finally {
       setCycleBusy(false);
     }
   }
+
+  const cycleBlocked = cycleRunning || cycleBusy;
 
   const formatNaira = (n: number | null | undefined) => {
     const value = Number(n ?? 0);
@@ -186,6 +191,15 @@ export default function DashboardPage() {
                 </span>
               </>
             ) : null}
+            {cycleRunning ? (
+              <>
+                <span className="status-hero__meta-sep" aria-hidden>·</span>
+                <span className="status-pill status-pill--warn" style={{ padding: '2px 8px', fontSize: '0.72rem' }}>
+                  <IconSpinner size={12} />
+                  Cycle running
+                </span>
+              </>
+            ) : null}
           </div>
           <h1 className="status-hero__title">{status.title}</h1>
           <p className="status-hero__sub">{status.sub}</p>
@@ -200,11 +214,11 @@ export default function DashboardPage() {
         <button
           type="button"
           className="btn btn-primary"
-          disabled={cycleBusy || !!error}
+          disabled={cycleBlocked || !!error}
           onClick={() => void runCycle()}
         >
-          {cycleBusy && <IconSpinner />}
-          {cycleBusy ? 'Running…' : 'Run trading cycle'}
+          {cycleBlocked && <IconSpinner />}
+          {cycleBlocked ? 'Cycle running…' : 'Run trading cycle'}
         </button>
       </section>
 
@@ -299,7 +313,11 @@ export default function DashboardPage() {
             <tbody>
               {data.positions.map((p) => (
                 <tr key={p.symbol}>
-                  <td className="mono">{p.symbol}</td>
+                  <td className="mono">
+                    <Link className="symbol-link" to={`/symbol/${encodeURIComponent(p.symbol)}`}>
+                      {p.symbol}
+                    </Link>
+                  </td>
                   <td className="mono">{Number(p.quantity).toLocaleString()}</td>
                   <td className="mono">{formatNaira(Number(p.avg_cost))}</td>
                   <td className="mono">{formatNaira(Number(p.current_price))}</td>

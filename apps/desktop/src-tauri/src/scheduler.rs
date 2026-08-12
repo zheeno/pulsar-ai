@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::time::MissedTickBehavior;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, CycleGateGuard};
 use crate::calendar::TradingCalendar;
 use crate::runtime_util::block_on_local;
 use crate::secrets::{get_secret, SECRET_PULSE_API_KEY, SECRET_PULSE_PASSWORD};
@@ -52,17 +52,22 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
             let app2 = app_cycle.clone();
             let state2 = state_cycle.clone();
             match tokio::task::spawn_blocking(move || run_scheduled_cycle(&app2, &state2)).await {
-                Ok(Ok(())) => {
+                Ok(Ok(true)) => {
                     tracing::info!(target: "scheduler", "auto cycle completed");
+                    last_cycle_at = Some(Instant::now());
+                }
+                Ok(Ok(false)) => {
+                    tracing::info!(target: "scheduler", "auto cycle skipped (already running)");
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(target: "scheduler", error = %e, "auto cycle failed");
+                    last_cycle_at = Some(Instant::now());
                 }
                 Err(e) => {
                     tracing::warn!(target: "scheduler", error = %e, "auto cycle task join failed");
+                    last_cycle_at = Some(Instant::now());
                 }
             }
-            last_cycle_at = Some(Instant::now());
         }
     });
 
@@ -97,18 +102,28 @@ fn catch_up_on_launch(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<
     Ok(())
 }
 
-fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<()> {
+/// Returns `Ok(true)` if a cycle ran, `Ok(false)` if skipped because another cycle holds the gate.
+fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<bool> {
     let settings = state.db.with_conn(get_settings)?;
     if !settings.auto_cycle_enabled || !settings.onboarding_complete {
-        return Ok(());
+        return Ok(false);
     }
+
+    let Some(_gate) = CycleGateGuard::acquire(state.clone()) else {
+        return Ok(false);
+    };
+
+    let _ = app.emit(
+        "cycle:start",
+        serde_json::json!({ "source": "scheduler" }),
+    );
 
     let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
     let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
     let calendar = TradingCalendar::default();
 
-    let result = state.db.with_conn(|conn| {
+    match state.db.with_conn(|conn| {
         block_on_local(run_cycle(
             conn,
             &state.agent,
@@ -117,8 +132,27 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
             &client,
             &calendar,
         ))
-    })?;
-
-    let _ = app.emit("cycle:complete", result);
-    Ok(())
+    }) {
+        Ok(result) => {
+            let mut payload = result;
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("ok".into(), serde_json::json!(true));
+                obj.insert("source".into(), serde_json::json!("scheduler"));
+            }
+            let _ = app.emit("cycle:complete", payload);
+            Ok(true)
+        }
+        Err(e) => {
+            let payload = serde_json::json!({
+                "ok": false,
+                "source": "scheduler",
+                "signals": 0,
+                "executed": 0,
+                "warnings": [],
+                "error": e.to_string(),
+            });
+            let _ = app.emit("cycle:complete", payload);
+            Err(e)
+        }
+    }
 }

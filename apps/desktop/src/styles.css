@@ -177,6 +177,19 @@ button,
   border-top: 1px solid var(--border-subtle);
 }
 
+.cycle-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
 .app-main {
   margin-left: var(--rail-width);
   min-width: 0;
@@ -515,6 +528,25 @@ button,
 .mono {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+.symbol-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+  border-bottom: 1px solid transparent;
+  transition: border-color var(--transition), color var(--transition);
+}
+
+.symbol-link:hover {
+  border-bottom-color: rgba(56, 189, 248, 0.55);
+  color: #7dd3fc;
+}
+
+.symbol-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
 }
 
 /* ——— Feedback ——— */

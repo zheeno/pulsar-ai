@@ -6,12 +6,14 @@ import { IconSpinner } from './components/Icons';
 import { api, type AppSettings } from './lib/api';
 import { SessionContext } from './lib/session';
 import { ToastProvider } from './lib/toast';
+import { CycleProvider } from './lib/cycle';
 import Dashboard from './pages/Dashboard';
 import Signals from './pages/Signals';
 import Trades from './pages/Trades';
 import Backtest from './pages/Backtest';
 import Settings from './pages/Settings';
 import Onboarding from './pages/Onboarding';
+import SymbolDetail from './pages/SymbolDetail';
 
 type PulseAuthReport = {
   ok: boolean;
@@ -112,6 +114,7 @@ function AppRoutes() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/signals" element={<Signals />} />
           <Route path="/trades" element={<Trades />} />
+          <Route path="/symbol/:symbol" element={<SymbolDetail />} />
           <Route path="/backtest" element={<Backtest />} />
           <Route path="/settings" element={<Settings />} />
         </Route>
@@ -127,14 +130,16 @@ export default function App() {
     <HashRouter>
       <ErrorBoundary>
         <ToastProvider>
-          <div className="app-root">
-            {browserMode && (
-              <div className="browser-banner">
-                Browser mock mode — sample data in localStorage. Pulse gating requires the desktop app.
-              </div>
-            )}
-            <AppRoutes />
-          </div>
+          <CycleProvider>
+            <div className="app-root">
+              {browserMode && (
+                <div className="browser-banner">
+                  Browser mock mode — sample data in localStorage. Pulse gating requires the desktop app.
+                </div>
+              )}
+              <AppRoutes />
+            </div>
+          </CycleProvider>
         </ToastProvider>
       </ErrorBoundary>
     </HashRouter>

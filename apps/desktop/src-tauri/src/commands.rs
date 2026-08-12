@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, CycleGateGuard};
 use crate::backtest::BacktestService;
 use crate::calendar::TradingCalendar;
 use crate::ingest::IngestionService;
@@ -304,33 +304,82 @@ pub async fn market_status(state: State<'_, Arc<AppState>>) -> Result<MarketStat
 }
 
 #[tauri::command]
-pub async fn cycle_run(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+pub fn cycle_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "running": state.is_cycle_running(),
+    }))
+}
+
+#[tauri::command]
+pub async fn cycle_run(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
+        let Some(_gate) = CycleGateGuard::acquire(state.clone()) else {
+            return Err("A trading cycle is already running.".into());
+        };
+
+        let _ = app.emit(
+            "cycle:start",
+            serde_json::json!({ "source": "manual" }),
+        );
+
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
         let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
         let calendar = TradingCalendar::default();
         if !crate::runtime_util::market_activity_allowed(&calendar) {
+            let payload = serde_json::json!({
+                "ok": false,
+                "source": "manual",
+                "signals": 0,
+                "executed": 0,
+                "warnings": [],
+                "error": "NGX market is closed. Cycles are blocked in production outside market hours (set APP_ENV=dev to bypass).",
+            });
+            let _ = app.emit("cycle:complete", payload.clone());
             return Err(
                 "NGX market is closed. Cycles are blocked in production outside market hours (set APP_ENV=dev to bypass)."
                     .into(),
             );
         }
-        state
-            .db
-            .with_conn(|conn| {
-                block_on_local(run_cycle(
-                    conn,
-                    &state.agent,
-                    &settings,
-                    &state.cache,
-                    &client,
-                    &calendar,
-                ))
-            })
-            .map_err(|e| e.to_string())
+
+        match state.db.with_conn(|conn| {
+            block_on_local(run_cycle(
+                conn,
+                &state.agent,
+                &settings,
+                &state.cache,
+                &client,
+                &calendar,
+            ))
+        }) {
+            Ok(result) => {
+                let mut payload = result;
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("ok".into(), serde_json::json!(true));
+                    obj.insert("source".into(), serde_json::json!("manual"));
+                }
+                let _ = app.emit("cycle:complete", payload.clone());
+                Ok(payload)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "source": "manual",
+                    "signals": 0,
+                    "executed": 0,
+                    "warnings": [],
+                    "error": msg,
+                });
+                let _ = app.emit("cycle:complete", payload);
+                Err(e.to_string())
+            }
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -438,6 +487,234 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
             Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         })
         .map_err(|e| e.to_string())
+}
+
+/// Fast path: local DB + in-memory price cache only (no NGX Pulse network calls).
+#[tauri::command]
+pub fn symbol_detail(
+    symbol: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let symbol = symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return Err("Symbol is required".into());
+    }
+
+    state
+        .db
+        .with_conn(|conn| {
+            use rusqlite::OptionalExtension;
+
+            let instrument: Option<(String, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT symbol, name, sector FROM instruments WHERE symbol = ?1",
+                    [&symbol],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+
+            let mut price_stmt = conn.prepare(
+                "SELECT trade_date, price, change_percent, volume, market_cap, pe_ratio
+                 FROM price_history WHERE symbol = ?1
+                 ORDER BY trade_date DESC LIMIT 90",
+            )?;
+            let mut prices: Vec<serde_json::Value> = price_stmt
+                .query_map([&symbol], |row| {
+                    Ok(serde_json::json!({
+                        "date": row.get::<_, String>(0)?,
+                        "price": row.get::<_, f64>(1)?,
+                        "changePercent": row.get::<_, Option<f64>>(2)?,
+                        "volume": row.get::<_, Option<i64>>(3)?,
+                        "marketCap": row.get::<_, Option<f64>>(4)?,
+                        "peRatio": row.get::<_, Option<f64>>(5)?,
+                    }))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            prices.reverse();
+
+            let portfolio_id = PortfolioService::get_default_portfolio_id(conn)?;
+            let position = if let Some(pid) = portfolio_id {
+                conn.query_row(
+                    "SELECT quantity, avg_cost FROM sandbox_positions
+                     WHERE portfolio_id = ?1 AND symbol = ?2",
+                    rusqlite::params![pid, symbol],
+                    |row| {
+                        Ok(serde_json::json!({
+                            "quantity": row.get::<_, f64>(0)?,
+                            "avgCost": row.get::<_, f64>(1)?,
+                        }))
+                    },
+                )
+                .optional()?
+            } else {
+                None
+            };
+
+            let mut sig_stmt = conn.prepare(
+                "SELECT id, generated_at, action, confidence, rationale, model_name, executed, risk_policy_result
+                 FROM signals WHERE symbol = ?1 ORDER BY generated_at DESC LIMIT 25",
+            )?;
+            let signals: Vec<serde_json::Value> = sig_stmt
+                .query_map([&symbol], |row| {
+                    Ok(serde_json::json!({
+                        "id": row.get::<_, String>(0)?,
+                        "generatedAt": row.get::<_, String>(1)?,
+                        "action": row.get::<_, String>(2)?,
+                        "confidence": row.get::<_, f64>(3)?,
+                        "rationale": row.get::<_, String>(4)?,
+                        "modelName": row.get::<_, String>(5)?,
+                        "executed": row.get::<_, i64>(6)? == 1,
+                        "riskPolicyResult": row.get::<_, String>(7)?,
+                    }))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut trade_stmt = conn.prepare(
+                "SELECT id, side, quantity, fill_price, simulated_fee, executed_at, resulting_cash_balance
+                 FROM sandbox_trades WHERE symbol = ?1 ORDER BY executed_at DESC LIMIT 25",
+            )?;
+            let trades: Vec<serde_json::Value> = trade_stmt
+                .query_map([&symbol], |row| {
+                    Ok(serde_json::json!({
+                        "id": row.get::<_, String>(0)?,
+                        "side": row.get::<_, String>(1)?,
+                        "quantity": row.get::<_, f64>(2)?,
+                        "fillPrice": row.get::<_, f64>(3)?,
+                        "simulatedFee": row.get::<_, f64>(4)?,
+                        "executedAt": row.get::<_, String>(5)?,
+                        "resultingCashBalance": row.get::<_, f64>(6)?,
+                    }))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let latest = prices.last().cloned();
+            let cached = state.cache.get_price(&symbol);
+            let quote_price = cached
+                .as_ref()
+                .map(|c| c.price)
+                .or_else(|| latest.as_ref().and_then(|p| p.get("price")).and_then(|v| v.as_f64()));
+            let pulse_quote = latest.as_ref().map(|last| {
+                serde_json::json!({
+                    "symbol": symbol,
+                    "name": instrument.as_ref().and_then(|(_, n, _)| n.clone()),
+                    "price": quote_price,
+                    "changePercent": last.get("changePercent").cloned().unwrap_or(serde_json::Value::Null),
+                    "volume": last.get("volume").cloned().unwrap_or(serde_json::Value::Null),
+                    "marketCap": last.get("marketCap").cloned().unwrap_or(serde_json::Value::Null),
+                    "peRatio": last.get("peRatio").cloned().unwrap_or(serde_json::Value::Null),
+                    "sector": instrument.as_ref().and_then(|(_, _, s)| s.clone()),
+                    "source": if cached.is_some() { "cache" } else { "local" },
+                })
+            });
+
+            Ok(serde_json::json!({
+                "symbol": symbol,
+                "name": instrument.as_ref().and_then(|(_, n, _)| n.clone()),
+                "sector": instrument.as_ref().and_then(|(_, _, s)| s.clone()),
+                "found": instrument.is_some() || !prices.is_empty(),
+                "latest": latest,
+                "prices": prices,
+                "position": position,
+                "signals": signals,
+                "trades": trades,
+                "pulseQuote": pulse_quote,
+                "needsPulsePrices": prices.len() < 5,
+            }))
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Optional enrichment: bounded single-symbol price history from Pulse (never loads full stocks).
+#[tauri::command]
+pub async fn symbol_detail_pulse(
+    symbol: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let symbol = symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return Err("Symbol is required".into());
+    }
+    let state = state.inner().clone();
+    let symbol_for_pulse = symbol.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
+        let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
+        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+
+        let to = chrono::Utc::now().date_naive();
+        let from = to - chrono::Duration::days(120);
+        let from_s = from.format("%Y-%m-%d").to_string();
+        let to_s = to.format("%Y-%m-%d").to_string();
+
+        let result = state.db.with_conn(|conn| {
+            Ok(block_on_local(async {
+                match client
+                    .get_symbol_price(conn, &symbol_for_pulse, Some(&from_s), Some(&to_s))
+                    .await
+                {
+                    Ok(pts) => {
+                        let mut prices: Vec<serde_json::Value> = pts
+                            .into_iter()
+                            .map(|p| {
+                                serde_json::json!({
+                                    "date": p.date,
+                                    "price": p.price,
+                                    "volume": p.volume,
+                                })
+                            })
+                            .collect();
+                        if prices.len() > 90 {
+                            let skip = prices.len() - 90;
+                            prices = prices.into_iter().skip(skip).collect();
+                        }
+                        let pulse_quote = prices.last().map(|last| {
+                            let prev = if prices.len() >= 2 {
+                                prices.get(prices.len() - 2)
+                            } else {
+                                None
+                            };
+                            let price = last.get("price").and_then(|v| v.as_f64());
+                            let prev_price = prev.and_then(|p| p.get("price")).and_then(|v| v.as_f64());
+                            let change_percent = match (price, prev_price) {
+                                (Some(c), Some(p)) if p.abs() > f64::EPSILON => {
+                                    Some(((c - p) / p) * 100.0)
+                                }
+                                _ => None,
+                            };
+                            serde_json::json!({
+                                "symbol": symbol_for_pulse,
+                                "price": price,
+                                "changePercent": change_percent,
+                                "volume": last.get("volume").cloned().unwrap_or(serde_json::Value::Null),
+                                "source": "ngx_pulse",
+                            })
+                        });
+                        serde_json::json!({
+                            "symbol": symbol_for_pulse,
+                            "prices": prices,
+                            "pulseQuote": pulse_quote,
+                            "error": null,
+                        })
+                    }
+                    Err(e) => serde_json::json!({
+                        "symbol": symbol_for_pulse,
+                        "prices": [],
+                        "pulseQuote": null,
+                        "error": e.to_string(),
+                    }),
+                }
+            }))
+        });
+
+        result.map_err(|e: anyhow::Error| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
