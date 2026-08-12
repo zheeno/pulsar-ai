@@ -73,3 +73,4 @@ export const PROMPT_VERSION = 'v1.0.0';
 export const PORTFOLIO_PROMPT_VERSION = 'v2.0.0';
 
 export * from './types';
+export * from './desktop';

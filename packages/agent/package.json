@@ -1,0 +1,27 @@
+{
+  "name": "@ngx/agent",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./dist/worker.js",
+  "types": "./dist/worker.d.ts",
+  "bin": {
+    "ngx-agent": "./dist/worker.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/worker.js",
+    "test": "echo 'no tests'"
+  },
+  "dependencies": {
+    "@langchain/anthropic": "^0.3.14",
+    "@langchain/core": "^0.3.27",
+    "@langchain/openai": "^0.3.17",
+    "@ngx/shared": "*",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
