@@ -81,6 +81,7 @@ pub fn logout(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let _ = delete_secret(SECRET_PULSE_PASSWORD);
     let _ = delete_secret(SECRET_PULSE_API_KEY);
     let _ = delete_secret(SECRET_LLM_API_KEY);
+    crate::wealth::WealthClient::clear_local_secrets();
     state
         .db
         .with_conn(clear_session_settings)
@@ -193,18 +194,210 @@ pub async fn complete_onboarding(state: State<'_, Arc<AppState>>) -> Result<crat
 }
 
 #[tauri::command]
-pub fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let id = state
-        .db
-        .with_conn(PortfolioService::get_default_portfolio_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No default portfolio".to_string())?;
-    let summary = state
-        .db
-        .with_conn(|conn| PortfolioService::get_portfolio(conn, &state.cache, &id))
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Portfolio not found".to_string())?;
-    serde_json::to_value(summary).map_err(|e| e.to_string())
+pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let id = state
+            .db
+            .with_conn(PortfolioService::get_default_portfolio_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No default portfolio".to_string())?;
+        let summary = state
+            .db
+            .with_conn(|conn| PortfolioService::get_portfolio(conn, &state.cache, &id))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Portfolio not found".to_string())?;
+
+        let mut value = serde_json::to_value(&summary).map_err(|e| e.to_string())?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
+        }
+
+        if !settings.wealth_connected {
+            return Ok(value);
+        }
+
+        let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
+        let client = crate::wealth::WealthClient::from_settings(&settings, wealth_password);
+        let status = block_on_local(client.profile_status(&settings));
+        // Show Wealth cash/positions whenever the session is connected and profile loads.
+        // Live *order* routing still requires trading_verified (cycle/execution path).
+        if !status.ok || !status.connected {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
+                obj.insert(
+                    "wealthStatus".into(),
+                    serde_json::to_value(&status).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            return Ok(value);
+        }
+
+        match block_on_local(async {
+            let snap = client.get_portfolio().await?;
+            let cash = match client.get_wallet().await {
+                Ok(w) => w.brokerage_balance,
+                Err(_) => status
+                    .brokerage_balance
+                    .unwrap_or(snap.balance),
+            };
+            Ok::<_, anyhow::Error>((cash, snap))
+        }) {
+            Ok((cash, snap)) => {
+                let positions: Vec<serde_json::Value> = snap
+                    .holdings
+                    .iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "id": format!("wealth-{}", h.stock_id),
+                            "symbol": h.symbol,
+                            "quantity": h.quantity,
+                            "avg_cost": h.buy_price.unwrap_or(h.price),
+                            "current_price": h.price,
+                            "market_value": h.current_value,
+                        })
+                    })
+                    .collect();
+                let market_value = if snap.stock_value > 0.0 {
+                    snap.stock_value
+                } else {
+                    snap.holdings.iter().map(|h| h.current_value).sum()
+                };
+                let total_equity = cash + market_value;
+                Ok(serde_json::json!({
+                    "portfolio": {
+                        "id": id,
+                        "name": "wealth-live",
+                        "starting_capital": cash,
+                        "cash_balance": cash,
+                        "created_at": summary.portfolio.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+                        "strategy_param_set_id": summary.portfolio.get("strategy_param_set_id").cloned().unwrap_or(serde_json::Value::Null),
+                    },
+                    "positions": positions,
+                    "total_equity": total_equity,
+                    "market_value": market_value,
+                    "pnl_today": snap.profit,
+                    "tradingMode": "live",
+                    "tradingVerified": status.trading_verified,
+                    "wealthStatus": status,
+                }))
+            }
+            Err(e) => {
+                tracing::warn!(target: "wealth", error = %e, "wealth portfolio overlay failed");
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
+                    obj.insert(
+                        "wealthStatus".into(),
+                        serde_json::to_value(&status).unwrap_or(serde_json::Value::Null),
+                    );
+                    obj.insert(
+                        "wealthError".into(),
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+                Ok(value)
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WealthLoginPayload {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Wealth2faPayload {
+    pub email: String,
+    pub temp_token: String,
+    pub code: String,
+}
+
+#[tauri::command]
+pub async fn wealth_login(
+    payload: WealthLoginPayload,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::wealth::WealthLoginResult, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let client = crate::wealth::WealthClient::from_settings(&settings, Some(payload.password.clone()));
+        let result = block_on_local(client.login(&payload.email, &payload.password));
+        let result = result.map_err(|e| e.to_string())?;
+        if result.ok && !result.needs_2fa {
+            let _ = set_secret(crate::secrets::SECRET_WEALTH_PASSWORD, &payload.password);
+            state
+                .db
+                .with_conn(|conn| crate::settings::mark_wealth_connected(conn, &payload.email))
+                .map_err(|e| e.to_string())?;
+        } else if result.needs_2fa {
+            let _ = set_secret(crate::secrets::SECRET_WEALTH_PASSWORD, &payload.password);
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn wealth_verify_2fa(
+    payload: Wealth2faPayload,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::wealth::WealthLoginResult, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
+        let client = crate::wealth::WealthClient::from_settings(&settings, password);
+        let result = block_on_local(client.verify_2fa(&payload.temp_token, &payload.code, &payload.email))
+            .map_err(|e| e.to_string())?;
+        if result.ok && !result.needs_2fa {
+            state
+                .db
+                .with_conn(|conn| crate::settings::mark_wealth_connected(conn, &payload.email))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn wealth_profile(state: State<'_, Arc<AppState>>) -> Result<crate::wealth::WealthProfileStatus, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
+        let client = crate::wealth::WealthClient::from_settings(&settings, password);
+        Ok(block_on_local(client.profile_status(&settings)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn wealth_logout(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
+        let client = crate::wealth::WealthClient::from_settings(&settings, password);
+        block_on_local(client.logout_remote());
+        crate::wealth::WealthClient::clear_local_secrets();
+        state
+            .db
+            .with_conn(crate::settings::clear_wealth_settings)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -330,6 +523,15 @@ pub async fn cycle_run(
         let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
+        let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
+        let wealth = if settings.wealth_connected {
+            Some(crate::wealth::WealthClient::from_settings(
+                &settings,
+                wealth_password,
+            ))
+        } else {
+            None
+        };
         let calendar = TradingCalendar::default();
         if !crate::runtime_util::market_activity_allowed(&calendar) {
             let payload = serde_json::json!({
@@ -355,6 +557,7 @@ pub async fn cycle_run(
                 &state.cache,
                 &client,
                 &calendar,
+                wealth.as_ref(),
             ))
         }) {
             Ok(result) => {
@@ -468,11 +671,13 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
     state
         .db
         .with_conn(|conn| {
+            let mut out = Vec::new();
+
             let mut stmt = conn.prepare(
                 "SELECT id, symbol, side, quantity, fill_price, simulated_fee, executed_at, resulting_cash_balance
                  FROM sandbox_trades ORDER BY executed_at DESC LIMIT ?1",
             )?;
-            let rows = stmt.query_map([limit], |row| {
+            for row in stmt.query_map([limit], |row| {
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
                     "symbol": row.get::<_, String>(1)?,
@@ -481,10 +686,43 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
                     "fill_price": row.get::<_, f64>(4)?,
                     "simulated_fee": row.get::<_, f64>(5)?,
                     "executed_at": row.get::<_, String>(6)?,
-                    "resulting_cash_balance": row.get::<_, f64>(7)?,
+                    "resulting_cash_balance": row.get::<_, Option<f64>>(7)?,
+                    "venue": "sandbox",
+                    "status": "executed",
                 }))
-            })?;
-            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            })? {
+                out.push(row?);
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT id, symbol, side, quantity, fill_price, fee, created_at, status, rejection_reason
+                 FROM broker_orders ORDER BY created_at DESC LIMIT ?1",
+            )?;
+            for row in stmt.query_map([limit], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "symbol": row.get::<_, String>(1)?,
+                    "side": row.get::<_, String>(2)?,
+                    "quantity": row.get::<_, f64>(3)?,
+                    "fill_price": row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    "simulated_fee": row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    "executed_at": row.get::<_, String>(6)?,
+                    "resulting_cash_balance": null,
+                    "venue": "wealth",
+                    "status": row.get::<_, String>(7)?,
+                    "rejection_reason": row.get::<_, Option<String>>(8)?,
+                }))
+            })? {
+                out.push(row?);
+            }
+
+            out.sort_by(|a, b| {
+                let da = a.get("executed_at").and_then(|v| v.as_str()).unwrap_or("");
+                let db = b.get("executed_at").and_then(|v| v.as_str()).unwrap_or("");
+                db.cmp(da)
+            });
+            out.truncate(limit as usize);
+            Ok(out)
         })
         .map_err(|e| e.to_string())
 }

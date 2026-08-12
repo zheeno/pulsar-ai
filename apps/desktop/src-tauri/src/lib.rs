@@ -17,6 +17,7 @@ mod secrets;
 mod seed;
 mod settings;
 mod signals;
+mod wealth;
 
 use std::path::PathBuf;
 
@@ -63,7 +64,7 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ngx_pulse=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ngx_pulse=debug,wealth=debug")),
         )
         .init();
     load_dotenv();
@@ -116,6 +117,10 @@ pub fn run() {
             commands::get_backtest,
             commands::export_database,
             commands::app_data_dir,
+            commands::wealth_login,
+            commands::wealth_verify_2fa,
+            commands::wealth_profile,
+            commands::wealth_logout,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

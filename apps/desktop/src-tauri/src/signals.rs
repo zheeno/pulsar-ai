@@ -258,17 +258,55 @@ pub async fn run_cycle(
     cache: &crate::cache::PriceCache,
     client: &crate::ngx::NgxPulseClient,
     calendar: &crate::calendar::TradingCalendar,
+    wealth: Option<&crate::wealth::WealthClient>,
 ) -> Result<serde_json::Value> {
     let _ = crate::ingest::IngestionService::ingest_stocks(conn, client, cache, calendar, true).await;
     let _ = crate::ingest::IngestionService::ingest_market(conn, client, calendar, true).await;
 
     let signal_ids = SignalGenerationService::generate_for_portfolio(conn, agent, settings, None).await?;
-    let executed = ExecutionService::process_signals(conn, cache, settings, &signal_ids)?;
-    crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None)?;
+
+    let mut warnings: Vec<String> = Vec::new();
+    let trading_mode = if let Some(w) = wealth {
+        w.resolve_trading_mode(settings).await
+    } else {
+        crate::wealth::TradingMode::Sandbox
+    };
+
+    let live_market_open = if trading_mode == crate::wealth::TradingMode::Live {
+        match wealth {
+            Some(w) => match w.market_is_open().await {
+                Ok(open) => open,
+                Err(e) => {
+                    warnings.push(format!("Could not check Wealth market status: {e}"));
+                    false
+                }
+            },
+            None => false,
+        }
+    } else {
+        true
+    };
+
+    let (executed, exec_warnings) = ExecutionService::process_signals(
+        conn,
+        cache,
+        settings,
+        &signal_ids,
+        wealth,
+        trading_mode,
+        live_market_open,
+    )
+    .await?;
+    warnings.extend(exec_warnings);
+
+    if trading_mode == crate::wealth::TradingMode::Sandbox {
+        crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None)?;
+    }
 
     Ok(json!({
         "signals": signal_ids.len(),
         "executed": executed,
-        "warnings": []
+        "tradingMode": trading_mode.as_str(),
+        "warnings": warnings,
     }))
 }

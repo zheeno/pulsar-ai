@@ -44,6 +44,8 @@ function defaultSettings(): Settings {
     simulatedFeePct: 0.0015,
     autoCycleEnabled: false,
     autoCycleIntervalMinutes: 30,
+    wealthEmail: undefined,
+    wealthConnected: false,
   };
 }
 
@@ -176,8 +178,11 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         pulseConfigured: false,
         llmConfigured: false,
         onboardingComplete: false,
+        wealthEmail: undefined,
+        wealthConnected: false,
       };
       delete next.pulseEmail;
+      delete next.wealthEmail;
       saveSettingsLocal(next);
       localStorage.removeItem(SECRETS_KEY);
       return undefined as T;
@@ -230,6 +235,8 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
 
     case 'portfolio_default': {
       const store = loadStore();
+      const settings = loadSettings();
+      const live = Boolean(settings.wealthConnected);
       const market_value = store.positions.reduce((s, p) => s + p.market_value, 0);
       return {
         portfolio: store.portfolio,
@@ -237,6 +244,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         total_equity: store.portfolio.cash_balance + market_value,
         market_value,
         pnl_today: store.performance.at(-1)?.pnl_daily ?? 0,
+        tradingMode: live ? 'live' : 'sandbox',
       } as T;
     }
 
@@ -426,6 +434,89 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
 
     case 'app_data_dir':
       return 'browser-mock' as T;
+
+    case 'wealth_login': {
+      const email = String(args?.email || '');
+      const password = String(args?.password || '');
+      if (!email || !password) {
+        return {
+          ok: false,
+          needs2fa: false,
+          connected: false,
+          message: 'Email and password required',
+          email,
+          baseUrl: 'https://wealthapp-api-stg-app.azurewebsites.net/v1',
+        } as T;
+      }
+      if (password === '2fa') {
+        return {
+          ok: true,
+          needs2fa: true,
+          tempToken: 'mock-temp-token',
+          connected: false,
+          message: 'Two-factor authentication required.',
+          email,
+          baseUrl: 'https://wealthapp-api-stg-app.azurewebsites.net/v1',
+        } as T;
+      }
+      const s = loadSettings();
+      s.wealthEmail = email;
+      s.wealthConnected = true;
+      saveSettingsLocal(s);
+      return {
+        ok: true,
+        needs2fa: false,
+        connected: true,
+        message: 'Wealth account connected.',
+        email,
+        baseUrl: 'https://wealthapp-api-stg-app.azurewebsites.net/v1',
+      } as T;
+    }
+
+    case 'wealth_verify_2fa': {
+      const email = String(args?.email || '');
+      const s = loadSettings();
+      s.wealthEmail = email;
+      s.wealthConnected = true;
+      saveSettingsLocal(s);
+      return {
+        ok: true,
+        needs2fa: false,
+        connected: true,
+        message: 'Wealth account connected.',
+        email,
+        baseUrl: 'https://wealthapp-api-stg-app.azurewebsites.net/v1',
+      } as T;
+    }
+
+    case 'wealth_profile': {
+      const s = loadSettings();
+      const connected = Boolean(s.wealthConnected);
+      return {
+        ok: connected,
+        connected,
+        email: s.wealthEmail ?? null,
+        tradingProfile: connected ? 'verified' : null,
+        tradingVerified: connected,
+        tradingMode: connected ? 'live' : 'sandbox',
+        brokerageBalance: connected ? 250_000 : null,
+        availableBalance: connected ? 200_000 : null,
+        currentBalance: connected ? 250_000 : null,
+        baseUrl: 'https://wealthapp-api-stg-app.azurewebsites.net/v1',
+        message: connected
+          ? 'Live trader mode — orders use Wealth brokerage balance.'
+          : 'Wealth account not connected.',
+        displayName: connected ? 'Mock Wealth User' : null,
+      } as T;
+    }
+
+    case 'wealth_logout': {
+      const s = loadSettings();
+      s.wealthConnected = false;
+      delete s.wealthEmail;
+      saveSettingsLocal(s);
+      return undefined as T;
+    }
 
     default:
       throw new Error(`Unknown command in browser mode: ${command}`);

@@ -22,6 +22,10 @@ pub struct AppSettings {
     pub auto_cycle_enabled: bool,
     /// Minutes between automatic cycles (clamped to 5–120 when saved).
     pub auto_cycle_interval_minutes: u32,
+    /// Coronation Wealth email when connected.
+    pub wealth_email: Option<String>,
+    /// True when a Wealth session has been established.
+    pub wealth_connected: bool,
 }
 
 impl Default for AppSettings {
@@ -42,6 +46,8 @@ impl Default for AppSettings {
             simulated_fee_pct: 0.0015,
             auto_cycle_enabled: false,
             auto_cycle_interval_minutes: 30,
+            wealth_email: None,
+            wealth_connected: false,
         }
     }
 }
@@ -78,6 +84,8 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
                 settings.auto_cycle_interval_minutes =
                     value.parse::<u32>().unwrap_or(30).clamp(5, 120)
             }
+            "wealth_email" => settings.wealth_email = Some(value),
+            "wealth_connected" => settings.wealth_connected = value == "true",
             _ => {}
         }
     }
@@ -153,6 +161,18 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
     )?;
     let interval = settings.auto_cycle_interval_minutes.clamp(5, 120);
     set_setting(conn, "auto_cycle_interval_minutes", &interval.to_string())?;
+    if let Some(v) = &settings.wealth_email {
+        set_setting(conn, "wealth_email", v)?;
+    }
+    set_setting(
+        conn,
+        "wealth_connected",
+        if settings.wealth_connected {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
     Ok(())
 }
 
@@ -162,6 +182,20 @@ pub fn clear_session_settings(conn: &Connection) -> Result<()> {
     set_setting(conn, "pulse_configured", "false")?;
     set_setting(conn, "llm_configured", "false")?;
     set_setting(conn, "onboarding_complete", "false")?;
+    conn.execute("DELETE FROM settings WHERE key = 'wealth_email'", [])?;
+    set_setting(conn, "wealth_connected", "false")?;
+    Ok(())
+}
+
+pub fn clear_wealth_settings(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = 'wealth_email'", [])?;
+    set_setting(conn, "wealth_connected", "false")?;
+    Ok(())
+}
+
+pub fn mark_wealth_connected(conn: &Connection, email: &str) -> Result<()> {
+    set_setting(conn, "wealth_email", email)?;
+    set_setting(conn, "wealth_connected", "true")?;
     Ok(())
 }
 

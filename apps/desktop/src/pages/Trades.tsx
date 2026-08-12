@@ -12,7 +12,10 @@ interface Trade {
   fill_price: number;
   simulated_fee: number;
   executed_at: string;
-  resulting_cash_balance: number;
+  resulting_cash_balance?: number | null;
+  venue?: string;
+  status?: string;
+  rejection_reason?: string | null;
 }
 
 export default function TradesPage() {
@@ -31,13 +34,18 @@ export default function TradesPage() {
   }, []);
 
   const formatNaira = (n: number) => `₦${n.toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
+  const hasLive = trades.some((t) => t.venue === 'wealth');
 
   return (
     <div className="page">
       <header className="page-header">
         <div>
           <h1>Trades</h1>
-          <p>Simulated fills from the sandbox execution engine.</p>
+          <p>
+            {hasLive
+              ? 'Sandbox fills and Coronation Wealth live orders.'
+              : 'Simulated fills from the sandbox execution engine. Connect Wealth in Settings for live orders.'}
+          </p>
         </div>
       </header>
 
@@ -52,7 +60,7 @@ export default function TradesPage() {
           <div className="empty-state">
             <div className="empty-state__icon"><IconTrades size={22} /></div>
             <div>No trades yet</div>
-            <p className="muted" style={{ margin: 0 }}>Run a cycle from Home to create simulated fills.</p>
+            <p className="muted" style={{ margin: 0 }}>Run a cycle from Home to create fills.</p>
           </div>
         ) : (
           <table className="data-table">
@@ -63,6 +71,7 @@ export default function TradesPage() {
                 <th>Qty</th>
                 <th>Fill price</th>
                 <th>Fee</th>
+                <th>Venue</th>
                 <th>Cash after</th>
                 <th>Time</th>
               </tr>
@@ -79,7 +88,17 @@ export default function TradesPage() {
                   <td className="mono">{Number(t.quantity).toLocaleString()}</td>
                   <td className="mono">{formatNaira(Number(t.fill_price))}</td>
                   <td className="mono">{formatNaira(Number(t.simulated_fee))}</td>
-                  <td className="mono">{formatNaira(Number(t.resulting_cash_balance))}</td>
+                  <td>
+                    <span className={`status-pill ${t.venue === 'wealth' ? 'status-pill--ok' : 'status-pill--muted'}`}>
+                      {t.venue === 'wealth' ? 'Live' : 'Sandbox'}
+                      {t.status && t.status !== 'executed' ? ` · ${t.status}` : ''}
+                    </span>
+                  </td>
+                  <td className="mono">
+                    {t.resulting_cash_balance != null
+                      ? formatNaira(Number(t.resulting_cash_balance))
+                      : '—'}
+                  </td>
                   <td className="muted" style={{ fontSize: 12 }}>{t.executed_at}</td>
                 </tr>
               ))}

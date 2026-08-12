@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::cache::PriceCache;
 use crate::settings::AppSettings;
+use crate::wealth::{insert_broker_order, TradingMode, WealthClient};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSet {
@@ -130,26 +131,52 @@ impl FillSimulator {
 pub struct ExecutionService;
 
 impl ExecutionService {
-    pub fn process_signals(
+    pub async fn process_signals(
         conn: &Connection,
         cache: &PriceCache,
         settings: &AppSettings,
         signal_ids: &[String],
-    ) -> Result<i64> {
+        wealth: Option<&WealthClient>,
+        trading_mode: TradingMode,
+        live_market_open: bool,
+    ) -> Result<(i64, Vec<String>)> {
         let mut executed = 0;
+        let mut warnings = Vec::new();
+
+        if trading_mode == TradingMode::Live && !live_market_open {
+            warnings.push(
+                "Live trader mode: Wealth market is closed — skipping live fills (no sandbox fallback)."
+                    .into(),
+            );
+            return Ok((0, warnings));
+        }
+
         for signal_id in signal_ids {
-            if Self::process_signal(conn, cache, settings, signal_id)? {
-                executed += 1;
+            match Self::process_signal(
+                conn,
+                cache,
+                settings,
+                signal_id,
+                wealth,
+                trading_mode,
+            )
+            .await
+            {
+                Ok(true) => executed += 1,
+                Ok(false) => {}
+                Err(e) => warnings.push(format!("Signal {signal_id}: {e}")),
             }
         }
-        Ok(executed)
+        Ok((executed, warnings))
     }
 
-    fn process_signal(
+    async fn process_signal(
         conn: &Connection,
         cache: &PriceCache,
         settings: &AppSettings,
         signal_id: &str,
+        wealth: Option<&WealthClient>,
+        trading_mode: TradingMode,
     ) -> Result<bool> {
         let signal: Option<(String, String, f64)> = conn
             .query_row(
@@ -170,19 +197,55 @@ impl ExecutionService {
         )?;
 
         let param_set = Self::load_param_set(conn, &portfolio.2)?;
-        let positions = Self::load_positions(conn, &portfolio.0)?;
-        let mut symbols: Vec<String> = positions.iter().map(|(s, _, _)| s.clone()).collect();
-        if !symbols.contains(&symbol) {
-            symbols.push(symbol.clone());
-        }
-        let prices = Self::get_prices(conn, cache, &symbols)?;
 
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let daily_trades: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sandbox_trades WHERE portfolio_id = ?1 AND date(executed_at) = ?2",
-            rusqlite::params![portfolio.0, today],
-            |row| row.get(0),
-        )?;
+        let (cash_balance, positions, prices, daily_trades) = if trading_mode == TradingMode::Live {
+            let client = wealth.ok_or_else(|| anyhow::anyhow!("Wealth client required for live mode"))?;
+            let wallet = client.get_wallet().await?;
+            let snap = client.get_portfolio().await?;
+            let positions: Vec<(String, f64, f64)> = snap
+                .holdings
+                .iter()
+                .map(|h| {
+                    (
+                        h.symbol.clone(),
+                        h.quantity,
+                        h.buy_price.unwrap_or(h.price),
+                    )
+                })
+                .collect();
+            let mut symbols: Vec<String> = positions.iter().map(|(s, _, _)| s.clone()).collect();
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol.clone());
+            }
+            let mut prices = Self::get_prices(conn, cache, &symbols)?;
+            for h in &snap.holdings {
+                if h.price > 0.0 {
+                    prices.insert(h.symbol.clone(), h.price);
+                }
+            }
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let daily_trades: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM broker_orders WHERE date(created_at) = ?1 AND status = 'executed'",
+                [&today],
+                |row| row.get(0),
+            )?;
+            (wallet.brokerage_balance, positions, prices, daily_trades)
+        } else {
+            let positions = Self::load_positions(conn, &portfolio.0)?;
+            let mut symbols: Vec<String> = positions.iter().map(|(s, _, _)| s.clone()).collect();
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol.clone());
+            }
+            let prices = Self::get_prices(conn, cache, &symbols)?;
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let daily_trades: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sandbox_trades WHERE portfolio_id = ?1 AND date(executed_at) = ?2",
+                rusqlite::params![portfolio.0, today],
+                |row| row.get(0),
+            )?;
+            (portfolio.1, positions, prices, daily_trades)
+        };
+
         let daily_drawdown: f64 = conn
             .query_row(
                 "SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = ?1 ORDER BY snapshot_date DESC LIMIT 1",
@@ -200,7 +263,7 @@ impl ExecutionService {
         let (result, quantity) = RiskPolicyService::evaluate(
             &input,
             &param_set,
-            portfolio.1,
+            cash_balance,
             &positions,
             &prices,
             daily_trades,
@@ -216,14 +279,101 @@ impl ExecutionService {
             return Ok(false);
         }
 
-        let current_price = prices.get(&symbol).copied().unwrap_or(0.0);
-        if current_price <= 0.0 {
-            return Ok(false);
+        if trading_mode == TradingMode::Live {
+            let client = wealth.ok_or_else(|| anyhow::anyhow!("Wealth client required for live mode"))?;
+            Self::execute_live_trade(conn, client, signal_id, &symbol, &action, quantity).await?;
+        } else {
+            let current_price = prices.get(&symbol).copied().unwrap_or(0.0);
+            if current_price <= 0.0 {
+                return Ok(false);
+            }
+            Self::execute_trade(
+                conn,
+                settings,
+                &portfolio.0,
+                signal_id,
+                &symbol,
+                &action,
+                quantity,
+                current_price,
+                cash_balance,
+            )?;
         }
 
-        Self::execute_trade(conn, settings, &portfolio.0, signal_id, &symbol, &action, quantity, current_price, portfolio.1)?;
         conn.execute("UPDATE signals SET executed = 1 WHERE id = ?1", [signal_id])?;
         Ok(true)
+    }
+
+    async fn execute_live_trade(
+        conn: &Connection,
+        client: &WealthClient,
+        signal_id: &str,
+        symbol: &str,
+        side: &str,
+        quantity: f64,
+    ) -> Result<()> {
+        let (stock_id, price) = client.resolve_stock_id(symbol).await?;
+        if price <= 0.0 {
+            return Err(anyhow::anyhow!("No Wealth price for {symbol}"));
+        }
+
+        let fee = client.calculate_fee(stock_id, quantity, price).await?;
+        if side == "BUY" {
+            let wallet = client.get_wallet().await?;
+            let cost = price * quantity + fee.rounded_fee;
+            if wallet.brokerage_balance < cost {
+                return Err(anyhow::anyhow!(
+                    "Insufficient brokerage balance for {symbol} (need ₦{cost:.2}, have ₦{:.2})",
+                    wallet.brokerage_balance
+                ));
+            }
+        } else {
+            let snap = client.get_portfolio().await?;
+            let held = snap
+                .holdings
+                .iter()
+                .find(|h| h.symbol.eq_ignore_ascii_case(symbol))
+                .map(|h| h.quantity)
+                .unwrap_or(0.0);
+            if quantity > held {
+                return Err(anyhow::anyhow!(
+                    "Cannot sell {quantity} of {symbol}; holding {held}"
+                ));
+            }
+        }
+
+        let order = client
+            .place_and_await_fill(stock_id, side, quantity)
+            .await?;
+
+        let fill_price = order.unit_price.or(order.quote_price).or(Some(price));
+        insert_broker_order(
+            conn,
+            Some(signal_id),
+            symbol,
+            side,
+            quantity,
+            &order,
+            fill_price,
+            Some(fee.rounded_fee),
+        )?;
+
+        if order.status == "rejected" {
+            return Err(anyhow::anyhow!(
+                "Wealth order rejected: {}",
+                order
+                    .rejection_reason
+                    .unwrap_or_else(|| "unknown reason".into())
+            ));
+        }
+        if order.status != "executed" {
+            return Err(anyhow::anyhow!(
+                "Wealth order still {} after polling (id {})",
+                order.status,
+                order.id
+            ));
+        }
+        Ok(())
     }
 
     fn execute_trade(

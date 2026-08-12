@@ -121,6 +121,15 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
     let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
     let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
+    let wealth_password = crate::secrets::get_secret(crate::secrets::SECRET_WEALTH_PASSWORD)?;
+    let wealth = if settings.wealth_connected {
+        Some(crate::wealth::WealthClient::from_settings(
+            &settings,
+            wealth_password,
+        ))
+    } else {
+        None
+    };
     let calendar = TradingCalendar::default();
 
     match state.db.with_conn(|conn| {
@@ -131,6 +140,7 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
             &state.cache,
             &client,
             &calendar,
+            wealth.as_ref(),
         ))
     }) {
         Ok(result) => {

@@ -18,6 +18,14 @@ type RawPortfolio = PortfolioData & {
   totalEquity?: number;
   marketValue?: number;
   pnlToday?: number;
+  tradingVerified?: boolean;
+  wealthStatus?: {
+    connected?: boolean;
+    tradingVerified?: boolean;
+    message?: string;
+    brokerageBalance?: number | null;
+  } | null;
+  wealthError?: string | null;
 };
 
 type Usage = {
@@ -47,6 +55,10 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
     total_equity: Number(raw.total_equity ?? raw.totalEquity ?? 0),
     market_value: Number(raw.market_value ?? raw.marketValue ?? 0),
     pnl_today: Number(raw.pnl_today ?? raw.pnlToday ?? 0),
+    tradingMode: (raw as { tradingMode?: string }).tradingMode || 'sandbox',
+    tradingVerified: raw.tradingVerified ?? raw.wealthStatus?.tradingVerified,
+    wealthStatus: raw.wealthStatus ?? null,
+    wealthError: raw.wealthError ?? null,
   };
 }
 
@@ -142,10 +154,18 @@ export default function DashboardPage() {
       };
     }
     if (usage?.authMode === 'session' && data) {
+      const live = data.tradingMode === 'live';
       return {
         level: 'ok' as const,
         title: 'Systems healthy',
-        sub: 'NGX Pulse session is active and your sandbox portfolio is ready. Run a cycle when you want fresh signals.',
+        sub: live
+          ? (data.tradingVerified
+            ? 'NGX Pulse is active. Home shows your Wealth brokerage cash and holdings; cycles can place live market orders.'
+            : (data.wealthStatus?.message
+              || 'Wealth connected — Home shows brokerage cash and holdings. Complete trading verification in the Wealth app to enable live orders.'))
+          : data.wealthError
+            ? `Wealth connected but portfolio sync failed: ${data.wealthError}`
+            : 'NGX Pulse session is active and your sandbox portfolio is ready. Connect a Wealth account in Settings to go live.',
         live: true,
       };
     }
@@ -200,6 +220,19 @@ export default function DashboardPage() {
                 </span>
               </>
             ) : null}
+            {data?.tradingMode ? (
+              <>
+                <span className="status-hero__meta-sep" aria-hidden>·</span>
+                <span
+                  className={`status-pill ${data.tradingMode === 'live' ? 'status-pill--ok' : 'status-pill--muted'}`}
+                  style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                >
+                  {data.tradingMode === 'live'
+                    ? (data.tradingVerified === false ? 'Wealth' : 'Live trader')
+                    : 'Sandbox'}
+                </span>
+              </>
+            ) : null}
           </div>
           <h1 className="status-hero__title">{status.title}</h1>
           <p className="status-hero__sub">{status.sub}</p>
@@ -235,7 +268,9 @@ export default function DashboardPage() {
             <div className="stat-card__value">{formatNaira(data.total_equity)}</div>
           </div>
           <div className="stat-card">
-            <div className="stat-card__label">Cash</div>
+            <div className="stat-card__label">
+              {data.tradingMode === 'live' ? 'Brokerage cash' : 'Cash'}
+            </div>
             <div className="stat-card__value">{formatNaira(Number(data.portfolio?.cash_balance))}</div>
           </div>
           <div className="stat-card">

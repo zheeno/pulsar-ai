@@ -41,3 +41,7 @@ pub struct LlmSecrets {
 pub const SECRET_PULSE_PASSWORD: &str = "pulse_password";
 pub const SECRET_PULSE_API_KEY: &str = "pulse_api_key";
 pub const SECRET_LLM_API_KEY: &str = "llm_api_key";
+pub const SECRET_WEALTH_PASSWORD: &str = "wealth_password";
+pub const SECRET_WEALTH_TOKEN: &str = "wealth_token";
+pub const SECRET_WEALTH_TOKEN_EXPIRES: &str = "wealth_token_expires";
+pub const SECRET_WEALTH_REFRESH_TOKEN: &str = "wealth_refresh_token";

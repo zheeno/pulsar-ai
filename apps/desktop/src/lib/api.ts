@@ -13,6 +13,10 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     return { payload: args };
   }
 
+  if (command === 'wealth_login' || command === 'wealth_verify_2fa') {
+    return { payload: args };
+  }
+
   if (command === 'start_backtest') {
     return {
       strategy_param_set_id: args.strategyParamSetId,
@@ -51,6 +55,8 @@ export interface AppSettings {
   simulatedFeePct: number;
   autoCycleEnabled: boolean;
   autoCycleIntervalMinutes: number;
+  wealthEmail?: string | null;
+  wealthConnected?: boolean;
 }
 
 export interface PortfolioData {
@@ -59,4 +65,12 @@ export interface PortfolioData {
   total_equity: number;
   market_value: number;
   pnl_today: number;
+  tradingMode?: 'sandbox' | 'live' | string;
+  tradingVerified?: boolean;
+  wealthStatus?: {
+    connected?: boolean;
+    tradingVerified?: boolean;
+    message?: string;
+  } | null;
+  wealthError?: string | null;
 }

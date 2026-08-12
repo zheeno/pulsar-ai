@@ -583,6 +583,29 @@ button,
   color: var(--text-muted);
 }
 
+.form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.form-stack label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.form-stack input {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated, #0f172a);
+  color: var(--text);
+  font-size: 14px;
+}
+
 /* ——— Toasts (global, above modals) ——— */
 
 .toast-host {

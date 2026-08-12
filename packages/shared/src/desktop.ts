@@ -31,6 +31,8 @@ export const AppSettingsSchema = z.object({
   simulatedFeePct: z.number().default(0.0015),
   autoCycleEnabled: z.boolean().default(false),
   autoCycleIntervalMinutes: z.number().int().min(5).max(120).default(30),
+  wealthEmail: z.string().email().optional(),
+  wealthConnected: z.boolean().default(false),
 });
 export type AppSettings = z.infer<typeof AppSettingsSchema>;
 
@@ -92,4 +94,7 @@ export const SECRET_KEYS = {
   PULSE_PASSWORD: 'pulse_password',
   PULSE_API_KEY: 'pulse_api_key',
   LLM_API_KEY: 'llm_api_key',
+  WEALTH_PASSWORD: 'wealth_password',
+  WEALTH_TOKEN: 'wealth_token',
+  WEALTH_TOKEN_EXPIRES: 'wealth_token_expires',
 } as const;
