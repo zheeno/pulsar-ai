@@ -93,6 +93,22 @@ pub struct PulseAuthReport {
     pub logs: Vec<String>,
 }
 
+/// Safe NGX Pulse account summary for Settings (no secrets).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PulseProfile {
+    pub ok: bool,
+    pub auth_mode: String,
+    pub email: Option<String>,
+    pub user_id: Option<String>,
+    pub display_name: Option<String>,
+    pub phone: Option<String>,
+    pub created_at: Option<String>,
+    pub last_sign_in_at: Option<String>,
+    pub email_confirmed: Option<bool>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 struct SessionTokens {
     access_token: String,
@@ -353,6 +369,128 @@ impl NgxPulseClient {
         Ok(NgxMarketStatus {
             status: data.get("status").and_then(|v| v.as_str()).unwrap_or("Unknown").into(),
             is_open: data.get("is_open").and_then(|v| v.as_bool()).unwrap_or(false),
+        })
+    }
+
+    /// Fetch the signed-in Supabase user for the Settings profile view.
+    pub async fn get_user_profile(&self) -> PulseProfile {
+        match self.auth_mode {
+            AuthMode::Mock => PulseProfile {
+                ok: false,
+                auth_mode: self.auth_mode.as_str().into(),
+                email: self.email.clone(),
+                user_id: None,
+                display_name: self.email.as_ref().map(|e| display_name_from_email(e)),
+                phone: None,
+                created_at: None,
+                last_sign_in_at: None,
+                email_confirmed: None,
+                message: "Pulse session is not active (demo / mock mode).".into(),
+            },
+            AuthMode::ApiKey => PulseProfile {
+                ok: true,
+                auth_mode: self.auth_mode.as_str().into(),
+                email: self.email.clone(),
+                user_id: None,
+                display_name: self.email.as_ref().map(|e| display_name_from_email(e)),
+                phone: None,
+                created_at: None,
+                last_sign_in_at: None,
+                email_confirmed: None,
+                message: "Connected with API key (no user profile endpoint).".into(),
+            },
+            AuthMode::Session => match self.fetch_supabase_user().await {
+                Ok(profile) => profile,
+                Err(e) => PulseProfile {
+                    ok: false,
+                    auth_mode: self.auth_mode.as_str().into(),
+                    email: self.email.clone(),
+                    user_id: None,
+                    display_name: self.email.as_ref().map(|e| display_name_from_email(e)),
+                    phone: None,
+                    created_at: None,
+                    last_sign_in_at: None,
+                    email_confirmed: None,
+                    message: format!("Could not load Pulse profile: {e}"),
+                },
+            },
+        }
+    }
+
+    async fn fetch_supabase_user(&self) -> Result<PulseProfile> {
+        let supabase_url = self.supabase_url.as_ref().context("supabase url")?;
+        let anon_key = self.anon_key.as_ref().context("anon key")?;
+        let access = self.get_access_token().await?;
+        let url = format!("{}/auth/v1/user", supabase_url.trim_end_matches('/'));
+
+        let res = self
+            .http
+            .get(&url)
+            .headers(supabase_user_headers(anon_key, &access))
+            .send()
+            .await
+            .context("pulse user request failed")?;
+
+        let status = res.status();
+        let text = res.text().await.context("pulse user body")?;
+        let body: serde_json::Value = serde_json::from_str(&text).context("pulse user json")?;
+        if !status.is_success() {
+            let msg = body
+                .get("msg")
+                .or(body.get("message"))
+                .or(body.get("error_description"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&text);
+            return Err(anyhow!("NGX Pulse user lookup failed ({status}): {msg}"));
+        }
+
+        let email = body
+            .get("email")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.email.clone());
+        let meta = body.get("user_metadata").cloned().unwrap_or(serde_json::Value::Null);
+        let display_name = meta
+            .get("full_name")
+            .or(meta.get("name"))
+            .or(meta.get("display_name"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| email.as_ref().map(|e| display_name_from_email(e)));
+
+        let phone = body
+            .get("phone")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        Ok(PulseProfile {
+            ok: true,
+            auth_mode: self.auth_mode.as_str().into(),
+            email,
+            user_id: body.get("id").and_then(|v| v.as_str()).map(str::to_string),
+            display_name,
+            phone,
+            created_at: body
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            last_sign_in_at: body
+                .get("last_sign_in_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            email_confirmed: body
+                .get("email_confirmed_at")
+                .and_then(|v| {
+                    if v.is_null() {
+                        Some(false)
+                    } else if v.as_str().is_some() {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }),
+            message: "Pulse session active.".into(),
         })
     }
 
@@ -622,6 +760,38 @@ fn supabase_headers(anon_key: &str) -> reqwest::header::HeaderMap {
     headers.insert("x-client-info", "supabase-js/2.112.1; runtime=web".parse().unwrap());
     headers.insert("x-supabase-api-version", "2024-01-01".parse().unwrap());
     headers
+}
+
+fn supabase_user_headers(anon_key: &str, access_token: &str) -> reqwest::header::HeaderMap {
+    let mut headers = supabase_headers(anon_key);
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {access_token}").parse().unwrap(),
+    );
+    headers
+}
+
+fn display_name_from_email(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or(email);
+    let cleaned = local.replace(['.', '_', '-'], " ");
+    let mut parts = cleaned
+        .split_whitespace()
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return "NGX User".into();
+    }
+    if parts.len() > 2 {
+        parts.truncate(2);
+    }
+    parts.join(" ")
 }
 
 async fn parse_auth_response(res: reqwest::Response) -> Result<SessionTokens> {

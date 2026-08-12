@@ -1,14 +1,23 @@
 import { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useSession } from '../lib/session';
+import {
+  IconBacktest,
+  IconHome,
+  IconLogout,
+  IconSettings,
+  IconSignals,
+  IconSpinner,
+  IconShieldCheck,
+  IconTrades,
+} from './Icons';
 
 const links = [
-  { href: '/', label: 'Dashboard' },
-  { href: '/signals', label: 'Signals' },
-  { href: '/trades', label: 'Trades' },
-  { href: '/strategy', label: 'Strategy' },
-  { href: '/backtest', label: 'Backtest' },
-  { href: '/settings', label: 'Settings' },
+  { href: '/', label: 'Home', Icon: IconHome },
+  { href: '/signals', label: 'Signals', Icon: IconSignals },
+  { href: '/trades', label: 'Trades', Icon: IconTrades },
+  { href: '/backtest', label: 'Backtest', Icon: IconBacktest },
+  { href: '/settings', label: 'Settings', Icon: IconSettings },
 ];
 
 export default function Nav() {
@@ -29,65 +38,52 @@ export default function Nav() {
       setBusy(false);
       setConfirming(false);
       console.error('Logout failed', e);
-      // Prefer inline status over alert() — WKWebView often blocks window.alert/confirm
-      window.dispatchEvent(new CustomEvent('pulsar:toast', { detail: `Logout failed: ${e}` }));
     }
   }
 
   return (
-    <nav style={{
-      display: 'flex', alignItems: 'center', gap: 16, padding: '12px 24px',
-      background: '#0f172a', borderBottom: '1px solid #1e293b',
-    }}>
-      <span style={{ fontWeight: 700, color: '#38bdf8', marginRight: 16 }}>Pulsar AI</span>
-      {links.map((link) => (
-        <Link
-          key={link.href}
-          to={link.href}
-          style={{
-            color: location.pathname === link.href ? '#38bdf8' : '#94a3b8',
-            textDecoration: 'none', fontSize: 14,
-          }}
-        >
-          {link.label}
-        </Link>
-      ))}
-      <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+    <aside className="nav-rail" aria-label="Primary">
+      <div className="nav-rail__brand">
+        <span className="nav-rail__brand-mark"><IconShieldCheck size={18} /></span>
+        <span className="nav-rail__brand-text">Pulsar AI</span>
+      </div>
+      <nav className="nav-rail__links" aria-label="Main">
+        {links.map(({ href, label, Icon }) => {
+          const active = location.pathname === href;
+          return (
+            <Link
+              key={href}
+              to={href}
+              className={`nav-rail__link${active ? ' is-active' : ''}`}
+              aria-current={active ? 'page' : undefined}
+            >
+              <Icon size={18} />
+              <span className="nav-rail__link-label">{label}</span>
+            </Link>
+          );
+        })}
+      </nav>
+      <div className="nav-rail__footer">
         {confirming && (
           <button
             type="button"
+            className="btn btn-ghost"
             disabled={busy}
             onClick={() => setConfirming(false)}
-            style={{
-              background: 'transparent',
-              border: '1px solid #475569',
-              color: '#94a3b8',
-              padding: '6px 12px',
-              borderRadius: 6,
-              cursor: 'pointer',
-              fontSize: 13,
-            }}
           >
             Cancel
           </button>
         )}
         <button
           type="button"
+          className={`btn ${confirming ? 'btn-danger' : 'btn-ghost'}`}
           disabled={busy}
           onClick={() => void handleLogout()}
-          style={{
-            background: confirming ? '#7f1d1d' : 'transparent',
-            border: `1px solid ${confirming ? '#ef4444' : '#475569'}`,
-            color: confirming ? '#fecaca' : '#94a3b8',
-            padding: '6px 12px',
-            borderRadius: 6,
-            cursor: busy ? 'wait' : 'pointer',
-            fontSize: 13,
-          }}
         >
+          {busy ? <IconSpinner /> : <IconLogout size={16} />}
           {busy ? 'Logging out…' : confirming ? 'Confirm log out' : 'Log out'}
         </button>
       </div>
-    </nav>
+    </aside>
   );
 }

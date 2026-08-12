@@ -42,6 +42,8 @@ function defaultSettings(): Settings {
     defaultStartingCapital: 10_000_000,
     simulatedSlippageBps: 10,
     simulatedFeePct: 0.0015,
+    autoCycleEnabled: false,
+    autoCycleIntervalMinutes: 30,
   };
 }
 
@@ -86,10 +88,10 @@ function defaultStore(): MockStore {
       max_position_pct: 0.1,
       max_daily_trades: 5,
       stop_loss_pct: 0.05,
+      take_profit_pct: 0.1,
       min_confidence_to_trade: 0.65,
       max_daily_drawdown_pct: 0.03,
       position_size_pct: 0.05,
-      allowed_symbols: ['DANGCEM', 'GTCO', 'ZENITHBANK', 'MTNN', 'BUACEMENT'],
       is_active: true,
     },
     backtests: {},
@@ -207,6 +209,25 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
     case 'test_llm':
       return { message: 'OK (browser mock — use Tauri for real LLM)' } as T;
 
+    case 'llm_status': {
+      const s = loadSettings();
+      const key = loadSecrets().llmApiKey;
+      const configured = Boolean(key);
+      let maskedKey: string | null = null;
+      if (key && key.length > 8) {
+        maskedKey = `${key.slice(0, 3)}••••••••${key.slice(-4)}`;
+      } else if (key) {
+        maskedKey = '••••••••';
+      }
+      return {
+        provider: s.llmProvider || 'openai',
+        model: s.llmModel || 'gpt-4o-mini',
+        baseUrl: s.llmBaseUrl ?? null,
+        configured,
+        maskedKey,
+      } as T;
+    }
+
     case 'portfolio_default': {
       const store = loadStore();
       const market_value = store.positions.reduce((s, p) => s + p.market_value, 0);
@@ -224,6 +245,26 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
 
     case 'usage_ngx_pulse':
       return { daily: 0, limit: null, remaining: null, authMode: 'mock' } as T;
+
+    case 'market_status': {
+      const now = new Date();
+      const watHour = (now.getUTCHours() + 1) % 24;
+      const isOpen = watHour >= 9 && watHour < 16;
+      const isPostClose = watHour === 16 && now.getUTCMinutes() < 30;
+      const phase = isOpen ? 'open' : isPostClose ? 'post_close' : 'closed';
+      return {
+        isOpen,
+        isPostClose,
+        isTradingDay: now.getUTCDay() !== 0 && now.getUTCDay() !== 6,
+        phase,
+        todayWat: now.toISOString().slice(0, 10),
+        nowWat: `${String(watHour).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')} WAT`,
+        pulseStatus: isOpen ? 'Open' : 'Closed',
+        pulseIsOpen: isOpen,
+        appEnv: 'dev',
+        marketHoursEnforced: false,
+      } as T;
+    }
 
     case 'cycle_run':
     case 'cycle_ingest':
@@ -257,6 +298,35 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
 
     case 'get_strategy':
       return loadStore().strategy as T;
+
+    case 'update_strategy': {
+      const payload = (args || {}) as {
+        strategy?: {
+          maxPositionPct?: number;
+          maxDailyTrades?: number;
+          stopLossPct?: number;
+          takeProfitPct?: number | null;
+          minConfidenceToTrade?: number;
+          maxDailyDrawdownPct?: number;
+          positionSizePct?: number;
+        };
+      };
+      const s = payload.strategy || {};
+      const store = loadStore();
+      store.strategy = {
+        ...store.strategy,
+        max_position_pct: s.maxPositionPct ?? store.strategy.max_position_pct,
+        max_daily_trades: s.maxDailyTrades ?? store.strategy.max_daily_trades,
+        stop_loss_pct: s.stopLossPct ?? store.strategy.stop_loss_pct,
+        take_profit_pct: s.takeProfitPct ?? store.strategy.take_profit_pct ?? 0.1,
+        min_confidence_to_trade: s.minConfidenceToTrade ?? store.strategy.min_confidence_to_trade,
+        max_daily_drawdown_pct: s.maxDailyDrawdownPct ?? store.strategy.max_daily_drawdown_pct,
+        position_size_pct: s.positionSizePct ?? store.strategy.position_size_pct,
+      };
+      delete store.strategy.allowed_symbols;
+      saveStore(store);
+      return store.strategy as T;
+    }
 
     case 'start_backtest': {
       const runId = `bt-${Date.now()}`;

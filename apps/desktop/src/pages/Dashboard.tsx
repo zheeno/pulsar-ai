@@ -1,12 +1,41 @@
-import { useEffect, useState } from 'react';
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
-import Nav from '../components/Nav';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import { IconShieldAlert, IconShieldCheck, IconSpinner } from '../components/Icons';
 import { api, type PortfolioData } from '../lib/api';
+import { useToast } from '../lib/toast';
 
 type RawPortfolio = PortfolioData & {
   totalEquity?: number;
   marketValue?: number;
   pnlToday?: number;
+};
+
+type Usage = {
+  daily: number;
+  limit: number | null;
+  remaining: number | null;
+  authMode?: string;
+};
+
+type MarketStatus = {
+  isOpen: boolean;
+  isPostClose: boolean;
+  isTradingDay: boolean;
+  phase: 'open' | 'post_close' | 'closed' | string;
+  todayWat: string;
+  nowWat: string;
+  pulseStatus?: string | null;
+  pulseIsOpen?: boolean | null;
+  appEnv: string;
+  marketHoursEnforced: boolean;
 };
 
 function normalizePortfolio(raw: RawPortfolio): PortfolioData {
@@ -19,11 +48,21 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
   };
 }
 
+function marketPhaseLabel(phase: string): string {
+  if (phase === 'open') return 'NGX Open';
+  if (phase === 'post_close') return 'Post-close';
+  return 'NGX Closed';
+}
+
 export default function DashboardPage() {
+  const toast = useToast();
   const [data, setData] = useState<PortfolioData | null>(null);
   const [performance, setPerformance] = useState<{ snapshot_date: string; total_equity: number }[]>([]);
-  const [usage, setUsage] = useState<{ daily: number; limit: number | null; remaining: number | null; authMode?: string } | null>(null);
+  const [usage, setUsage] = useState<Usage | null>(null);
+  const [market, setMarket] = useState<MarketStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [cycleBusy, setCycleBusy] = useState(false);
 
   useEffect(() => {
     void loadData();
@@ -33,8 +72,15 @@ export default function DashboardPage() {
 
   async function loadData() {
     try {
-      const portfolio = normalizePortfolio(await api<RawPortfolio>('portfolio_default'));
+      const [portfolioRaw, usageData, marketData] = await Promise.all([
+        api<RawPortfolio>('portfolio_default'),
+        api<Usage>('usage_ngx_pulse'),
+        api<MarketStatus>('market_status'),
+      ]);
+      const portfolio = normalizePortfolio(portfolioRaw);
       setData(portfolio);
+      setUsage(usageData);
+      setMarket(marketData);
       setError(null);
       if (portfolio.portfolio?.id) {
         const perf = await api<{ snapshot_date: string; total_equity: number }[]>(
@@ -43,20 +89,28 @@ export default function DashboardPage() {
         );
         setPerformance(perf);
       }
-      const usageData = await api<typeof usage>('usage_ngx_pulse');
-      setUsage(usageData);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setLoading(false);
     }
   }
 
   async function runCycle() {
+    setCycleBusy(true);
+    toast.info('Running trading cycle…', 'Cycle');
     try {
       const result = await api<{ signals: number; executed: number; warnings: string[] }>('cycle_run');
-      alert(`Cycle complete: ${result.signals} signals, ${result.executed} executed`);
+      const warnings = result.warnings?.length ? ` Warnings: ${result.warnings.join('; ')}` : '';
+      toast.success(
+        `${result.signals} signals, ${result.executed} executed.${warnings}`,
+        'Cycle complete',
+      );
       void loadData();
     } catch (e) {
-      alert(`Cycle failed: ${e}`);
+      toast.error(String(e), 'Cycle failed');
+    } finally {
+      setCycleBusy(false);
     }
   }
 
@@ -65,97 +119,209 @@ export default function DashboardPage() {
     return `₦${(Number.isFinite(value) ? value : 0).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
   };
 
+  const status = useMemo(() => {
+    if (error) {
+      return {
+        level: 'bad' as const,
+        title: 'Attention needed',
+        sub: error,
+        live: false,
+      };
+    }
+    if (loading && !data) {
+      return {
+        level: 'warn' as const,
+        title: 'Checking systems…',
+        sub: 'Loading portfolio and Pulse session status.',
+        live: false,
+      };
+    }
+    if (usage?.authMode === 'session' && data) {
+      return {
+        level: 'ok' as const,
+        title: 'Systems healthy',
+        sub: 'NGX Pulse session is active and your sandbox portfolio is ready. Run a cycle when you want fresh signals.',
+        live: true,
+      };
+    }
+    if (usage?.authMode && usage.authMode !== 'session') {
+      return {
+        level: 'warn' as const,
+        title: 'Needs attention',
+        sub: `Pulse is in ${usage.authMode} mode. Prefer a live session login for full market access.`,
+        live: false,
+      };
+    }
+    return {
+      level: 'warn' as const,
+      title: 'Needs attention',
+      sub: 'Waiting for Pulse usage and portfolio data. Open Settings if this persists.',
+      live: false,
+    };
+  }, [error, loading, data, usage]);
+
+  const marketChipClass =
+    market?.phase === 'open'
+      ? 'status-pill--ok'
+      : market?.phase === 'post_close'
+        ? 'status-pill--warn'
+        : 'status-pill--muted';
+
   return (
-    <div>
-      <Nav />
-      <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-          <h1>Portfolio Overview</h1>
-          <button onClick={() => void runCycle()} style={{ background: '#22c55e', color: 'white', border: 'none', padding: '10px 20px', borderRadius: 6, cursor: 'pointer' }}>
-            Run Cycle
-          </button>
+    <div className="page">
+      <section className={`status-hero is-${status.level}`} aria-live="polite">
+        <div className="status-hero__orb">
+          {status.level === 'ok' ? <IconShieldCheck /> : <IconShieldAlert />}
         </div>
-
-        {error && (
-          <p style={{ color: '#f87171', marginBottom: 16 }}>{error}</p>
-        )}
-
-        {data ? (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 32 }}>
-            <StatCard label="Total Equity" value={formatNaira(data.total_equity)} />
-            <StatCard label="Cash Balance" value={formatNaira(Number(data.portfolio?.cash_balance))} />
-            <StatCard label="Market Value" value={formatNaira(data.market_value)} />
-            <StatCard
-              label="Today's P&L"
-              value={formatNaira(data.pnl_today)}
-              color={data.pnl_today >= 0 ? '#22c55e' : '#ef4444'}
-            />
+        <div className="status-hero__body">
+          <div className="status-hero__meta">
+            {status.live && <span className="live-dot" title="Live session" />}
+            {status.live ? 'Protected · Live' : status.level === 'bad' ? 'Issue detected' : 'Review required'}
+            {market ? (
+              <>
+                <span className="status-hero__meta-sep" aria-hidden>·</span>
+                <span className={`status-pill ${marketChipClass}`} style={{ padding: '2px 8px', fontSize: '0.72rem' }}>
+                  {market.phase === 'open' && <span className="live-dot" aria-hidden />}
+                  {marketPhaseLabel(market.phase)}
+                </span>
+              </>
+            ) : null}
           </div>
-        ) : (
-          <p style={{ color: '#94a3b8' }}>
-            {error ? 'Could not load portfolio.' : 'Loading portfolio…'}
-          </p>
-        )}
+          <h1 className="status-hero__title">{status.title}</h1>
+          <p className="status-hero__sub">{status.sub}</p>
+          {market ? (
+            <p className="status-hero__market muted">
+              {market.nowWat}
+              {market.pulseStatus ? ` · Pulse: ${market.pulseStatus}` : ''}
+              {!market.marketHoursEnforced ? ' · Hours bypassed (dev)' : ''}
+            </p>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={cycleBusy || !!error}
+          onClick={() => void runCycle()}
+        >
+          {cycleBusy && <IconSpinner />}
+          {cycleBusy ? 'Running…' : 'Run trading cycle'}
+        </button>
+      </section>
 
-        {usage && (
-          <div style={{ background: '#1e293b', padding: 16, borderRadius: 8, marginBottom: 24 }}>
-            NGX Pulse ({usage.authMode ?? 'api_key'}): {usage.daily}
-            {usage.limit != null ? `/${usage.limit} requests today (${usage.remaining} remaining)` : ' requests today (unlimited session auth)'}
+      {loading && !data ? (
+        <div className="stat-grid" aria-hidden>
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="skeleton skeleton-card" />
+          ))}
+        </div>
+      ) : data ? (
+        <div className="stat-grid">
+          <div className="stat-card">
+            <div className="stat-card__label">Total equity</div>
+            <div className="stat-card__value">{formatNaira(data.total_equity)}</div>
           </div>
-        )}
-
-        {performance.length > 0 && (
-          <div style={{ background: '#1e293b', padding: 24, borderRadius: 8, marginBottom: 32 }}>
-            <h2 style={{ marginTop: 0 }}>Equity Curve</h2>
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={performance}>
-                <CartesianGrid stroke="#334155" />
-                <XAxis dataKey="snapshot_date" stroke="#94a3b8" fontSize={12} />
-                <YAxis stroke="#94a3b8" fontSize={12} tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`} />
-                <Tooltip contentStyle={{ background: '#1e293b', border: '1px solid #334155' }} />
-                <Line type="monotone" dataKey="total_equity" stroke="#3b82f6" dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
+          <div className="stat-card">
+            <div className="stat-card__label">Cash</div>
+            <div className="stat-card__value">{formatNaira(Number(data.portfolio?.cash_balance))}</div>
           </div>
-        )}
+          <div className="stat-card">
+            <div className="stat-card__label">Market value</div>
+            <div className="stat-card__value">{formatNaira(data.market_value)}</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-card__label">Today&apos;s P&amp;L</div>
+            <div
+              className="stat-card__value"
+              style={{ color: data.pnl_today >= 0 ? 'var(--status-ok)' : 'var(--status-bad)' }}
+            >
+              {formatNaira(data.pnl_today)}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <p className="empty-state">{error ? 'Could not load portfolio.' : 'Loading portfolio…'}</p>
+      )}
 
-        {data && data.positions.length > 0 && (
-          <div style={{ background: '#1e293b', padding: 24, borderRadius: 8 }}>
-            <h2 style={{ marginTop: 0 }}>Positions</h2>
-            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr style={{ borderBottom: '1px solid #334155', textAlign: 'left' }}>
-                  <th style={{ padding: 8 }}>Symbol</th>
-                  <th style={{ padding: 8 }}>Qty</th>
-                  <th style={{ padding: 8 }}>Avg Cost</th>
-                  <th style={{ padding: 8 }}>Current</th>
-                  <th style={{ padding: 8 }}>Value</th>
+      {performance.length > 0 && (
+        <div className="panel">
+          <h2>Equity curve</h2>
+          <ResponsiveContainer width="100%" height={280}>
+            <AreaChart data={performance}>
+              <defs>
+                <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#38bdf8" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
+              <XAxis dataKey="snapshot_date" stroke="var(--text-muted)" fontSize={11} tickMargin={8} />
+              <YAxis
+                stroke="var(--text-muted)"
+                fontSize={11}
+                tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
+                width={48}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: '#0f172a',
+                  border: '1px solid #334155',
+                  borderRadius: 8,
+                  fontFamily: 'Fira Sans, sans-serif',
+                }}
+              />
+              <Area
+                type="monotone"
+                dataKey="total_equity"
+                stroke="#38bdf8"
+                strokeWidth={2}
+                fill="url(#equityFill)"
+                dot={false}
+                activeDot={{ r: 4 }}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {data && data.positions.length > 0 && (
+        <div className="panel">
+          <h2>Positions</h2>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Qty</th>
+                <th>Avg cost</th>
+                <th>Current</th>
+                <th>Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.positions.map((p) => (
+                <tr key={p.symbol}>
+                  <td className="mono">{p.symbol}</td>
+                  <td className="mono">{Number(p.quantity).toLocaleString()}</td>
+                  <td className="mono">{formatNaira(Number(p.avg_cost))}</td>
+                  <td className="mono">{formatNaira(Number(p.current_price))}</td>
+                  <td className="mono">{formatNaira(Number(p.market_value))}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {data.positions.map((p) => (
-                  <tr key={p.symbol} style={{ borderBottom: '1px solid #1e293b' }}>
-                    <td style={{ padding: 8 }}>{p.symbol}</td>
-                    <td style={{ padding: 8 }}>{Number(p.quantity).toLocaleString()}</td>
-                    <td style={{ padding: 8 }}>{formatNaira(Number(p.avg_cost))}</td>
-                    <td style={{ padding: 8 }}>{formatNaira(Number(p.current_price))}</td>
-                    <td style={{ padding: 8 }}>{formatNaira(Number(p.market_value))}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
-function StatCard({ label, value, color }: { label: string; value: string; color?: string }) {
-  return (
-    <div style={{ background: '#1e293b', padding: 20, borderRadius: 8 }}>
-      <div style={{ color: '#94a3b8', fontSize: 14, marginBottom: 4 }}>{label}</div>
-      <div style={{ fontSize: 24, fontWeight: 700, color: color || '#e2e8f0' }}>{value}</div>
+      {data && data.positions.length === 0 && (
+        <div className="panel">
+          <div className="empty-state">
+            <div className="empty-state__icon"><IconShieldCheck size={22} /></div>
+            <div>No open positions yet</div>
+            <p className="muted" style={{ margin: 0, maxWidth: 360 }}>
+              Run a trading cycle to generate signals and simulated fills in the sandbox.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

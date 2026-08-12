@@ -156,16 +156,14 @@ impl SignalGenerationService {
         if let Some(pid) = portfolio_id {
             let row: Option<ParamSetRow> = conn
                 .query_row(
-                    "SELECT s.id, s.max_daily_trades, s.allowed_symbols FROM strategy_param_sets s
+                    "SELECT s.id, s.max_daily_trades FROM strategy_param_sets s
                      JOIN sandbox_portfolios p ON p.strategy_param_set_id = s.id
                      WHERE p.id = ?1 AND s.is_active = 1 LIMIT 1",
                     [pid],
                     |row| {
-                        let allowed: Option<String> = row.get(2)?;
                         Ok(ParamSetRow {
                             id: row.get(0)?,
                             max_daily_trades: row.get(1)?,
-                            allowed_symbols: allowed.and_then(|s| serde_json::from_str(&s).ok()),
                         })
                     },
                 )
@@ -176,14 +174,12 @@ impl SignalGenerationService {
         }
 
         conn.query_row(
-            "SELECT id, max_daily_trades, allowed_symbols FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
+            "SELECT id, max_daily_trades FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
             [],
             |row| {
-                let allowed: Option<String> = row.get(2)?;
                 Ok(ParamSetRow {
                     id: row.get(0)?,
                     max_daily_trades: row.get(1)?,
-                    allowed_symbols: allowed.and_then(|s| serde_json::from_str(&s).ok()),
                 })
             },
         )
@@ -191,23 +187,15 @@ impl SignalGenerationService {
         .map_err(Into::into)
     }
 
-    fn build_universe(conn: &Connection, param_set: &ParamSetRow) -> Result<Vec<Value>> {
-        let mut sql = String::from(
-            "SELECT i.symbol, i.name, i.sector, ph.price, ph.change_percent, ph.volume
+    fn build_universe(conn: &Connection, _param_set: &ParamSetRow) -> Result<Vec<Value>> {
+        let sql = "SELECT i.symbol, i.name, i.sector, ph.price, ph.change_percent, ph.volume
              FROM instruments i
              LEFT JOIN price_history ph ON ph.symbol = i.symbol AND ph.trade_date = (
                SELECT MAX(trade_date) FROM price_history WHERE symbol = i.symbol
              )
-             WHERE i.is_active = 1",
-        );
-        if let Some(allowed) = &param_set.allowed_symbols {
-            if !allowed.is_empty() {
-                let list = allowed.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
-                sql.push_str(&format!(" AND i.symbol IN ({list})"));
-            }
-        }
+             WHERE i.is_active = 1";
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(json!({
                 "symbol": row.get::<_, String>(0)?,
@@ -259,7 +247,6 @@ impl SignalGenerationService {
 struct ParamSetRow {
     id: String,
     max_daily_trades: i64,
-    allowed_symbols: Option<Vec<String>>,
 }
 
 use rusqlite::OptionalExtension;

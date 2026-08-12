@@ -1,196 +1,735 @@
-import { useEffect, useState } from 'react';
-import Nav from '../components/Nav';
+import { useEffect, useId, useRef, useState } from 'react';
+import { IconLogout, IconSpinner } from '../components/Icons';
 import { api, type AppSettings } from '../lib/api';
 import { useSession } from '../lib/session';
+import { useToast } from '../lib/toast';
 
-type PulseAuthReport = {
-  ok: boolean;
-  authMode: string;
-  supabaseHost?: string | null;
-  pulseBaseUrl: string;
-  hasEmail: boolean;
-  email?: string | null;
-  hasPassword: boolean;
-  hasAnonKey: boolean;
-  loginUrl?: string | null;
-  httpStatus?: number | null;
-  tokenExpiresAt?: number | null;
-  tokenPreview?: string | null;
-  message: string;
-  logs: string[];
+type LlmStatus = {
+  provider: string;
+  model: string;
+  baseUrl?: string | null;
+  configured: boolean;
+  maskedKey?: string | null;
 };
 
-export default function SettingsPage() {
-  const { logout } = useSession();
-  const [settings, setSettings] = useState<AppSettings | null>(null);
-  const [pulsePassword, setPulsePassword] = useState('');
-  const [llmApiKey, setLlmApiKey] = useState('');
-  const [status, setStatus] = useState('');
-  const [pulseReport, setPulseReport] = useState<PulseAuthReport | null>(null);
+type PulseProfile = {
+  ok: boolean;
+  authMode: string;
+  email?: string | null;
+  userId?: string | null;
+  displayName?: string | null;
+  phone?: string | null;
+  createdAt?: string | null;
+  lastSignInAt?: string | null;
+  emailConfirmed?: boolean | null;
+  message: string;
+};
 
-  useEffect(() => {
-    api<AppSettings>('settings_get').then(setSettings).catch(() => {});
-  }, []);
+type StrategyRecord = {
+  id: string;
+  name: string;
+  max_position_pct: number;
+  max_daily_trades: number;
+  stop_loss_pct: number;
+  take_profit_pct?: number | null;
+  min_confidence_to_trade: number;
+  max_daily_drawdown_pct: number;
+  position_size_pct: number;
+};
 
-  async function save() {
-    if (!settings) return;
-    setStatus('Saving...');
-    try {
-      await api('settings_set', {
-        settings: {
-          ...settings,
-          pulseConfigured: !!settings.pulseEmail,
-          llmConfigured: settings.llmConfigured || !!llmApiKey,
-        },
-        pulsePassword: pulsePassword || undefined,
-        llmApiKey: llmApiKey || undefined,
-      });
-      setStatus('Saved — run Test Pulse Login to verify session auth');
-      if (pulsePassword) setPulsePassword('');
-    } catch (e) {
-      setStatus(String(e));
-    }
-  }
+type StrategyDraft = {
+  maxPositionPct: number;
+  positionSizePct: number;
+  maxDailyTrades: number;
+  minConfidenceToTrade: number;
+  maxDailyDrawdownPct: number;
+  stopLossPct: number;
+  takeProfitPct: number;
+};
 
-  async function testPulse() {
-    setStatus('Testing Pulse… (check the desktop:dev terminal for ngx_pulse logs)');
-    setPulseReport(null);
-    try {
-      const report = await api<PulseAuthReport>('test_pulse_login');
-      setPulseReport(report);
-      setStatus(report.ok ? `Pulse OK (${report.authMode})` : `Pulse failed (${report.authMode})`);
-    } catch (e) {
-      setStatus(String(e));
-    }
-  }
+const PROVIDER_LABELS: Record<string, string> = {
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+  openrouter: 'OpenRouter',
+};
 
-  async function testLlm() {
-    setStatus('Testing LLM...');
-    try {
-      const r = await api<{ message: string }>('test_llm');
-      setStatus(`LLM OK: ${r.message?.slice(0, 50)}`);
-    } catch (e) {
-      setStatus(String(e));
-    }
-  }
+const AUTH_LABELS: Record<string, string> = {
+  session: 'NGX Pulse session',
+  api_key: 'API key',
+  mock: 'Demo mode',
+};
 
-  if (!settings) return <div style={{ padding: 24, color: '#e2e8f0' }}>Loading...</div>;
+function clamp(n: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, n));
+}
 
+function toPct(ratio: number, min: number, max: number) {
+  return clamp(Math.round(ratio * 100), min, max);
+}
+
+function draftFromStrategy(s: StrategyRecord): StrategyDraft {
+  return {
+    maxPositionPct: toPct(s.max_position_pct, 1, 50),
+    positionSizePct: toPct(s.position_size_pct, 1, 25),
+    maxDailyTrades: clamp(Math.round(s.max_daily_trades), 1, 20),
+    minConfidenceToTrade: toPct(s.min_confidence_to_trade, 40, 95),
+    maxDailyDrawdownPct: toPct(s.max_daily_drawdown_pct, 1, 15),
+    stopLossPct: toPct(s.stop_loss_pct, 1, 25),
+    takeProfitPct: toPct(s.take_profit_pct ?? 0.1, 2, 40),
+  };
+}
+
+function initialsFrom(name?: string | null, email?: string | null): string {
+  const source = (name || email || 'NG').trim();
+  const parts = source.includes('@')
+    ? source.split('@')[0].split(/[.\s_-]+/)
+    : source.split(/\s+/);
+  const letters = parts.filter(Boolean).slice(0, 2).map((p) => p[0]?.toUpperCase() || '');
+  return (letters.join('') || 'NG').slice(0, 2);
+}
+
+function formatDate(iso?: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+}
+
+function formatDateTime(iso?: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function shortId(id?: string | null): string {
+  if (!id) return '—';
+  if (id.length <= 12) return id;
+  return `${id.slice(0, 8)}…${id.slice(-4)}`;
+}
+
+function ParamSlider({
+  id,
+  label,
+  hint,
+  value,
+  min,
+  max,
+  step = 1,
+  format,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  format: (v: number) => string;
+  disabled?: boolean;
+  onChange: (v: number) => void;
+}) {
   return (
-    <div>
-      <Nav />
-      <div style={{ padding: 24, maxWidth: 720, margin: '0 auto' }}>
-        <h1>Settings</h1>
-
-        <section style={sectionStyle}>
-          <h2>NGX Pulse</h2>
-          <p style={{ color: '#64748b', fontSize: 13, marginTop: 0 }}>
-            Supabase URL/anon key come from <code>.env</code>. Email/password are stored locally.
-            Pulse HTTP runs in Rust — use <strong>Test Pulse Login</strong> and the terminal logs (not browser Network).
-          </p>
-          <Field label="Email" value={settings.pulseEmail || ''} onChange={(v) => setSettings({ ...settings, pulseEmail: v })} />
-          <Field label="Password (leave blank to keep)" value={pulsePassword} onChange={setPulsePassword} type="password" />
-          <button type="button" onClick={() => void testPulse()} style={btnSecondary}>Test Pulse Login</button>
-        </section>
-
-        {pulseReport && (
-          <section style={sectionStyle}>
-            <h2 style={{ color: pulseReport.ok ? '#22c55e' : '#f87171' }}>
-              Auth report — {pulseReport.ok ? 'success' : 'failed'}
-            </h2>
-            <dl style={dlStyle}>
-              <dt>authMode</dt><dd>{pulseReport.authMode}</dd>
-              <dt>supabaseHost</dt><dd>{pulseReport.supabaseHost || '—'}</dd>
-              <dt>loginUrl</dt><dd style={{ wordBreak: 'break-all' }}>{pulseReport.loginUrl || '—'}</dd>
-              <dt>pulseBaseUrl</dt><dd>{pulseReport.pulseBaseUrl}</dd>
-              <dt>email</dt><dd>{pulseReport.email || '—'}</dd>
-              <dt>hasPassword</dt><dd>{String(pulseReport.hasPassword)}</dd>
-              <dt>hasAnonKey</dt><dd>{String(pulseReport.hasAnonKey)}</dd>
-              <dt>httpStatus</dt><dd>{pulseReport.httpStatus ?? '—'}</dd>
-              <dt>tokenPreview</dt><dd>{pulseReport.tokenPreview || '—'}</dd>
-              <dt>tokenExpiresAt</dt><dd>{pulseReport.tokenExpiresAt ?? '—'}</dd>
-              <dt>message</dt><dd>{pulseReport.message}</dd>
-            </dl>
-            <h3 style={{ fontSize: 14, color: '#94a3b8' }}>Request log</h3>
-            <pre style={preStyle}>{pulseReport.logs.join('\n')}</pre>
-          </section>
-        )}
-
-        <section style={sectionStyle}>
-          <h2>LLM</h2>
-          <label style={labelStyle}>Provider</label>
-          <select style={inputStyle} value={settings.llmProvider} onChange={(e) => setSettings({ ...settings, llmProvider: e.target.value })}>
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic</option>
-            <option value="openrouter">OpenRouter</option>
-          </select>
-          <Field label="Model" value={settings.llmModel} onChange={(v) => setSettings({ ...settings, llmModel: v })} />
-          <Field label="Base URL (optional)" value={settings.llmBaseUrl || ''} onChange={(v) => setSettings({ ...settings, llmBaseUrl: v })} />
-          <Field label="API Key (leave blank to keep)" value={llmApiKey} onChange={setLlmApiKey} type="password" />
-          <button type="button" onClick={() => void testLlm()} style={btnSecondary}>Test LLM</button>
-        </section>
-
-        <div style={{ display: 'flex', gap: 12, marginTop: 24, alignItems: 'center' }}>
-          <button type="button" onClick={() => void save()} style={btnPrimary}>Save Settings</button>
-          <button
-            type="button"
-            onClick={() => {
-              void (async () => {
-                setStatus('Logging out…');
-                try {
-                  await logout();
-                } catch (e) {
-                  setStatus(String(e));
-                }
-              })();
-            }}
-            style={{ ...btnPrimary, background: '#7f1d1d' }}
-          >
-            Log out
-          </button>
+    <div className="param-slider">
+      <div className="param-slider__head">
+        <div className="param-slider__copy">
+          <label className="param-slider__label" htmlFor={id}>{label}</label>
+          <p className="param-slider__hint">{hint}</p>
         </div>
-        {status && (
-          <p style={{
-            marginTop: 12,
-            color: status.includes('OK') || status.includes('success') ? '#22c55e' : '#94a3b8',
-            whiteSpace: 'pre-wrap',
-          }}
-          >
-            {status}
-          </p>
-        )}
+        <span className="param-slider__value mono">{format(value)}</span>
+      </div>
+      <input
+        id={id}
+        className="param-slider__input"
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+      <div className="param-slider__bounds">
+        <span>{format(min)}</span>
+        <span>{format(max)}</span>
       </div>
     </div>
   );
 }
 
-function Field({ label, value, onChange, type = 'text' }: { label: string; value: string; onChange: (v: string) => void; type?: string }) {
+export default function SettingsPage() {
+  const { logout } = useSession();
+  const toast = useToast();
+  const providerId = useId();
+  const modelId = useId();
+  const baseId = useId();
+  const keyId = useId();
+  const titleId = useId();
+  const maxPosId = useId();
+  const posSizeId = useId();
+  const maxTradesId = useId();
+  const minConfId = useId();
+  const maxDdId = useId();
+  const stopLossId = useId();
+  const takeProfitId = useId();
+  const autoCycleId = useId();
+  const cycleIntervalId = useId();
+  const firstFieldRef = useRef<HTMLSelectElement>(null);
+
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
+  const [profile, setProfile] = useState<PulseProfile | null>(null);
+  const [strategyDraft, setStrategyDraft] = useState<StrategyDraft | null>(null);
+  const [autoCycleEnabled, setAutoCycleEnabled] = useState(false);
+  const [autoCycleMinutes, setAutoCycleMinutes] = useState(30);
+  const [busy, setBusy] = useState(false);
+  const [strategyBusy, setStrategyBusy] = useState(false);
+  const [cycleBusy, setCycleBusy] = useState(false);
+
+  const [llmModalOpen, setLlmModalOpen] = useState(false);
+  const [draftProvider, setDraftProvider] = useState('openai');
+  const [draftModel, setDraftModel] = useState('');
+  const [draftBaseUrl, setDraftBaseUrl] = useState('');
+  const [draftApiKey, setDraftApiKey] = useState('');
+  const [modalStatus, setModalStatus] = useState('');
+  const [modalBusy, setModalBusy] = useState(false);
+
+  async function refresh() {
+    const [s, llm, strategy] = await Promise.all([
+      api<AppSettings>('settings_get'),
+      api<LlmStatus>('llm_status'),
+      api<StrategyRecord>('get_strategy'),
+    ]);
+    setSettings(s);
+    setLlmStatus(llm);
+    setStrategyDraft(draftFromStrategy(strategy));
+    setAutoCycleEnabled(!!s.autoCycleEnabled);
+    setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
+    try {
+      setProfile(await api<PulseProfile>('pulse_profile'));
+    } catch (e) {
+      setProfile({
+        ok: false,
+        authMode: 'mock',
+        email: s.pulseEmail,
+        message: String(e),
+      });
+    }
+  }
+
+  useEffect(() => {
+    refresh().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!llmModalOpen) return;
+    firstFieldRef.current?.focus();
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape' && !modalBusy) closeLlmModal();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [llmModalOpen, modalBusy]);
+
+  function openLlmModal() {
+    if (!settings && !llmStatus) return;
+    setDraftProvider(llmStatus?.provider || settings?.llmProvider || 'openai');
+    setDraftModel(llmStatus?.model || settings?.llmModel || '');
+    setDraftBaseUrl(llmStatus?.baseUrl || settings?.llmBaseUrl || '');
+    setDraftApiKey('');
+    setModalStatus('');
+    setLlmModalOpen(true);
+  }
+
+  function closeLlmModal() {
+    if (modalBusy) return;
+    setLlmModalOpen(false);
+    setDraftApiKey('');
+    setModalStatus('');
+  }
+
+  async function saveLlmFromModal() {
+    if (!settings) return;
+    if (!draftApiKey.trim()) {
+      setModalStatus('Enter a new API key to update LLM credentials.');
+      return;
+    }
+    setModalBusy(true);
+    setModalStatus('Saving and verifying LLM…');
+    try {
+      await api('settings_set', {
+        settings: {
+          ...settings,
+          llmProvider: draftProvider,
+          llmModel: draftModel,
+          llmBaseUrl: draftBaseUrl.trim() || undefined,
+          llmConfigured: true,
+        },
+        llmApiKey: draftApiKey.trim(),
+      });
+      await api('test_llm');
+      await refresh();
+      setLlmModalOpen(false);
+      setDraftApiKey('');
+      toast.success('LLM settings updated and verified.', 'LLM');
+    } catch (e) {
+      setModalStatus(String(e));
+    } finally {
+      setModalBusy(false);
+    }
+  }
+
+  async function saveStrategy() {
+    if (!strategyDraft) return;
+    setStrategyBusy(true);
+    toast.info('Saving strategy…');
+    try {
+      const updated = await api<StrategyRecord>('update_strategy', {
+        strategy: {
+          maxPositionPct: strategyDraft.maxPositionPct / 100,
+          positionSizePct: strategyDraft.positionSizePct / 100,
+          maxDailyTrades: strategyDraft.maxDailyTrades,
+          minConfidenceToTrade: strategyDraft.minConfidenceToTrade / 100,
+          maxDailyDrawdownPct: strategyDraft.maxDailyDrawdownPct / 100,
+          stopLossPct: strategyDraft.stopLossPct / 100,
+          takeProfitPct: strategyDraft.takeProfitPct / 100,
+        },
+      });
+      setStrategyDraft(draftFromStrategy(updated));
+      toast.success('Strategy parameters saved.', 'Strategy');
+    } catch (e) {
+      toast.error(String(e), 'Strategy');
+    } finally {
+      setStrategyBusy(false);
+    }
+  }
+
+  async function saveAutoCycle() {
+    if (!settings) return;
+    setCycleBusy(true);
+    toast.info('Saving automation…');
+    try {
+      const minutes = clamp(autoCycleMinutes, 5, 120);
+      await api('settings_set', {
+        settings: {
+          ...settings,
+          autoCycleEnabled,
+          autoCycleIntervalMinutes: minutes,
+        },
+      });
+      setSettings({
+        ...settings,
+        autoCycleEnabled,
+        autoCycleIntervalMinutes: minutes,
+      });
+      setAutoCycleMinutes(minutes);
+      if (autoCycleEnabled) {
+        toast.success(
+          `Automatic cycles enabled every ${minutes} minutes during market hours.`,
+          'Automation',
+        );
+      } else {
+        toast.info(
+          'Automatic cycles disabled. You can still run a cycle manually from Home.',
+          'Automation',
+        );
+      }
+    } catch (e) {
+      toast.error(String(e), 'Automation');
+    } finally {
+      setCycleBusy(false);
+    }
+  }
+
+  if (!settings || !llmStatus || !profile || !strategyDraft) {
+    return (
+      <div className="page">
+        <div className="skeleton skeleton-line" style={{ width: '40%', height: 28 }} />
+        <div className="skeleton skeleton-card profile-card" style={{ marginTop: 24, minHeight: 180 }} />
+        <div className="skeleton skeleton-card" style={{ marginTop: 20, minHeight: 140 }} />
+      </div>
+    );
+  }
+
+  const providerLabel = PROVIDER_LABELS[llmStatus.provider] || llmStatus.provider;
+  const displayName = profile.displayName || profile.email || 'NGX account';
+  const authLabel = AUTH_LABELS[profile.authMode] || profile.authMode;
+  const sessionLive = profile.ok && profile.authMode === 'session';
+
   return (
-    <>
-      <label style={labelStyle}>{label}</label>
-      <input type={type} style={inputStyle} value={value} onChange={(e) => onChange(e.target.value)} />
-    </>
+    <div className="page">
+      <header className="page-header">
+        <div>
+          <h1>Settings</h1>
+          <p>Profile, strategy risk parameters, and LLM credentials.</p>
+        </div>
+      </header>
+
+      <section className="profile-card" aria-labelledby="profile-heading">
+        <div className="profile-card__hero">
+          <div className="profile-card__avatar" aria-hidden>
+            {initialsFrom(profile.displayName, profile.email)}
+          </div>
+          <div className="profile-card__identity">
+            <div className="profile-card__eyebrow">NGX Pulse</div>
+            <h2 id="profile-heading" className="profile-card__name">
+              {displayName}
+            </h2>
+            {profile.email ? (
+              <p className="profile-card__email">{profile.email}</p>
+            ) : (
+              <p className="profile-card__email muted">No email on file</p>
+            )}
+            <div className="profile-card__badges">
+              <span className={`status-pill ${sessionLive ? 'status-pill--ok' : profile.ok ? 'status-pill--warn' : 'status-pill--bad'}`}>
+                <span className={`live-dot ${sessionLive ? '' : 'live-dot--off'}`} aria-hidden />
+                {sessionLive ? 'Session active' : profile.ok ? authLabel : 'Session unavailable'}
+              </span>
+              {profile.emailConfirmed === true ? (
+                <span className="status-pill status-pill--muted">Email verified</span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        <dl className="profile-meta">
+          <div className="profile-meta__item">
+            <dt>Auth</dt>
+            <dd>{authLabel}</dd>
+          </div>
+          <div className="profile-meta__item">
+            <dt>User ID</dt>
+            <dd className="mono" title={profile.userId || undefined}>
+              {shortId(profile.userId)}
+            </dd>
+          </div>
+          <div className="profile-meta__item">
+            <dt>Member since</dt>
+            <dd>{formatDate(profile.createdAt)}</dd>
+          </div>
+          <div className="profile-meta__item">
+            <dt>Last sign-in</dt>
+            <dd>{formatDateTime(profile.lastSignInAt)}</dd>
+          </div>
+          {profile.phone ? (
+            <div className="profile-meta__item">
+              <dt>Phone</dt>
+              <dd className="mono">{profile.phone}</dd>
+            </div>
+          ) : null}
+        </dl>
+
+        {!profile.ok && (
+          <div className="banner banner-bad" style={{ marginTop: 16 }} role="status">
+            {profile.message}
+          </div>
+        )}
+
+        <div className="profile-card__actions">
+          <p className="muted profile-card__hint">
+            Pulse credentials are set during onboarding. Log out to reconnect with a different account.
+          </p>
+          <button
+            type="button"
+            className="btn btn-danger"
+            disabled={busy}
+            onClick={() => {
+              void (async () => {
+                setBusy(true);
+                toast.info('Logging out…');
+                try {
+                  await logout();
+                } catch (e) {
+                  toast.error(String(e), 'Logout failed');
+                  setBusy(false);
+                }
+              })();
+            }}
+          >
+            {busy ? <IconSpinner /> : <IconLogout />}
+            Log out
+          </button>
+        </div>
+      </section>
+
+      <section className="panel" aria-labelledby="strategy-heading">
+        <h2 id="strategy-heading">Strategy</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Risk and sizing for the sandbox. The trading universe is all active NGX instruments from Pulse.
+        </p>
+
+        <div className="param-slider-grid">
+          <ParamSlider
+            id={maxPosId}
+            label="Max position"
+            hint="Caps how large any single holding can grow as a share of total equity. Higher values concentrate risk in fewer names; lower values force broader diversification."
+            value={strategyDraft.maxPositionPct}
+            min={1}
+            max={50}
+            format={(v) => `${v}%`}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, maxPositionPct: v })}
+          />
+          <ParamSlider
+            id={posSizeId}
+            label="Position size"
+            hint="Target size for each new buy as a percent of equity. This sets the default order size before max-position and cash limits are applied."
+            value={strategyDraft.positionSizePct}
+            min={1}
+            max={25}
+            format={(v) => `${v}%`}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, positionSizePct: v })}
+          />
+          <ParamSlider
+            id={maxTradesId}
+            label="Max daily trades"
+            hint="Hard limit on how many buys can execute in a single trading day. Lower values slow turnover and reduce fee drag; higher values allow more active rebalancing."
+            value={strategyDraft.maxDailyTrades}
+            min={1}
+            max={20}
+            format={(v) => String(v)}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, maxDailyTrades: v })}
+          />
+          <ParamSlider
+            id={minConfId}
+            label="Min confidence"
+            hint="Signals below this model confidence are blocked. Raise it to trade only high-conviction ideas; lower it to accept more borderline recommendations."
+            value={strategyDraft.minConfidenceToTrade}
+            min={40}
+            max={95}
+            format={(v) => `${v}%`}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, minConfidenceToTrade: v })}
+          />
+          <ParamSlider
+            id={maxDdId}
+            label="Max daily drawdown"
+            hint="If today’s equity drop reaches this level, new buys are blocked for the rest of the day. Protects the book after a sharp session loss."
+            value={strategyDraft.maxDailyDrawdownPct}
+            min={1}
+            max={15}
+            format={(v) => `${v}%`}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, maxDailyDrawdownPct: v })}
+          />
+          <ParamSlider
+            id={stopLossId}
+            label="Stop loss"
+            hint="Planned exit threshold below entry for open positions. Stored for risk planning; keep it tight to cut losers sooner, or wider to tolerate normal volatility."
+            value={strategyDraft.stopLossPct}
+            min={1}
+            max={25}
+            format={(v) => `${v}%`}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, stopLossPct: v })}
+          />
+          <ParamSlider
+            id={takeProfitId}
+            label="Take profit"
+            hint="Planned exit threshold above entry for locking gains. Higher targets let winners run longer; lower targets bank profits earlier."
+            value={strategyDraft.takeProfitPct}
+            min={2}
+            max={40}
+            format={(v) => `${v}%`}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, takeProfitPct: v })}
+          />
+        </div>
+
+        <div className="btn-row">
+          <button type="button" className="btn btn-primary" disabled={strategyBusy} onClick={() => void saveStrategy()}>
+            {strategyBusy && <IconSpinner />}
+            {strategyBusy ? 'Saving…' : 'Save strategy'}
+          </button>
+        </div>
+      </section>
+
+      <section className="panel" aria-labelledby="automation-heading">
+        <h2 id="automation-heading">Automation</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Control whether Pulsar runs ingest → signals → execution cycles on a timer during NGX market hours.
+        </p>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label" htmlFor={autoCycleId}>Run cycles automatically</label>
+            <p className="toggle-row__hint">
+              When on, the app schedules full trading cycles in the background. When off, cycles only run when you trigger them from Home.
+            </p>
+          </div>
+          <button
+            id={autoCycleId}
+            type="button"
+            role="switch"
+            aria-checked={autoCycleEnabled}
+            className={`toggle ${autoCycleEnabled ? 'is-on' : ''}`}
+            disabled={cycleBusy}
+            onClick={() => setAutoCycleEnabled((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
+
+        <div className="param-slider-grid" style={{ marginTop: 20 }}>
+          <ParamSlider
+            id={cycleIntervalId}
+            label="Cycle frequency"
+            hint="Minutes between automatic cycles while the market is open (or in the post-close window). Shorter intervals react faster but use more LLM calls."
+            value={autoCycleMinutes}
+            min={5}
+            max={120}
+            step={5}
+            format={(v) => `${v} min`}
+            disabled={cycleBusy || !autoCycleEnabled}
+            onChange={setAutoCycleMinutes}
+          />
+        </div>
+
+        <div className="btn-row">
+          <button type="button" className="btn btn-primary" disabled={cycleBusy} onClick={() => void saveAutoCycle()}>
+            {cycleBusy && <IconSpinner />}
+            {cycleBusy ? 'Saving…' : 'Save automation'}
+          </button>
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>LLM</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Current provider configuration. Change credentials only when you need to rotate a key.
+        </p>
+        <dl className="summary-row" style={{ marginTop: 16 }}>
+          <dt>Provider</dt>
+          <dd>{providerLabel}</dd>
+          <dt>Model</dt>
+          <dd>{llmStatus.model || '—'}</dd>
+          {llmStatus.baseUrl ? (
+            <>
+              <dt>Base URL</dt>
+              <dd>{llmStatus.baseUrl}</dd>
+            </>
+          ) : null}
+          <dt>API key</dt>
+          <dd>
+            {llmStatus.configured
+              ? (llmStatus.maskedKey || '••••••••')
+              : 'Not configured'}
+          </dd>
+        </dl>
+        <div className="btn-row">
+          <button type="button" className="btn btn-ghost" onClick={openLlmModal}>
+            Change LLM settings
+          </button>
+        </div>
+      </section>
+
+      {llmModalOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) closeLlmModal();
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={titleId}
+          >
+            <div className="modal__header">
+              <div>
+                <h2 id={titleId}>Change LLM settings</h2>
+                <p className="muted" style={{ margin: '6px 0 0', fontSize: 13 }}>
+                  Updates are verified against the provider before they are kept.
+                </p>
+              </div>
+              <button type="button" className="modal__close" aria-label="Close" onClick={closeLlmModal} disabled={modalBusy}>
+                ×
+              </button>
+            </div>
+
+            <label className="label" htmlFor={providerId}>Provider</label>
+            <select
+              id={providerId}
+              ref={firstFieldRef}
+              className="input"
+              disabled={modalBusy}
+              value={draftProvider}
+              onChange={(e) => setDraftProvider(e.target.value)}
+            >
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+
+            <label className="label" htmlFor={modelId}>Model</label>
+            <input
+              id={modelId}
+              className="input"
+              disabled={modalBusy}
+              value={draftModel}
+              onChange={(e) => setDraftModel(e.target.value)}
+            />
+
+            <label className="label" htmlFor={baseId}>Base URL (optional)</label>
+            <input
+              id={baseId}
+              className="input"
+              disabled={modalBusy}
+              value={draftBaseUrl}
+              onChange={(e) => setDraftBaseUrl(e.target.value)}
+              placeholder="Leave blank for provider default"
+            />
+
+            <label className="label" htmlFor={keyId}>API key</label>
+            <input
+              id={keyId}
+              className="input"
+              type="password"
+              autoComplete="off"
+              disabled={modalBusy}
+              value={draftApiKey}
+              onChange={(e) => setDraftApiKey(e.target.value)}
+              placeholder="Paste new API key"
+            />
+
+            {modalStatus && (
+              <div
+                className={`banner ${modalStatus.includes('verifying') || modalStatus.includes('Saving') ? 'banner-muted' : 'banner-bad'}`}
+                style={{ marginTop: 16 }}
+                role="status"
+              >
+                {modalStatus}
+              </div>
+            )}
+
+            <div className="btn-row">
+              <button type="button" className="btn btn-ghost" disabled={modalBusy} onClick={closeLlmModal}>
+                Cancel
+              </button>
+              <button type="button" className="btn btn-primary" disabled={modalBusy} onClick={() => void saveLlmFromModal()}>
+                {modalBusy && <IconSpinner />}
+                {modalBusy ? 'Verifying…' : 'Save & verify'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
-
-const sectionStyle: React.CSSProperties = { background: '#1e293b', padding: 24, borderRadius: 8, marginTop: 16 };
-const labelStyle: React.CSSProperties = { display: 'block', marginTop: 12, marginBottom: 4, fontSize: 13, color: '#94a3b8' };
-const inputStyle: React.CSSProperties = { width: '100%', padding: 10, borderRadius: 6, border: '1px solid #334155', background: '#0f172a', color: '#e2e8f0' };
-const btnPrimary: React.CSSProperties = { background: '#22c55e', color: 'white', border: 'none', padding: '10px 20px', borderRadius: 6, cursor: 'pointer' };
-const btnSecondary: React.CSSProperties = { ...btnPrimary, background: '#334155', marginTop: 12 };
-const dlStyle: React.CSSProperties = {
-  display: 'grid',
-  gridTemplateColumns: '160px 1fr',
-  gap: '8px 16px',
-  fontSize: 13,
-  margin: 0,
-};
-const preStyle: React.CSSProperties = {
-  background: '#0f172a',
-  padding: 12,
-  borderRadius: 6,
-  fontSize: 12,
-  overflow: 'auto',
-  color: '#cbd5e1',
-  whiteSpace: 'pre-wrap',
-};

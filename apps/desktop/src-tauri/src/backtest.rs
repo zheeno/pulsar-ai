@@ -224,10 +224,9 @@ use rusqlite::OptionalExtension;
 
 fn load_param_set(conn: &Connection, id: &str) -> Result<ParamSet> {
     conn.query_row(
-        "SELECT id, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade, max_daily_drawdown_pct, allowed_symbols, position_size_pct FROM strategy_param_sets WHERE id = ?1",
+        "SELECT id, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct FROM strategy_param_sets WHERE id = ?1",
         [id],
         |row| {
-            let allowed: Option<String> = row.get(6)?;
             Ok(ParamSet {
                 id: row.get(0)?,
                 max_position_pct: row.get(1)?,
@@ -235,20 +234,14 @@ fn load_param_set(conn: &Connection, id: &str) -> Result<ParamSet> {
                 stop_loss_pct: row.get(3)?,
                 min_confidence_to_trade: row.get(4)?,
                 max_daily_drawdown_pct: row.get(5)?,
-                allowed_symbols: allowed.and_then(|s| serde_json::from_str(&s).ok()),
-                position_size_pct: row.get(7)?,
+                position_size_pct: row.get(6)?,
             })
         },
     )
     .map_err(Into::into)
 }
 
-fn resolve_symbols(conn: &Connection, param_set: &ParamSet) -> Result<Vec<String>> {
-    if let Some(allowed) = &param_set.allowed_symbols {
-        if !allowed.is_empty() {
-            return Ok(allowed.clone());
-        }
-    }
+fn resolve_symbols(conn: &Connection, _param_set: &ParamSet) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT symbol FROM instruments WHERE is_active = 1")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())

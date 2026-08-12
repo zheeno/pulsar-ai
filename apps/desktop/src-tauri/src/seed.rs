@@ -67,11 +67,8 @@ impl SeedService {
         let param_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO strategy_param_sets (id, name, is_active, allowed_symbols)
-             VALUES (?1, 'default', 1, ?2)",
-            rusqlite::params![
-                param_id,
-                serde_json::to_string(&CURATED.iter().map(|(s, _, _)| *s).collect::<Vec<_>>())?
-            ],
+             VALUES (?1, 'default', 1, NULL)",
+            rusqlite::params![param_id],
         )?;
 
         let portfolio_id = Uuid::new_v4().to_string();

@@ -46,7 +46,7 @@ export const StrategyParamSetSchema = z.object({
   take_profit_pct: z.number().min(0).max(1).nullable().optional(),
   min_confidence_to_trade: z.number().min(0).max(1),
   max_daily_drawdown_pct: z.number().min(0).max(1),
-  allowed_symbols: z.array(z.string()).nullable().optional(),
+  allowed_symbols: z.array(z.string()).nullable().optional(), // deprecated: unused; universe is all active instruments
   position_size_pct: z.number().min(0).max(1).default(0.05),
   is_active: z.boolean().optional(),
 });

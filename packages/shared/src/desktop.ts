@@ -29,6 +29,8 @@ export const AppSettingsSchema = z.object({
   defaultStartingCapital: z.number().positive().default(10_000_000),
   simulatedSlippageBps: z.number().default(10),
   simulatedFeePct: z.number().default(0.0015),
+  autoCycleEnabled: z.boolean().default(false),
+  autoCycleIntervalMinutes: z.number().int().min(5).max(120).default(30),
 });
 export type AppSettings = z.infer<typeof AppSettingsSchema>;
 

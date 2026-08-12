@@ -31,6 +31,9 @@ impl Database {
         let conn = self.conn.lock();
         conn.execute_batch(migration)
             .context("run migrations")?;
+        // Discontinue strategy symbol allowlists — universe is all active instruments.
+        conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
+            .context("clear allowed_symbols")?;
         Ok(())
     }
 

@@ -1,27 +1,68 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
+use tokio::time::MissedTickBehavior;
 
 use crate::app_state::AppState;
+use crate::calendar::TradingCalendar;
 use crate::runtime_util::block_on_local;
 use crate::secrets::{get_secret, SECRET_PULSE_API_KEY, SECRET_PULSE_PASSWORD};
 use crate::settings::get_settings;
+use crate::signals::run_cycle;
+
+const SCHEDULER_POLL_SECS: u64 = 30;
 
 pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
-    let app_schedule = app.clone();
-    let state_schedule = state.clone();
+    let app_cycle = app.clone();
+    let state_cycle = state.clone();
     tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
+        let mut ticker = tokio::time::interval(Duration::from_secs(SCHEDULER_POLL_SECS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_cycle_at: Option<Instant> = None;
+
         loop {
-            interval.tick().await;
-            let calendar = crate::calendar::TradingCalendar::default();
-            if !calendar.is_market_open() && !calendar.is_post_close_window() {
+            ticker.tick().await;
+
+            let settings = match state_cycle.db.with_conn(get_settings) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(target: "scheduler", error = %e, "failed to load settings");
+                    continue;
+                }
+            };
+
+            if !settings.auto_cycle_enabled || !settings.onboarding_complete {
                 continue;
             }
-            let app2 = app_schedule.clone();
-            let state2 = state_schedule.clone();
-            let _ = tokio::task::spawn_blocking(move || run_scheduled_ingest(&app2, &state2)).await;
+
+            let interval =
+                Duration::from_secs(u64::from(settings.auto_cycle_interval_minutes.clamp(5, 120)) * 60);
+            if let Some(last) = last_cycle_at {
+                if last.elapsed() < interval {
+                    continue;
+                }
+            }
+
+            let calendar = TradingCalendar::default();
+            if !crate::runtime_util::market_activity_allowed(&calendar) {
+                continue;
+            }
+
+            let app2 = app_cycle.clone();
+            let state2 = state_cycle.clone();
+            match tokio::task::spawn_blocking(move || run_scheduled_cycle(&app2, &state2)).await {
+                Ok(Ok(())) => {
+                    tracing::info!(target: "scheduler", "auto cycle completed");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "scheduler", error = %e, "auto cycle failed");
+                }
+                Err(e) => {
+                    tracing::warn!(target: "scheduler", error = %e, "auto cycle task join failed");
+                }
+            }
+            last_cycle_at = Some(Instant::now());
         }
     });
 
@@ -36,7 +77,7 @@ fn catch_up_on_launch(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<
     let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
     let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
-    let calendar = crate::calendar::TradingCalendar::default();
+    let calendar = TradingCalendar::default();
 
     state.db.with_conn(|conn| {
         block_on_local(async {
@@ -56,23 +97,28 @@ fn catch_up_on_launch(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<
     Ok(())
 }
 
-fn run_scheduled_ingest(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<()> {
+fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<()> {
     let settings = state.db.with_conn(get_settings)?;
+    if !settings.auto_cycle_enabled || !settings.onboarding_complete {
+        return Ok(());
+    }
+
     let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
     let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
-    let calendar = crate::calendar::TradingCalendar::default();
+    let calendar = TradingCalendar::default();
 
-    state.db.with_conn(|conn| {
-        block_on_local(async {
-            let _ =
-                crate::ingest::IngestionService::ingest_stocks(conn, &client, &state.cache, &calendar, false)
-                    .await;
-            let _ = crate::ingest::IngestionService::ingest_market(conn, &client, &calendar, false).await;
-            Ok(())
-        })
+    let result = state.db.with_conn(|conn| {
+        block_on_local(run_cycle(
+            conn,
+            &state.agent,
+            &settings,
+            &state.cache,
+            &client,
+            &calendar,
+        ))
     })?;
 
-    let _ = app.emit("ingest:complete", ());
+    let _ = app.emit("cycle:complete", result);
     Ok(())
 }

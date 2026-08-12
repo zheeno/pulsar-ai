@@ -49,6 +49,8 @@ export interface AppSettings {
   defaultStartingCapital: number;
   simulatedSlippageBps: number;
   simulatedFeePct: number;
+  autoCycleEnabled: boolean;
+  autoCycleIntervalMinutes: number;
 }
 
 export interface PortfolioData {

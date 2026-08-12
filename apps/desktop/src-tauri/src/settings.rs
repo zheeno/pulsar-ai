@@ -18,6 +18,10 @@ pub struct AppSettings {
     pub default_starting_capital: f64,
     pub simulated_slippage_bps: f64,
     pub simulated_fee_pct: f64,
+    /// When true, the desktop scheduler runs full trading cycles on an interval.
+    pub auto_cycle_enabled: bool,
+    /// Minutes between automatic cycles (clamped to 5–120 when saved).
+    pub auto_cycle_interval_minutes: u32,
 }
 
 impl Default for AppSettings {
@@ -36,6 +40,8 @@ impl Default for AppSettings {
             default_starting_capital: 10_000_000.0,
             simulated_slippage_bps: 10.0,
             simulated_fee_pct: 0.0015,
+            auto_cycle_enabled: false,
+            auto_cycle_interval_minutes: 30,
         }
     }
 }
@@ -67,6 +73,11 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
                 settings.simulated_slippage_bps = value.parse().unwrap_or(10.0)
             }
             "simulated_fee_pct" => settings.simulated_fee_pct = value.parse().unwrap_or(0.0015),
+            "auto_cycle_enabled" => settings.auto_cycle_enabled = value == "true",
+            "auto_cycle_interval_minutes" => {
+                settings.auto_cycle_interval_minutes =
+                    value.parse::<u32>().unwrap_or(30).clamp(5, 120)
+            }
             _ => {}
         }
     }
@@ -131,6 +142,17 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
         "simulated_fee_pct",
         &settings.simulated_fee_pct.to_string(),
     )?;
+    set_setting(
+        conn,
+        "auto_cycle_enabled",
+        if settings.auto_cycle_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    let interval = settings.auto_cycle_interval_minutes.clamp(5, 120);
+    set_setting(conn, "auto_cycle_interval_minutes", &interval.to_string())?;
     Ok(())
 }
 

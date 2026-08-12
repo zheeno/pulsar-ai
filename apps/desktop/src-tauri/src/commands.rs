@@ -107,6 +107,58 @@ pub async fn test_llm(state: State<'_, Arc<AppState>>) -> Result<serde_json::Val
     state.agent.test_llm(&settings).await.map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmStatus {
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub configured: bool,
+    pub masked_key: Option<String>,
+}
+
+fn mask_api_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        return "••••••••".into();
+    }
+    let prefix: String = chars.iter().take(3).collect();
+    let suffix: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{prefix}••••••••{suffix}")
+}
+
+/// Safe LLM credential summary for Settings (never returns the raw key).
+#[tauri::command]
+pub fn llm_status(state: State<'_, Arc<AppState>>) -> Result<LlmStatus, String> {
+    let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+    let key = get_secret(SECRET_LLM_API_KEY).map_err(|e| e.to_string())?;
+    let configured = key.as_ref().is_some_and(|k| !k.is_empty());
+    Ok(LlmStatus {
+        provider: settings.llm_provider,
+        model: settings.llm_model,
+        base_url: settings.llm_base_url,
+        configured,
+        masked_key: key
+            .filter(|k| !k.is_empty())
+            .map(|k| mask_api_key(&k)),
+    })
+}
+
+/// NGX Pulse account profile for Settings (no secrets).
+#[tauri::command]
+pub async fn pulse_profile(state: State<'_, Arc<AppState>>) -> Result<crate::ngx::PulseProfile, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
+        let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
+        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+        Ok(block_on_local(client.get_user_profile()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Verify Pulse session + LLM, then mark onboarding complete. Rejects mock / failed auth.
 #[tauri::command]
 pub async fn complete_onboarding(state: State<'_, Arc<AppState>>) -> Result<crate::ngx::PulseAuthReport, String> {
@@ -186,6 +238,71 @@ pub fn usage_ngx_pulse(state: State<'_, Arc<AppState>>) -> Result<serde_json::Va
     }))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatusResponse {
+    pub is_open: bool,
+    pub is_post_close: bool,
+    pub is_trading_day: bool,
+    pub phase: String,
+    pub today_wat: String,
+    pub now_wat: String,
+    pub pulse_status: Option<String>,
+    pub pulse_is_open: Option<bool>,
+    pub app_env: String,
+    pub market_hours_enforced: bool,
+}
+
+#[tauri::command]
+pub async fn market_status(state: State<'_, Arc<AppState>>) -> Result<MarketStatusResponse, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let calendar = TradingCalendar::default();
+        let is_open = calendar.is_market_open();
+        let is_post_close = calendar.is_post_close_window();
+        let is_trading_day = calendar.is_trading_day(None);
+        let phase = if is_open {
+            "open"
+        } else if is_post_close {
+            "post_close"
+        } else {
+            "closed"
+        };
+
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
+        let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
+        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+
+        let (pulse_status, pulse_is_open) = state
+            .db
+            .with_conn(|conn| {
+                Ok(block_on_local(async {
+                    match client.get_market_status(conn).await {
+                        Ok(s) => (Some(s.status), Some(s.is_open)),
+                        Err(_) => (None, None),
+                    }
+                }))
+            })
+            .unwrap_or((None, None));
+
+        Ok(MarketStatusResponse {
+            is_open,
+            is_post_close,
+            is_trading_day,
+            phase: phase.into(),
+            today_wat: calendar.today_wat(),
+            now_wat: calendar.now_wat().format("%H:%M WAT").to_string(),
+            pulse_status,
+            pulse_is_open,
+            app_env: crate::runtime_util::app_env().into(),
+            market_hours_enforced: crate::runtime_util::enforce_market_hours(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn cycle_run(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let state = state.inner().clone();
@@ -195,6 +312,12 @@ pub async fn cycle_run(state: State<'_, Arc<AppState>>) -> Result<serde_json::Va
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
         let calendar = TradingCalendar::default();
+        if !crate::runtime_util::market_activity_allowed(&calendar) {
+            return Err(
+                "NGX market is closed. Cycles are blocked in production outside market hours (set APP_ENV=dev to bypass)."
+                    .into(),
+            );
+        }
         state
             .db
             .with_conn(|conn| {
@@ -323,27 +446,97 @@ pub fn get_strategy(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
         .db
         .with_conn(|conn| {
             Ok(conn.query_row(
-                "SELECT id, name, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct, allowed_symbols, is_active
+                "SELECT id, name, max_position_pct, max_daily_trades, stop_loss_pct, take_profit_pct,
+                        min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct, is_active
                  FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
                 [],
                 |row| {
-                    let allowed: Option<String> = row.get(8)?;
                     Ok(serde_json::json!({
                         "id": row.get::<_, String>(0)?,
                         "name": row.get::<_, String>(1)?,
                         "max_position_pct": row.get::<_, f64>(2)?,
                         "max_daily_trades": row.get::<_, i64>(3)?,
                         "stop_loss_pct": row.get::<_, f64>(4)?,
-                        "min_confidence_to_trade": row.get::<_, f64>(5)?,
-                        "max_daily_drawdown_pct": row.get::<_, f64>(6)?,
-                        "position_size_pct": row.get::<_, f64>(7)?,
-                        "allowed_symbols": allowed.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
+                        "take_profit_pct": row.get::<_, Option<f64>>(5)?,
+                        "min_confidence_to_trade": row.get::<_, f64>(6)?,
+                        "max_daily_drawdown_pct": row.get::<_, f64>(7)?,
+                        "position_size_pct": row.get::<_, f64>(8)?,
                         "is_active": row.get::<_, i64>(9)? == 1,
                     }))
                 },
             )?)
         })
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrategyUpdate {
+    pub max_position_pct: f64,
+    pub max_daily_trades: i64,
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: Option<f64>,
+    pub min_confidence_to_trade: f64,
+    pub max_daily_drawdown_pct: f64,
+    pub position_size_pct: f64,
+}
+
+fn validate_ratio(name: &str, value: f64) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("{name} must be between 0 and 1"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_strategy(
+    strategy: StrategyUpdate,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    validate_ratio("maxPositionPct", strategy.max_position_pct)?;
+    validate_ratio("stopLossPct", strategy.stop_loss_pct)?;
+    validate_ratio("minConfidenceToTrade", strategy.min_confidence_to_trade)?;
+    validate_ratio("maxDailyDrawdownPct", strategy.max_daily_drawdown_pct)?;
+    validate_ratio("positionSizePct", strategy.position_size_pct)?;
+    if let Some(tp) = strategy.take_profit_pct {
+        validate_ratio("takeProfitPct", tp)?;
+    }
+    if strategy.max_daily_trades < 1 {
+        return Err("maxDailyTrades must be at least 1".into());
+    }
+
+    state
+        .db
+        .with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE strategy_param_sets SET
+                    max_position_pct = ?1,
+                    max_daily_trades = ?2,
+                    stop_loss_pct = ?3,
+                    take_profit_pct = ?4,
+                    min_confidence_to_trade = ?5,
+                    max_daily_drawdown_pct = ?6,
+                    position_size_pct = ?7,
+                    allowed_symbols = NULL
+                 WHERE is_active = 1",
+                rusqlite::params![
+                    strategy.max_position_pct,
+                    strategy.max_daily_trades,
+                    strategy.stop_loss_pct,
+                    strategy.take_profit_pct,
+                    strategy.min_confidence_to_trade,
+                    strategy.max_daily_drawdown_pct,
+                    strategy.position_size_pct,
+                ],
+            )?;
+            if updated == 0 {
+                anyhow::bail!("No active strategy param set found");
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+
+    get_strategy(state)
 }
 
 #[tauri::command]

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { HashRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
+import AppShell from './components/AppShell';
 import ErrorBoundary from './components/ErrorBoundary';
+import { IconSpinner } from './components/Icons';
 import { api, type AppSettings } from './lib/api';
 import { SessionContext } from './lib/session';
+import { ToastProvider } from './lib/toast';
 import Dashboard from './pages/Dashboard';
 import Signals from './pages/Signals';
 import Trades from './pages/Trades';
-import Strategy from './pages/Strategy';
 import Backtest from './pages/Backtest';
 import Settings from './pages/Settings';
 import Onboarding from './pages/Onboarding';
@@ -84,8 +86,9 @@ function AppRoutes() {
 
   if (!ready) {
     return (
-      <div style={{ padding: 48, color: '#e2e8f0', background: '#0b1220', minHeight: '100vh' }}>
-        {bootMessage}
+      <div className="boot-screen">
+        <IconSpinner size={22} />
+        <div>{bootMessage}</div>
       </div>
     );
   }
@@ -104,14 +107,14 @@ function AppRoutes() {
           }
         />
         <Route
-          path="/"
-          element={needsOnboarding ? <Navigate to="/onboarding" replace /> : <Dashboard />}
-        />
-        <Route path="/signals" element={needsOnboarding ? <Navigate to="/onboarding" replace /> : <Signals />} />
-        <Route path="/trades" element={needsOnboarding ? <Navigate to="/onboarding" replace /> : <Trades />} />
-        <Route path="/strategy" element={needsOnboarding ? <Navigate to="/onboarding" replace /> : <Strategy />} />
-        <Route path="/backtest" element={needsOnboarding ? <Navigate to="/onboarding" replace /> : <Backtest />} />
-        <Route path="/settings" element={needsOnboarding ? <Navigate to="/onboarding" replace /> : <Settings />} />
+          element={needsOnboarding ? <Navigate to="/onboarding" replace /> : <AppShell />}
+        >
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/signals" element={<Signals />} />
+          <Route path="/trades" element={<Trades />} />
+          <Route path="/backtest" element={<Backtest />} />
+          <Route path="/settings" element={<Settings />} />
+        </Route>
       </Routes>
     </SessionContext.Provider>
   );
@@ -123,16 +126,16 @@ export default function App() {
   return (
     <HashRouter>
       <ErrorBoundary>
-        <div style={{ minHeight: '100vh', background: '#0b1220', color: '#e2e8f0' }}>
-          {browserMode && (
-            <div style={{
-              background: '#422006', color: '#fde68a', padding: '8px 16px', fontSize: 13, textAlign: 'center',
-            }}>
-              Browser mock mode — sample data in localStorage. Pulse gating requires the desktop app.
-            </div>
-          )}
-          <AppRoutes />
-        </div>
+        <ToastProvider>
+          <div className="app-root">
+            {browserMode && (
+              <div className="browser-banner">
+                Browser mock mode — sample data in localStorage. Pulse gating requires the desktop app.
+              </div>
+            )}
+            <AppRoutes />
+          </div>
+        </ToastProvider>
       </ErrorBoundary>
     </HashRouter>
   );

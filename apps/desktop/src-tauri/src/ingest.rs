@@ -16,7 +16,11 @@ impl IngestionService {
         calendar: &TradingCalendar,
         force: bool,
     ) -> Result<usize> {
-        if !force && !calendar.is_market_open() && !Self::is_post_close(calendar) {
+        if !force
+            && crate::runtime_util::enforce_market_hours()
+            && !calendar.is_market_open()
+            && !Self::is_post_close(calendar)
+        {
             return Ok(0);
         }
         let stocks = match client.get_stocks(conn).await {
@@ -38,7 +42,7 @@ impl IngestionService {
         calendar: &TradingCalendar,
         force: bool,
     ) -> Result<()> {
-        if !force && !calendar.is_trading_day(None) {
+        if !force && crate::runtime_util::enforce_market_hours() && !calendar.is_trading_day(None) {
             return Ok(());
         }
         let market = match client.get_market(conn).await {

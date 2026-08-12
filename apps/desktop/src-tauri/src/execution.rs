@@ -14,7 +14,6 @@ pub struct ParamSet {
     pub stop_loss_pct: f64,
     pub min_confidence_to_trade: f64,
     pub max_daily_drawdown_pct: f64,
-    pub allowed_symbols: Option<Vec<String>>,
     pub position_size_pct: f64,
 }
 
@@ -43,11 +42,6 @@ impl RiskPolicyService {
         }
         if signal.confidence < param_set.min_confidence_to_trade {
             return ("BLOCKED_CONFIDENCE".into(), 0.0);
-        }
-        if let Some(allowed) = &param_set.allowed_symbols {
-            if !allowed.contains(&signal.symbol) {
-                return ("BLOCKED_SYMBOL".into(), 0.0);
-            }
         }
         if signal.action == "BUY" && daily_trades >= param_set.max_daily_trades {
             return ("BLOCKED_DAILY_TRADES".into(), 0.0);
@@ -311,10 +305,9 @@ impl ExecutionService {
 
     fn load_param_set(conn: &Connection, id: &str) -> Result<ParamSet> {
         conn.query_row(
-            "SELECT id, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade, max_daily_drawdown_pct, allowed_symbols, position_size_pct FROM strategy_param_sets WHERE id = ?1",
+            "SELECT id, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct FROM strategy_param_sets WHERE id = ?1",
             [id],
             |row| {
-                let allowed: Option<String> = row.get(6)?;
                 Ok(ParamSet {
                     id: row.get(0)?,
                     max_position_pct: row.get(1)?,
@@ -322,8 +315,7 @@ impl ExecutionService {
                     stop_loss_pct: row.get(3)?,
                     min_confidence_to_trade: row.get(4)?,
                     max_daily_drawdown_pct: row.get(5)?,
-                    allowed_symbols: allowed.and_then(|s| serde_json::from_str(&s).ok()),
-                    position_size_pct: row.get(7)?,
+                    position_size_pct: row.get(6)?,
                 })
             },
         )
