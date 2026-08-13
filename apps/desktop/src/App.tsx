@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { HashRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import AppShell from './components/AppShell';
 import ErrorBoundary from './components/ErrorBoundary';
-import { IconSpinner } from './components/Icons';
+import SplashScreen from './components/SplashScreen';
 import { api, type AppSettings } from './lib/api';
 import { SessionContext } from './lib/session';
 import { ToastProvider } from './lib/toast';
@@ -24,8 +24,9 @@ type PulseAuthReport = {
 function AppRoutes() {
   const navigate = useNavigate();
   const [ready, setReady] = useState(false);
+  const [splashDone, setSplashDone] = useState(false);
   const [needsOnboarding, setNeedsOnboarding] = useState(true);
-  const [bootMessage, setBootMessage] = useState('Loading Pulsar AI…');
+  const [bootMessage, setBootMessage] = useState('Igniting Pulsar…');
 
   useEffect(() => {
     let cancelled = false;
@@ -59,6 +60,7 @@ function AppRoutes() {
           return;
         }
 
+        setBootMessage('Ready');
         setNeedsOnboarding(false);
         setReady(true);
       } catch {
@@ -85,13 +87,15 @@ function AppRoutes() {
   }, [navigate]);
 
   const session = useMemo(() => ({ logout }), [logout]);
+  const finishSplash = useCallback(() => setSplashDone(true), []);
 
-  if (!ready) {
+  if (!splashDone) {
     return (
-      <div className="boot-screen">
-        <IconSpinner size={22} />
-        <div>{bootMessage}</div>
-      </div>
+      <SplashScreen
+        ready={ready}
+        message={bootMessage}
+        onFinished={finishSplash}
+      />
     );
   }
 

@@ -9,9 +9,10 @@ import {
   IconSettings,
   IconSignals,
   IconSpinner,
-  IconShieldCheck,
   IconTrades,
 } from './Icons';
+import pulsarLogo from '../assets/pulsar-logo.svg';
+import pulsarLogoFull from '../assets/pulsar-logo-full.svg';
 
 const links = [
   { href: '/', label: 'Home', Icon: IconHome },
@@ -46,8 +47,16 @@ export default function Nav() {
   return (
     <aside className="nav-rail" aria-label="Primary">
       <div className="nav-rail__brand">
-        <span className="nav-rail__brand-mark"><IconShieldCheck size={18} /></span>
-        <span className="nav-rail__brand-text">Pulsar AI</span>
+        <img
+          src={pulsarLogoFull}
+          alt="Pulsar AI"
+          className="nav-rail__brand-logo nav-rail__brand-logo--full"
+        />
+        <img
+          src={pulsarLogo}
+          alt="Pulsar AI"
+          className="nav-rail__brand-logo nav-rail__brand-logo--mark"
+        />
       </div>
       <nav className="nav-rail__links" aria-label="Main">
         {links.map(({ href, label, Icon }) => {

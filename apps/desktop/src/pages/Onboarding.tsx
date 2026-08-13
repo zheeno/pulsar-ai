@@ -1,6 +1,7 @@
 import { useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { IconShieldCheck, IconSpinner } from '../components/Icons';
+import { IconSpinner } from '../components/Icons';
+import pulsarLogoFull from '../assets/pulsar-logo-full.svg';
 import { api, type AppSettings } from '../lib/api';
 import { useToast } from '../lib/toast';
 
@@ -136,8 +137,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
       <div className="onboarding-screen">
         <div className="onboarding-card">
           <div className="onboarding-brand">
-            <span className="nav-rail__brand-mark"><IconShieldCheck size={18} /></span>
-            Pulsar AI
+            <img src={pulsarLogoFull} alt="Pulsar AI" className="onboarding-brand__logo" />
           </div>
           <p className="muted" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <IconSpinner /> Loading…
@@ -154,8 +154,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
     <div className="onboarding-screen">
       <div className="onboarding-card">
         <div className="onboarding-brand">
-          <span className="nav-rail__brand-mark"><IconShieldCheck size={18} /></span>
-          Pulsar AI
+          <img src={pulsarLogoFull} alt="Pulsar AI" className="onboarding-brand__logo" />
         </div>
         <h1 style={{ margin: '0 0 8px', fontSize: '1.5rem', letterSpacing: '-0.03em' }}>
           Protect your trading workspace
