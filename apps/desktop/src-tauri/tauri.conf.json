@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "identifier": "com.pulsar.ai",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run prepare:resources && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run prepare:resources && npm run build",
     "frontendDist": "../dist"

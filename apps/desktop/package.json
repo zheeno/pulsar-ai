@@ -9,8 +9,8 @@
     "prepare:resources": "node ../../scripts/prepare-desktop-resources.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "desktop:dev": "RUST_LOG=\"info,ngx_pulse=debug\" tauri dev",
-    "desktop:build": "tauri build --bundles app,dmg",
+    "desktop:dev": "node ../../scripts/run-with-cargo.mjs tauri dev",
+    "desktop:build": "tauri build",
     "icons": "rsvg-convert -w 1024 -h 1024 src/assets/pulsar-logo.svg -o src-tauri/app-icon.png && tauri icon src-tauri/app-icon.png",
     "test": "echo 'no tests'"
   },
