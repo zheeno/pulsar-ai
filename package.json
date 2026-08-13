@@ -14,6 +14,7 @@
     "desktop:dev": "export PATH=\"$HOME/.cargo/bin:$PATH\" RUST_LOG=\"info,ngx_pulse=debug\" && npm run desktop:dev -w @ngx/desktop",
     "desktop:ui": "npm run dev -w @ngx/desktop",
     "desktop:build": "export PATH=\"$HOME/.cargo/bin:$PATH\" && npm run desktop:build -w @ngx/desktop",
+    "desktop:prepare": "node scripts/prepare-desktop-resources.mjs",
     "agent:build": "npm run build -w @ngx/agent",
     "agent:ping": "node scripts/test-agent-ping.js"
   },

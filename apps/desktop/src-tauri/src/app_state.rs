@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use crate::agent::AgentBridge;
 use crate::cache::PriceCache;
@@ -13,11 +14,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Database) -> Arc<Self> {
+    pub fn new(db: Database, worker_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             db,
             cache: PriceCache::new(2400),
-            agent: AgentBridge::new(crate::agent::resolve_worker_path()),
+            agent: AgentBridge::new(worker_path),
             cycle_running: AtomicBool::new(false),
         })
     }

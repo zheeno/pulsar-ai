@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -114,14 +114,37 @@ impl AgentBridge {
     }
 }
 
+fn resolve_node_bin() -> PathBuf {
+    if let Ok(path) = std::env::var("NGX_NODE_BIN") {
+        return PathBuf::from(path);
+    }
+    for candidate in [
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/bin/node",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from("node")
+}
+
 fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
-    let mut child = Command::new("node")
+    let node = resolve_node_bin();
+    let mut child = Command::new(&node)
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("spawn agent worker")?;
+        .with_context(|| {
+            format!(
+                "spawn agent worker with {} — install Node.js 20+ or set NGX_NODE_BIN",
+                node.display()
+            )
+        })?;
 
     let stdin = child.stdin.take().context("agent stdin")?;
     let stdout = child.stdout.take().context("agent stdout")?;
@@ -132,11 +155,29 @@ fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
     })
 }
 
-pub fn resolve_worker_path() -> PathBuf {
+/// Prefer bundled resource worker in packaged apps; fall back to repo path in dev.
+pub fn resolve_worker_path(resource_dir: Option<&Path>) -> PathBuf {
     if let Ok(path) = std::env::var("NGX_AGENT_WORKER") {
         return PathBuf::from(path);
     }
+
+    if let Some(dir) = resource_dir {
+        let bundled = dir.join("agent-worker.cjs");
+        if bundled.is_file() {
+            return bundled;
+        }
+        let nested = dir.join("resources").join("agent-worker.cjs");
+        if nested.is_file() {
+            return nested;
+        }
+    }
+
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let packaged = manifest.join("resources/agent-worker.cjs");
+    if packaged.is_file() {
+        return packaged;
+    }
+
     manifest
         .join("../../../packages/agent/dist/worker.js")
         .canonicalize()

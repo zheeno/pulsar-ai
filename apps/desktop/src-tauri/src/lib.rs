@@ -56,7 +56,36 @@ fn load_dotenv() {
             }
         }
     }
-    tracing::warn!("no .env found; NGX_PULSE_SUPABASE_* must be set in the process environment");
+    tracing::warn!("no .env found; will try bundled app.env in setup");
+}
+
+fn load_bundled_app_env(resource_dir: &std::path::Path) {
+    for candidate in [
+        resource_dir.join("app.env"),
+        resource_dir.join("resources").join("app.env"),
+    ] {
+        if !candidate.is_file() {
+            continue;
+        }
+        match std::fs::read_to_string(&candidate) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    let Some((key, value)) = trimmed.split_once('=') else {
+                        continue;
+                    };
+                    // Bundled production config must win over any ambient .env from the build machine.
+                    std::env::set_var(key.trim(), value.trim());
+                }
+                tracing::info!("loaded bundled env from {}", candidate.display());
+                return;
+            }
+            Err(e) => tracing::warn!("failed to read {}: {e}", candidate.display()),
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -77,13 +106,22 @@ pub fn run() {
             }
         }))
         .setup(|app| {
+            let resource_dir = app.path().resource_dir().ok();
+            if let Some(ref dir) = resource_dir {
+                // Bundled app.env wins for shipped builds (APP_ENV=production + Pulse URLs).
+                load_bundled_app_env(dir);
+            }
+
+            let worker_path = crate::agent::resolve_worker_path(resource_dir.as_deref());
+            tracing::info!(worker = %worker_path.display(), "agent worker path");
+
             let app_data = app.path().app_data_dir().expect("app data dir");
             let db = Database::open(&app_data).expect("open database");
             let settings = db.with_conn(get_settings).unwrap_or_default();
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
                 .expect("seed database");
 
-            let state = AppState::new(db);
+            let state = AppState::new(db, worker_path);
             app.manage(state.clone());
 
             scheduler::start_scheduler(app.handle().clone(), state);
