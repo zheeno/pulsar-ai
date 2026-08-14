@@ -1,4 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import bambooLogo from '../assets/bamboo.webp';
+import wealthLogo from '../assets/wealth.webp';
 import { IconLogout, IconSpinner } from '../components/Icons';
 import { api, type AppSettings } from '../lib/api';
 import { formatNaira } from '../lib/format';
@@ -24,6 +26,13 @@ type PulseProfile = {
   lastSignInAt?: string | null;
   emailConfirmed?: boolean | null;
   message: string;
+};
+
+type BrokerListItem = {
+  id: 'wealth' | 'bamboo' | string;
+  name: string;
+  available: boolean;
+  connected: boolean;
 };
 
 type WealthProfile = {
@@ -72,6 +81,16 @@ type StrategyDraft = {
   stopLossPct: number;
   takeProfitPct: number;
 };
+
+const BROKER_LOGOS: Record<string, string> = {
+  wealth: wealthLogo,
+  bamboo: bambooLogo,
+};
+
+const DEFAULT_BROKERS: BrokerListItem[] = [
+  { id: 'wealth', name: 'Coronation Wealth', available: true, connected: false },
+  { id: 'bamboo', name: 'Bamboo', available: false, connected: false },
+];
 
 const PROVIDER_LABELS: Record<string, string> = {
   openai: 'OpenAI',
@@ -218,6 +237,8 @@ export default function SettingsPage() {
   const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
   const [profile, setProfile] = useState<PulseProfile | null>(null);
   const [wealth, setWealth] = useState<WealthProfile | null>(null);
+  const [brokers, setBrokers] = useState<BrokerListItem[]>([]);
+  const [selectedBroker, setSelectedBroker] = useState('wealth');
   const [wealthEmail, setWealthEmail] = useState('');
   const [wealthPassword, setWealthPassword] = useState('');
   const [wealth2fa, setWealth2fa] = useState('');
@@ -256,6 +277,15 @@ export default function SettingsPage() {
     setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
     setLiveTradingEnabled(!!s.liveTradingEnabled);
     setScheduledLiveAuthorized(!!s.scheduledLiveAuthorized);
+    setSelectedBroker(s.selectedBroker || 'wealth');
+    try {
+      setBrokers(await api<BrokerListItem[]>('broker_list'));
+    } catch {
+      setBrokers([
+        { id: 'wealth', name: 'Coronation Wealth', available: true, connected: !!s.wealthConnected },
+        { id: 'bamboo', name: 'Bamboo', available: false, connected: false },
+      ]);
+    }
     try {
       setDataDir(await api<string>('app_data_dir'));
     } catch {
@@ -371,6 +401,27 @@ export default function SettingsPage() {
       toast.error(String(e), 'Strategy');
     } finally {
       setStrategyBusy(false);
+    }
+  }
+
+  async function selectBroker(next: string) {
+    if (wealthBusy || next === selectedBroker) return;
+    setWealthBusy(true);
+    try {
+      const updated = await api<AppSettings>('set_selected_broker', { brokerId: next });
+      setSettings(updated);
+      setSelectedBroker(updated.selectedBroker || next);
+      toast.success(
+        next === 'bamboo'
+          ? 'Bamboo selected. Live orders stay in sandbox until Bamboo is integrated.'
+          : 'Coronation Wealth selected as the live broker.',
+        'Live broker',
+      );
+      await refresh();
+    } catch (err) {
+      toast.error(String(err), 'Could not change broker');
+    } finally {
+      setWealthBusy(false);
     }
   }
 
@@ -526,6 +577,42 @@ export default function SettingsPage() {
         </div>
       </section>
 
+      <section className="panel" aria-labelledby="broker-heading" style={{ marginTop: 20 }}>
+        <h2 id="broker-heading">Live broker</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          One live broker at a time. Pulse stays the market-data source. Without a connected live
+          broker, Pulsar runs in sandbox mode.
+        </p>
+        <div className="broker-grid" role="radiogroup" aria-labelledby="broker-heading">
+          {(brokers.length ? brokers : DEFAULT_BROKERS).map((b) => {
+            const selected = selectedBroker === b.id;
+            return (
+              <button
+                key={b.id}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                className={`broker-card${selected ? ' is-selected' : ''}`}
+                disabled={wealthBusy}
+                onClick={() => void selectBroker(b.id)}
+              >
+                {BROKER_LOGOS[b.id] ? (
+                  <img src={BROKER_LOGOS[b.id]} alt="" className="broker-card__logo" />
+                ) : (
+                  <span className="broker-card__logo broker-card__logo--fallback" aria-hidden>
+                    {b.name.slice(0, 1)}
+                  </span>
+                )}
+                <span className="broker-card__name">{b.name}</span>
+                <span className="broker-card__meta">
+                  {b.connected ? 'Connected' : b.available ? 'Available' : 'Coming soon'}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
       <section className="panel" aria-labelledby="wealth-heading" style={{ marginTop: 20 }}>
         <h2 id="wealth-heading">Coronation Wealth</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
@@ -534,7 +621,14 @@ export default function SettingsPage() {
           signals place real market orders.
         </p>
 
-        {wealth?.connected ? (
+        {selectedBroker === 'bamboo' ? (
+          <div className="banner banner-warn" role="status">
+            Coming soon — live orders stay in sandbox until Bamboo is integrated.
+            {settings?.wealthConnected
+              ? ' Your Wealth account stays saved and idle until you select Coronation Wealth again.'
+              : ''}
+          </div>
+        ) : wealth?.connected ? (
           <>
             <div className="profile-card__badges" style={{ marginBottom: 12 }}>
               <span className={`status-pill ${wealth.tradingMode === 'live' ? 'status-pill--ok' : 'status-pill--warn'}`}>

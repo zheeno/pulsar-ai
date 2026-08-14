@@ -226,17 +226,21 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
         let mut value = serde_json::to_value(&summary).map_err(|e| e.to_string())?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
+            obj.insert(
+                "brokerId".into(),
+                serde_json::json!(crate::broker::BrokerId::parse(&settings.selected_broker).as_str()),
+            );
+            obj.insert(
+                "brokerName".into(),
+                serde_json::json!(crate::broker::BrokerId::parse(&settings.selected_broker).short_name()),
+            );
         }
 
-        if !settings.wealth_connected {
+        let Some(session) = crate::broker::open_live_broker(&settings) else {
             return Ok(value);
-        }
+        };
 
-        let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
-        let client = crate::wealth::WealthClient::from_settings(&settings, wealth_password);
-        let status = block_on_local(client.profile_status(&settings));
-        // Show Wealth cash/positions whenever the session is connected and profile loads.
-        // Live *order* routing still requires trading_verified (cycle/execution path).
+        let status = block_on_local(session.profile_status(&settings));
         if !status.ok || !status.connected {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
@@ -248,25 +252,27 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
             return Ok(value);
         }
 
-        match block_on_local(crate::wealth::WealthSyncService::refresh(&state.db, &client)) {
+        match block_on_local(session.refresh_book(&state.db)) {
             Ok(book) => Ok(live_portfolio_payload(
                 &id,
                 &summary,
                 &book,
                 &status,
                 false,
-                wealth_pnl_today(&state, book.profit),
+                wealth_pnl_today(&state, session.id().as_str(), book.profit),
+                session.id(),
             )),
             Err(e) => {
-                tracing::warn!(target: "wealth", error = %e, "wealth portfolio sync failed");
-                if let Some(book) = crate::wealth::WealthSyncService::load(&state.db).ok().flatten() {
+                tracing::warn!(target: "broker", error = %e, "live portfolio sync failed");
+                if let Some(book) = session.load_book(&state.db).ok().flatten() {
                     Ok(live_portfolio_payload(
                         &id,
                         &summary,
                         &book,
                         &status,
                         true,
-                        wealth_pnl_today(&state, book.profit),
+                        wealth_pnl_today(&state, session.id().as_str(), book.profit),
+                        session.id(),
                     ))
                 } else if let Some(obj) = value.as_object_mut() {
                     obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
@@ -328,40 +334,34 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
 
         let mut live_pnl_fallback: Option<f64> = None;
         let mut wealth_synced_at: Option<String> = None;
+        let mut live_broker = crate::broker::BrokerId::parse(&settings.selected_broker);
 
-        if settings.wealth_connected {
-            let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
-            let client = crate::wealth::WealthClient::from_settings(&settings, wealth_password);
-            let status = block_on_local(client.profile_status(&settings));
-            if status.ok && status.connected {
-                let book = match block_on_local(crate::wealth::WealthSyncService::refresh(
-                    &state.db,
-                    &client,
-                )) {
-                    Ok(b) => Some(b),
-                    Err(_) => crate::wealth::WealthSyncService::load(&state.db).ok().flatten(),
-                };
-                if let Some(book) = book {
-                    trading_mode = "live";
-                    cash = book.brokerage_balance;
-                    live_pnl_fallback = Some(wealth_pnl_today(&state, book.profit));
-                    wealth_synced_at = Some(book.synced_at.clone());
-                    lots = book
-                        .holdings
-                        .iter()
-                        .filter(|h| h.quantity > 0.0)
-                        .map(|h| {
-                            (
-                                format!("wealth-{}", h.stock_id),
-                                h.symbol.clone(),
-                                h.quantity,
-                                h.buy_price.unwrap_or(h.price),
-                                h.price,
-                                h.current_value,
-                            )
-                        })
-                        .collect();
-                }
+        if let Some(session) = crate::broker::open_live_broker(&settings) {
+            live_broker = session.id();
+            let book = match block_on_local(session.refresh_book(&state.db)) {
+                Ok(b) => Some(b),
+                Err(_) => session.load_book(&state.db).ok().flatten(),
+            };
+            if let Some(book) = book {
+                trading_mode = "live";
+                cash = book.brokerage_balance;
+                live_pnl_fallback = Some(wealth_pnl_today(&state, live_broker.as_str(), book.profit));
+                wealth_synced_at = Some(book.synced_at.clone());
+                lots = book
+                    .holdings
+                    .iter()
+                    .filter(|h| h.quantity > 0.0)
+                    .map(|h| {
+                        (
+                            format!("wealth-{}", h.stock_id),
+                            h.symbol.clone(),
+                            h.quantity,
+                            h.buy_price.unwrap_or(h.price),
+                            h.price,
+                            h.current_value,
+                        )
+                    })
+                    .collect();
             }
         }
 
@@ -403,6 +403,8 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
                 "quotedSymbols": Vec::<String>::new(),
                 "stale": collapsed,
                 "tradingMode": trading_mode,
+                "brokerId": live_broker.as_str(),
+                "brokerName": live_broker.short_name(),
                 "portfolio": {
                     "id": id,
                     "cash_balance": cash,
@@ -522,10 +524,10 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
     .map_err(|e| e.to_string())?
 }
 
-fn wealth_pnl_today(state: &Arc<AppState>, fallback: f64) -> f64 {
+fn wealth_pnl_today(state: &Arc<AppState>, venue: &str, fallback: f64) -> f64 {
     state
         .db
-        .with_conn(|conn| crate::portfolio::EquityCurveService::pnl_today(conn, "wealth"))
+        .with_conn(|conn| crate::portfolio::EquityCurveService::pnl_today(conn, venue))
         .ok()
         .flatten()
         .unwrap_or(fallback)
@@ -538,6 +540,7 @@ fn live_portfolio_payload(
     status: &crate::wealth::WealthProfileStatus,
     stale: bool,
     pnl_today: f64,
+    broker_id: crate::broker::BrokerId,
 ) -> serde_json::Value {
     let cash = book.brokerage_balance;
     let market_value = book.market_value();
@@ -577,6 +580,8 @@ fn live_portfolio_payload(
         "unrealized_pnl": unrealized_pnl,
         "quotesAsOf": book.synced_at,
         "tradingMode": "live",
+        "brokerId": broker_id.as_str(),
+        "brokerName": broker_id.short_name(),
         "tradingVerified": status.trading_verified,
         "wealthStatus": status,
         "stale": stale,
@@ -607,6 +612,9 @@ pub async fn wealth_login(
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        if crate::broker::BrokerId::parse(&settings.selected_broker) != crate::broker::BrokerId::Wealth {
+            return Err("Select Coronation Wealth as the live broker before connecting.".into());
+        }
         let client = crate::wealth::WealthClient::from_settings(&settings, Some(payload.password.clone()));
         let result = block_on_local(client.login(&payload.email, &payload.password));
         let result = result.map_err(|e| e.to_string())?;
@@ -634,6 +642,9 @@ pub async fn wealth_verify_2fa(
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        if crate::broker::BrokerId::parse(&settings.selected_broker) != crate::broker::BrokerId::Wealth {
+            return Err("Select Coronation Wealth as the live broker before connecting.".into());
+        }
         let password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
         let client = crate::wealth::WealthClient::from_settings(&settings, password);
         let result = block_on_local(client.verify_2fa(&payload.temp_token, &payload.code, &payload.email))
@@ -683,13 +694,38 @@ pub async fn wealth_logout(state: State<'_, Arc<AppState>>) -> Result<(), String
 }
 
 #[tauri::command]
+pub fn broker_list(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::broker::BrokerListItem>, String> {
+    let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+    Ok(crate::broker::catalog(&settings))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectBrokerPayload {
+    pub broker_id: String,
+}
+
+#[tauri::command]
+pub fn set_selected_broker(
+    payload: SelectBrokerPayload,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AppSettings, String> {
+    let id = crate::broker::BrokerId::parse(&payload.broker_id);
+    state
+        .db
+        .with_conn(|conn| crate::settings::set_selected_broker(conn, id.as_str()))
+        .map_err(|e| e.to_string())?;
+    state.db.with_conn(get_settings).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn portfolio_performance(
     id: Option<String>,
     venue: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let venue = venue.unwrap_or_else(|| "sandbox".into());
-    if venue == "wealth" || venue == "sandbox" {
+    if venue == "wealth" || venue == "sandbox" || venue == "bamboo" {
         return state
             .db
             .with_conn(|conn| crate::portfolio::EquityCurveService::get_curve(conn, &venue))
@@ -818,15 +854,7 @@ pub async fn cycle_run(
         let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
-        let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
-        let wealth = if settings.wealth_connected {
-            Some(crate::wealth::WealthClient::from_settings(
-                &settings,
-                wealth_password,
-            ))
-        } else {
-            None
-        };
+        let broker = crate::broker::open_live_broker(&settings);
         let calendar = TradingCalendar::default();
         if !crate::runtime_util::market_activity_allowed(&calendar) {
             let payload = serde_json::json!({
@@ -844,13 +872,13 @@ pub async fn cycle_run(
             );
         }
 
-        let trading_mode = if let Some(ref w) = wealth {
-            block_on_local(w.resolve_trading_mode(&settings))
+        let trading_mode = if let Some(ref session) = broker {
+            block_on_local(session.resolve_trading_mode(&settings))
         } else {
             crate::wealth::TradingMode::Sandbox
         };
-        if trading_mode == crate::wealth::TradingMode::Live && !settings.wealth_connected {
-            return Err("Wealth must be connected for live trading.".into());
+        if trading_mode == crate::wealth::TradingMode::Live && broker.is_none() {
+            return Err("Connect the selected live broker before live trading.".into());
         }
 
         let strategy_hash = state
@@ -875,9 +903,9 @@ pub async fn cycle_run(
             if let Some(token) = confirmation_token.as_deref() {
                 let confirm = state
                     .live_intents
-                    .consume(token, "wealth", &strategy_hash, allow_bulk)
+                    .consume(token, broker.as_ref().map(|s| s.id().as_str()).unwrap_or("wealth"), &strategy_hash, allow_bulk)
                     .map_err(|e| e.to_string())?;
-                let live_open = wealth
+                let live_open = broker
                     .as_ref()
                     .map(|w| block_on_local(w.market_is_open()).unwrap_or(false))
                     .unwrap_or(false);
@@ -886,7 +914,7 @@ pub async fn cycle_run(
                     &state.cache,
                     &settings,
                     &confirm.signal_ids,
-                    wealth.as_ref(),
+                    broker.as_ref(),
                     crate::wealth::TradingMode::Live,
                     live_open,
                     true,
@@ -915,7 +943,7 @@ pub async fn cycle_run(
             &state.cache,
             &client,
             &calendar,
-            wealth.as_ref(),
+            broker.as_ref(),
             execute,
             allow_bulk,
             Some(&cycle_id),
@@ -940,7 +968,7 @@ pub async fn cycle_run(
                             .unwrap_or_default();
                         let issued = state.live_intents.issue(
                             cycle_id,
-                            "wealth".into(),
+                            broker.as_ref().map(|s| s.id().as_str().to_string()).unwrap_or_else(|| "wealth".into()),
                             strategy_hash,
                             ids,
                             allow_bulk,
@@ -1011,36 +1039,28 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
-        let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
-        let wealth = if settings.wealth_connected {
-            Some(crate::wealth::WealthClient::from_settings(
-                &settings,
-                wealth_password,
-            ))
-        } else {
-            None
-        };
+        let broker = crate::broker::open_live_broker(&settings);
 
         let ids = block_on_local(async {
-                    let trading_mode = if let Some(ref w) = wealth {
-                        w.resolve_trading_mode(&settings).await
+                    let trading_mode = if let Some(ref session) = broker {
+                        session.resolve_trading_mode(&settings).await
                     } else {
                         crate::wealth::TradingMode::Sandbox
                     };
                     let (cash, venue, holdings) = if trading_mode == crate::wealth::TradingMode::Live {
-                        if let Some(ref w) = wealth {
-                            let book = match crate::wealth::WealthSyncService::refresh(&state.db, w).await {
+                        if let Some(ref session) = broker {
+                            let book = match session.refresh_book(&state.db).await {
                                 Ok(b) => Some(b),
-                                Err(_) => crate::wealth::WealthSyncService::load(&state.db).ok().flatten(),
+                                Err(_) => session.load_book(&state.db).ok().flatten(),
                             };
                             let cash = book.as_ref().map(|b| b.brokerage_balance);
                             let holdings = book
                                 .as_ref()
-                                .map(|b| crate::signals::HeldLot::from_wealth_holdings(&b.holdings))
+                                .map(|b| crate::signals::HeldLot::from_holdings(&b.holdings))
                                 .unwrap_or_default();
-                            (cash, "wealth", holdings)
+                            (cash, session.id().as_str(), holdings)
                         } else {
-                            (None, "wealth", Vec::new())
+                            (None, "sandbox", Vec::new())
                         }
                     } else {
                         (None, "sandbox", Vec::new())
@@ -1052,7 +1072,7 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
                         None,
                         cash,
                         venue,
-                        if venue == "wealth" {
+                        if venue != "sandbox" {
                             Some(holdings.as_slice())
                         } else {
                             None

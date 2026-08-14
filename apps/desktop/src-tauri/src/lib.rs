@@ -1,6 +1,7 @@
 mod agent;
 mod app_state;
 mod backtest;
+mod broker;
 mod cache;
 mod calendar;
 mod commands;
@@ -223,6 +224,8 @@ pub fn run() {
             commands::wealth_verify_2fa,
             commands::wealth_profile,
             commands::wealth_logout,
+            commands::broker_list,
+            commands::set_selected_broker,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

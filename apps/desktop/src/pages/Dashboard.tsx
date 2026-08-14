@@ -64,6 +64,8 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
       ?? null,
     stale: Boolean((raw as { stale?: boolean }).stale),
     tradingMode: (raw as { tradingMode?: string }).tradingMode || 'sandbox',
+    brokerId: (raw as { brokerId?: string }).brokerId ?? null,
+    brokerName: (raw as { brokerName?: string }).brokerName ?? null,
     tradingVerified: raw.tradingVerified ?? raw.wealthStatus?.tradingVerified,
     wealthStatus: raw.wealthStatus ?? null,
     wealthError: raw.wealthError ?? null,
@@ -266,6 +268,9 @@ export default function DashboardPage() {
       ]);
       const portfolio = normalizePortfolio(portfolioRaw);
       setData((prev) => {
+        if (portfolio.brokerId && prev?.brokerId && portfolio.brokerId !== prev.brokerId) {
+          return portfolio;
+        }
         if (prev?.tradingMode === 'live' && portfolio.tradingMode !== 'live') {
           return prev;
         }
@@ -290,7 +295,7 @@ export default function DashboardPage() {
       setUsage(usageData);
       setMarket(marketData);
       setError(null);
-      const venue = portfolio.tradingMode === 'live' ? 'wealth' : 'sandbox';
+      const venue = portfolio.tradingMode === 'live' ? (portfolio.brokerId || 'wealth') : 'sandbox';
       const perf = await api<EquityPoint[]>(
         'portfolio_performance',
         { venue, id: portfolio.portfolio?.id },
@@ -371,17 +376,18 @@ export default function DashboardPage() {
     }
     if (usage?.authMode === 'session' && data) {
       const live = data.tradingMode === 'live';
+      const broker = data.brokerName || 'broker';
       return {
         level: 'ok' as const,
         title: 'Systems healthy',
         sub: live
           ? (data.tradingVerified
-            ? 'NGX Pulse is active. Home shows your Wealth brokerage cash and holdings; cycles can place live market orders.'
+            ? `NGX Pulse is active. Home shows your ${broker} brokerage cash and holdings; cycles can place live market orders.`
             : (data.wealthStatus?.message
-              || 'Wealth connected — Home shows brokerage cash and holdings. Complete trading verification in the Wealth app to enable live orders.'))
+              || `${broker} connected — Home shows brokerage cash and holdings. Complete trading verification to enable live orders.`))
           : data.wealthError
-            ? `Wealth connected but portfolio sync failed: ${data.wealthError}`
-            : 'NGX Pulse session is active and your sandbox portfolio is ready. Connect a Wealth account in Settings to go live.',
+            ? `${broker} connected but portfolio sync failed: ${data.wealthError}`
+            : 'NGX Pulse session is active and your sandbox portfolio is ready. Connect a live broker in Settings to go live.',
         live: true,
       };
     }
@@ -444,7 +450,7 @@ export default function DashboardPage() {
                   style={{ padding: '2px 8px', fontSize: '0.72rem' }}
                 >
                   {data.tradingMode === 'live'
-                    ? (data.tradingVerified === false ? 'Wealth' : 'Live trader')
+                    ? (data.tradingVerified === false ? (data.brokerName || 'Broker') : 'Live trader')
                     : 'Sandbox'}
                 </span>
               </>
@@ -458,7 +464,7 @@ export default function DashboardPage() {
               {market.pulseStatus ? ` · Pulse: ${market.pulseStatus}` : ''}
               {!market.marketHoursEnforced ? ' · Hours bypassed (dev)' : ''}
               {data?.quotesAsOf
-                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : data.tradingMode === 'live' ? ' · Wealth' : ' · Pulse'}`
+                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : data.tradingMode === 'live' ? ` · ${data.brokerName || 'Broker'}` : ' · Pulse'}`
                 : ''}
             </p>
           ) : null}

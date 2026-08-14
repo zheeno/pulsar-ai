@@ -28,7 +28,7 @@ Rules:
 - BUY when momentum/context supports it and RSI is not cited as overbought (>70) if known
 - Do not contradict recent symbolMemory rationale without new evidence
 - Respect cashBalance/brokerageBalance and estimatedFeePct — do not imply unaffordable buys
-- tradingVenue is sandbox|wealth; Wealth brokerageBalance is spendable cash
+- tradingVenue is sandbox or a live broker id; when live, brokerageBalance is spendable cash
 - No external company knowledge beyond this prompt
 
 Confidence: <0.5 omit; 0.5-0.75 moderate; >0.75 strong

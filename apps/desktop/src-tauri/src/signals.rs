@@ -21,7 +21,7 @@ pub struct HeldLot {
 }
 
 impl HeldLot {
-    pub fn from_wealth_holdings(holdings: &[crate::wealth::WealthHolding]) -> Vec<Self> {
+    pub fn from_holdings(holdings: &[crate::broker::BrokerHolding]) -> Vec<Self> {
         holdings
             .iter()
             .filter(|h| h.quantity > 0.0)
@@ -62,7 +62,7 @@ impl SignalGenerationService {
             return Ok(None);
         };
 
-        let lots = if venue == "wealth" {
+        let lots = if venue != "sandbox" {
             live_holdings_owned.clone().unwrap_or_default()
         } else {
             Self::sandbox_lots(conn, pid.as_deref())?
@@ -210,7 +210,7 @@ impl SignalGenerationService {
             "maxActions": llm_cap,
             "symbolMemory": symbol_memory,
             "cashBalance": cash,
-            "brokerageBalance": if venue == "wealth" { Some(cash) } else { None::<f64> },
+            "brokerageBalance": if venue != "sandbox" { Some(cash) } else { None::<f64> },
             "tradingVenue": venue,
             "estimatedFeePct": settings_fee,
         });
@@ -741,7 +741,7 @@ pub async fn run_cycle(
     cache: &crate::cache::PriceCache,
     client: &crate::ngx::NgxPulseClient,
     calendar: &crate::calendar::TradingCalendar,
-    wealth: Option<&crate::wealth::WealthClient>,
+    broker: Option<&crate::broker::BrokerSession>,
     execute: bool,
     allow_bulk_liquidation: bool,
     cycle_id: Option<&str>,
@@ -759,41 +759,42 @@ pub async fn run_cycle(
     if let Err(e) = crate::ingest::IngestionService::ingest_market(db, client, calendar, true).await {
         warnings.push(format!("Pulse market ingest failed: {e}"));
     }
-    let trading_mode = if let Some(w) = wealth {
-        w.resolve_trading_mode(settings).await
+    let trading_mode = if let Some(session) = broker {
+        session.resolve_trading_mode(settings).await
     } else {
         crate::wealth::TradingMode::Sandbox
     };
 
-    let mut wealth_snap: Option<crate::wealth::WealthPortfolioSnapshot> = None;
+    let mut live_snap: Option<crate::wealth::WealthPortfolioSnapshot> = None;
     let (cash_for_agent, trading_venue, live_holdings) =
         if trading_mode == crate::wealth::TradingMode::Live {
-            if let Some(w) = wealth {
+            if let Some(session) = broker {
                 if execute {
-                    let _ = crate::execution::ExecutionService::reconcile_if_possible(db, w).await;
+                    let _ = crate::execution::ExecutionService::reconcile_if_possible(db, session).await;
                 }
-                let book = match crate::wealth::WealthSyncService::refresh(db, w).await {
+                let book = match session.refresh_book(db).await {
                     Ok(b) => Some(b),
                     Err(e) => {
-                        warnings.push(format!("Could not refresh Wealth holdings: {e}"));
-                        crate::wealth::WealthSyncService::load(db).ok().flatten()
+                        warnings.push(format!("Could not refresh {} holdings: {e}", session.display_name()));
+                        session.load_book(db).ok().flatten()
                     }
                 };
                 let cash = book.as_ref().map(|b| b.brokerage_balance);
                 let holdings = book
                     .as_ref()
-                    .map(|b| HeldLot::from_wealth_holdings(&b.holdings))
+                    .map(|b| HeldLot::from_holdings(&b.holdings))
                     .unwrap_or_default();
-                wealth_snap = book.map(|b| crate::wealth::WealthPortfolioSnapshot {
+                let venue = session.id().as_str();
+                live_snap = book.map(|b| crate::wealth::WealthPortfolioSnapshot {
                     balance: b.brokerage_balance,
                     profit: b.profit,
                     stock_value: b.stock_value,
                     holdings: b.holdings,
                     stocks_present: true,
                 });
-                (cash, "wealth", holdings)
+                (cash, venue, holdings)
             } else {
-                (None, "wealth", Vec::new())
+                (None, "sandbox", Vec::new())
             }
         } else {
             (None, "sandbox", Vec::new())
@@ -806,7 +807,7 @@ pub async fn run_cycle(
         None,
         cash_for_agent,
         trading_venue,
-        if trading_venue == "wealth" {
+        if trading_venue != "sandbox" {
             Some(live_holdings.as_slice())
         } else {
             None
@@ -823,11 +824,11 @@ pub async fn run_cycle(
     }
 
     let live_market_open = if trading_mode == crate::wealth::TradingMode::Live {
-        match wealth {
-            Some(w) => match w.market_is_open().await {
+        match broker {
+            Some(session) => match session.market_is_open().await {
                 Ok(open) => open,
                 Err(e) => {
-                    warnings.push(format!("Could not check Wealth market status: {e}"));
+                    warnings.push(format!("Could not check {} market status: {e}", session.display_name()));
                     false
                 }
             },
@@ -847,7 +848,7 @@ pub async fn run_cycle(
         cache,
         settings,
         &signal_ids,
-        wealth,
+        broker,
         trading_mode,
         live_market_open,
         do_execute,
@@ -860,28 +861,24 @@ pub async fn run_cycle(
     if trading_mode == crate::wealth::TradingMode::Sandbox {
         db.with_conn(|conn| crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None))?;
     } else if execute {
-        if let Some(w) = wealth {
-            if let Ok(book) = crate::wealth::WealthSyncService::refresh(db, w).await {
+        if let Some(session) = broker {
+            if let Ok(book) = session.refresh_book(db).await {
                 let _ = db.with_conn(|conn| {
                     crate::portfolio::EquityCurveService::insert_point(
                         conn,
-                        "wealth",
+                        session.id().as_str(),
                         book.brokerage_balance + book.market_value(),
                         book.brokerage_balance,
                         book.market_value(),
                     )
                 });
-            } else if let Some(snap) = wealth_snap {
+            } else if let Some(snap) = live_snap {
                 let cash = snap.balance;
-                let market_value = if snap.stock_value > 0.0 {
-                    snap.stock_value
-                } else {
-                    snap.holdings.iter().map(|h| h.current_value).sum()
-                };
+                let market_value = snap.holdings.iter().map(|h| h.current_value).sum();
                 let _ = db.with_conn(|conn| {
                     crate::portfolio::EquityCurveService::insert_point(
                         conn,
-                        "wealth",
+                        session.id().as_str(),
                         cash + market_value,
                         cash,
                         market_value,

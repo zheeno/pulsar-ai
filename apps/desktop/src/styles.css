@@ -274,6 +274,77 @@ button,
   font-weight: 600;
 }
 
+.broker-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  max-width: 440px;
+}
+
+.broker-card {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 14px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(15, 23, 42, 0.45);
+  color: var(--text);
+  text-align: center;
+  transition: border-color var(--transition), background var(--transition), box-shadow var(--transition);
+}
+
+.broker-card:hover:not(:disabled) {
+  border-color: rgba(148, 163, 184, 0.45);
+  background: rgba(30, 41, 59, 0.7);
+}
+
+.broker-card.is-selected {
+  border-color: rgba(34, 197, 94, 0.5);
+  background: var(--status-ok-soft);
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.18);
+}
+
+.broker-card:disabled {
+  opacity: 0.72;
+}
+
+.broker-card__logo {
+  width: 64px;
+  height: 64px;
+  object-fit: contain;
+  border-radius: 14px;
+  background: #fff;
+  padding: 6px;
+}
+
+.broker-card__logo--fallback {
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.broker-card__name {
+  font-weight: 600;
+  font-size: 0.92rem;
+  line-height: 1.25;
+}
+
+.broker-card__meta {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.broker-card.is-selected .broker-card__meta {
+  color: #bbf7d0;
+}
+
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1481,6 +1552,11 @@ select.input {
 
   .param-slider-grid {
     grid-template-columns: 1fr;
+  }
+
+  .broker-grid {
+    grid-template-columns: 1fr;
+    max-width: none;
   }
 }
 

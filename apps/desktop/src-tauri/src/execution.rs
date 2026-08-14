@@ -7,8 +7,9 @@ use crate::cache::PriceCache;
 use crate::db::Database;
 use crate::intents;
 use crate::ngx::is_valid_ticker;
+use crate::broker::BrokerSession;
 use crate::settings::AppSettings;
-use crate::wealth::{insert_broker_order, TradingMode, WealthClient};
+use crate::wealth::{insert_broker_order, TradingMode};
 
 pub const MAX_QUOTE_DEVIATION: f64 = 0.05;
 pub const MAX_LIQUIDATION_PCT: f64 = 0.25;
@@ -166,7 +167,7 @@ impl ExecutionService {
         cache: &PriceCache,
         settings: &AppSettings,
         signal_ids: &[String],
-        wealth: Option<&WealthClient>,
+        broker: Option<&BrokerSession>,
         trading_mode: TradingMode,
         live_market_open: bool,
         execute: bool,
@@ -183,7 +184,7 @@ impl ExecutionService {
 
         if trading_mode == TradingMode::Live && !live_market_open {
             warnings.push(
-                "Live trader mode: Wealth market is closed — skipping live fills (no sandbox fallback)."
+                "Live trader mode: brokerage market is closed — skipping live fills (no sandbox fallback)."
                     .into(),
             );
             return Ok((0, warnings));
@@ -203,7 +204,7 @@ impl ExecutionService {
                 cache,
                 settings,
                 signal_id,
-                wealth,
+                broker,
                 trading_mode,
                 allow_bulk_liquidation,
                 cycle_id,
@@ -224,7 +225,7 @@ impl ExecutionService {
         cache: &PriceCache,
         settings: &AppSettings,
         signal_id: &str,
-        wealth: Option<&WealthClient>,
+        broker: Option<&BrokerSession>,
         trading_mode: TradingMode,
         allow_bulk_liquidation: bool,
         cycle_id: Option<&str>,
@@ -270,10 +271,10 @@ impl ExecutionService {
         let fee_pct = settings.simulated_fee_pct.max(0.0);
 
         if trading_mode == TradingMode::Live {
-            let client = wealth.ok_or_else(|| anyhow::anyhow!("Wealth client required for live mode"))?;
-            let (stock_id, broker_quote) = client.resolve_stock_id(&symbol).await?;
+            let client = broker.ok_or_else(|| anyhow::anyhow!("Live broker session required"))?;
+            let (stock_id, broker_quote) = client.resolve_instrument(&symbol).await?;
             if broker_quote <= 0.0 {
-                return Err(anyhow::anyhow!("No Wealth price for {symbol}"));
+                return Err(anyhow::anyhow!("No broker price for {symbol}"));
             }
             let wallet = client.get_wallet().await?;
             let snap = client.get_portfolio().await?;
@@ -325,7 +326,7 @@ impl ExecutionService {
                 }
                 let spendable = (wallet.brokerage_balance - pending_buy).max(0.0);
                 let daily_trades = intents::pending_action_count(conn)?;
-                let daily_drawdown = live_drawdown_pct(conn, current_equity)?;
+                let daily_drawdown = live_drawdown_pct(conn, client.id().as_str(), current_equity)?;
                 let (result, mut quantity) = RiskPolicyService::evaluate(
                     &input,
                     &param_set,
@@ -445,7 +446,7 @@ impl ExecutionService {
             }
             if order.status == "rejected" {
                 return Err(anyhow::anyhow!(
-                    "Wealth order rejected: {}",
+                    "Broker order rejected: {}",
                     order
                         .rejection_reason
                         .unwrap_or_else(|| "unknown reason".into())
@@ -661,11 +662,11 @@ impl ExecutionService {
         Ok(prices)
     }
 
-    pub async fn reconcile_if_possible(db: &Database, client: &WealthClient) -> Result<()> {
+    pub async fn reconcile_if_possible(db: &Database, session: &BrokerSession) -> Result<()> {
         let open = db.with_conn(crate::intents::load_open_intents)?;
         for intent in open {
             if let Some(eid) = intent.external_order_id {
-                match client.get_order(eid).await {
+                match session.get_order(eid).await {
                     Ok(order) => {
                         let state = if order.status == "executed" {
                             "filled"
@@ -709,21 +710,21 @@ pub fn quote_within_deviation(reference: f64, broker: f64) -> bool {
     ((broker - reference) / reference).abs() <= MAX_QUOTE_DEVIATION
 }
 
-pub fn live_drawdown_pct(conn: &Connection, current_equity: f64) -> Result<f64> {
+pub fn live_drawdown_pct(conn: &Connection, venue: &str, current_equity: f64) -> Result<f64> {
     if current_equity <= 0.0 || !current_equity.is_finite() {
-        anyhow::bail!("Live drawdown breaker: current Wealth equity is unavailable");
+        anyhow::bail!("Live drawdown breaker: current brokerage equity is unavailable");
     }
     let prior: Option<f64> = conn
         .query_row(
             "SELECT total_equity FROM equity_curve_points
-             WHERE venue = 'wealth' AND date(recorded_at) < date('now')
+             WHERE venue = ?1 AND date(recorded_at) < date('now')
              ORDER BY recorded_at DESC LIMIT 1",
-            [],
+            [venue],
             |row| row.get(0),
         )
         .optional()?;
     let Some(prior) = prior.filter(|p| *p > 0.0 && p.is_finite()) else {
-        anyhow::bail!("Live drawdown breaker: prior Wealth equity is unavailable");
+        anyhow::bail!("Live drawdown breaker: prior brokerage equity is unavailable");
     };
     Ok(((prior - current_equity) / prior).max(0.0))
 }

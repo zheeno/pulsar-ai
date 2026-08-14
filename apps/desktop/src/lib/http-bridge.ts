@@ -50,6 +50,7 @@ function defaultSettings(): Settings {
     simulatedFeePct: 0.0015,
     autoCycleEnabled: false,
     autoCycleIntervalMinutes: 30,
+    selectedBroker: 'wealth',
     wealthEmail: undefined,
     wealthConnected: false,
     liveTradingEnabled: false,
@@ -122,6 +123,22 @@ function loadSettings(): Settings {
 
 function saveSettingsLocal(settings: Settings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+}
+
+function selectedBrokerId(): string {
+  return String(loadSettings().selectedBroker || 'wealth');
+}
+
+function mockLiveConnected(): boolean {
+  return selectedBrokerId() === 'wealth' && Boolean(loadSettings().wealthConnected);
+}
+
+function mockBrokerMeta() {
+  const id = selectedBrokerId();
+  return {
+    brokerId: id,
+    brokerName: id === 'bamboo' ? 'Bamboo' : 'Wealth',
+  };
 }
 
 function loadSecrets(): Record<string, string> {
@@ -239,8 +256,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
 
     case 'portfolio_default': {
       const store = loadStore();
-      const settings = loadSettings();
-      const live = Boolean(settings.wealthConnected);
+      const live = mockLiveConnected();
       const market_value = store.positions.reduce((s, p) => s + p.market_value, 0);
       return {
         portfolio: store.portfolio,
@@ -249,6 +265,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         market_value,
         pnl_today: store.performance.at(-1)?.pnl_daily ?? 0,
         tradingMode: live ? 'live' : 'sandbox',
+        ...mockBrokerMeta(),
       } as T;
     }
 
@@ -274,7 +291,8 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         quotesAsOf: new Date().toISOString(),
         quotedSymbols: positions.map((p) => p.symbol),
         stale: false,
-        tradingMode: Boolean(loadSettings().wealthConnected) ? 'live' : 'sandbox',
+        tradingMode: mockLiveConnected() ? 'live' : 'sandbox',
+        ...mockBrokerMeta(),
         portfolio: { id: store.portfolio.id, cash_balance: store.portfolio.cash_balance },
       } as T;
     }
@@ -493,6 +511,9 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       return { ok: true } as T;
 
     case 'wealth_login': {
+      if (selectedBrokerId() !== 'wealth') {
+        throw new Error('Select Coronation Wealth as the live broker before connecting.');
+      }
       const email = String(args?.email || '');
       const password = String(args?.password || '');
       if (!email || !password) {
@@ -531,6 +552,9 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
     }
 
     case 'wealth_verify_2fa': {
+      if (selectedBrokerId() !== 'wealth') {
+        throw new Error('Select Coronation Wealth as the live broker before connecting.');
+      }
       const email = String(args?.email || '');
       const s = loadSettings();
       s.wealthEmail = email;
@@ -555,7 +579,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         email: s.wealthEmail ?? null,
         tradingProfile: connected ? 'verified' : null,
         tradingVerified: connected,
-        tradingMode: connected ? 'live' : 'sandbox',
+        tradingMode: mockLiveConnected() ? 'live' : 'sandbox',
         brokerageBalance: connected ? 250_000 : null,
         availableBalance: connected ? 200_000 : null,
         currentBalance: connected ? 250_000 : null,
@@ -573,6 +597,27 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       delete s.wealthEmail;
       saveSettingsLocal(s);
       return undefined as T;
+    }
+
+    case 'broker_list': {
+      const s = loadSettings();
+      return [
+        {
+          id: 'wealth',
+          name: 'Coronation Wealth',
+          available: true,
+          connected: Boolean(s.wealthConnected),
+        },
+        { id: 'bamboo', name: 'Bamboo', available: false, connected: false },
+      ] as T;
+    }
+
+    case 'set_selected_broker': {
+      const brokerId = String(args?.brokerId || 'wealth') === 'bamboo' ? 'bamboo' : 'wealth';
+      const s = loadSettings();
+      s.selectedBroker = brokerId;
+      saveSettingsLocal(s);
+      return s as T;
     }
 
     default:

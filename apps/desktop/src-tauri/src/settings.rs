@@ -22,6 +22,9 @@ pub struct AppSettings {
     pub auto_cycle_enabled: bool,
     /// Minutes between automatic cycles (clamped to 5–120 when saved).
     pub auto_cycle_interval_minutes: u32,
+    /// Live broker used for Home and order routing (`wealth` | `bamboo`).
+    #[serde(default = "default_selected_broker")]
+    pub selected_broker: String,
     /// Coronation Wealth email when connected.
     pub wealth_email: Option<String>,
     /// True when a Wealth session has been established.
@@ -56,6 +59,7 @@ impl Default for AppSettings {
             simulated_fee_pct: 0.0015,
             auto_cycle_enabled: false,
             auto_cycle_interval_minutes: 30,
+            selected_broker: "wealth".into(),
             wealth_email: None,
             wealth_connected: false,
             live_trading_enabled: false,
@@ -99,6 +103,7 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
                 settings.auto_cycle_interval_minutes =
                     value.parse::<u32>().unwrap_or(30).clamp(5, 120)
             }
+            "selected_broker" => settings.selected_broker = value,
             "wealth_email" => settings.wealth_email = Some(value),
             "wealth_connected" => settings.wealth_connected = value == "true",
             "live_trading_enabled" => settings.live_trading_enabled = value == "true",
@@ -189,6 +194,7 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
     )?;
     let interval = settings.auto_cycle_interval_minutes.clamp(5, 120);
     set_setting(conn, "auto_cycle_interval_minutes", &interval.to_string())?;
+    set_setting(conn, "selected_broker", &settings.selected_broker)?;
     if let Some(v) = &settings.wealth_email {
         set_setting(conn, "wealth_email", v)?;
     }
@@ -231,6 +237,10 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+fn default_selected_broker() -> String {
+    "wealth".into()
 }
 
 fn finite_in_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
@@ -289,6 +299,10 @@ pub fn mark_wealth_connected(conn: &Connection, email: &str) -> Result<()> {
     set_setting(conn, "wealth_email", email)?;
     set_setting(conn, "wealth_connected", "true")?;
     Ok(())
+}
+
+pub fn set_selected_broker(conn: &Connection, broker_id: &str) -> Result<()> {
+    set_setting(conn, "selected_broker", broker_id)
 }
 
 /// Mark setup complete after Pulse session + LLM verification succeed.

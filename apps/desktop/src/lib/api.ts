@@ -13,7 +13,7 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     return { payload: args };
   }
 
-  if (command === 'wealth_login' || command === 'wealth_verify_2fa') {
+  if (command === 'set_selected_broker' || command === 'wealth_login' || command === 'wealth_verify_2fa') {
     return { payload: args };
   }
 
@@ -62,6 +62,7 @@ export interface AppSettings {
   simulatedFeePct: number;
   autoCycleEnabled: boolean;
   autoCycleIntervalMinutes: number;
+  selectedBroker?: string;
   wealthEmail?: string | null;
   wealthConnected?: boolean;
   liveTradingEnabled?: boolean;
@@ -81,6 +82,8 @@ export interface PortfolioData {
   quotesAsOf?: string | null;
   stale?: boolean;
   tradingMode?: 'sandbox' | 'live' | string;
+  brokerId?: string | null;
+  brokerName?: string | null;
   tradingVerified?: boolean;
   wealthStatus?: {
     connected?: boolean;
