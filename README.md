@@ -39,3 +39,9 @@ npm run desktop:dev
 Copy `.env.example` for optional agent/dev overrides. In the desktop app, NGX Pulse and LLM credentials are entered in Settings and stored in the OS keychain (not `.env`).
 
 See [apps/desktop/README.md](apps/desktop/README.md).
+
+## Security notes
+
+- NGX Pulse Supabase **anon** keys are public client credentials. Never put a Supabase **service-role** key in `.env`, `tauri.conf.json`, or compiled config.
+- Browser mock mode (`npm run desktop:ui`) does not persist credentials.
+- Release signing, SBOM, and updater verification: [docs/release-security.md](docs/release-security.md).

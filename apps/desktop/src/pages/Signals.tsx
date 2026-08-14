@@ -15,6 +15,20 @@ interface Signal {
   risk_policy_result: string;
 }
 
+function formatGeneratedAt(raw?: string | null): string {
+  if (!raw) return '—';
+  const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T') + (raw.endsWith('Z') ? '' : 'Z');
+  const d = new Date(normalized);
+  if (Number.isNaN(d.getTime())) return raw;
+  return d.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
 export default function SignalsPage() {
   const toast = useToast();
   const [signals, setSignals] = useState<Signal[]>([]);
@@ -39,9 +53,10 @@ export default function SignalsPage() {
   async function generate() {
     setLoading(true);
     try {
-      await api('generate_signals');
+      const result = await api<{ count: number; universeSize?: number }>('generate_signals');
       await loadSignals();
-      toast.success('Fresh signals are ready.', 'Signals generated');
+      const size = result.universeSize != null ? ` Universe ${result.universeSize}.` : '';
+      toast.success(`Fresh signals are ready.${size}`, 'Signals generated');
     } catch (e) {
       toast.error(String(e), 'Generate failed');
     } finally {
@@ -82,6 +97,7 @@ export default function SignalsPage() {
           <table className="data-table">
             <thead>
               <tr>
+                <th>Generated</th>
                 <th>Symbol</th>
                 <th>Action</th>
                 <th>Confidence</th>
@@ -93,6 +109,9 @@ export default function SignalsPage() {
             <tbody>
               {signals.map((s) => (
                 <tr key={s.id}>
+                  <td className="muted mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                    {formatGeneratedAt(s.generated_at)}
+                  </td>
                   <td className="mono">{s.symbol}</td>
                   <td className={s.action === 'BUY' ? 'text-ok' : s.action === 'SELL' ? 'text-bad' : 'muted'}>
                     {s.action}

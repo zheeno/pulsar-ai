@@ -4,13 +4,14 @@ use rusqlite::Connection;
 
 use crate::cache::{CachedPrice, PriceCache};
 use crate::calendar::TradingCalendar;
-use crate::ngx::{NgxPulseClient, NgxStock};
+use crate::db::Database;
+use crate::ngx::{LatestQuote, NgxPulseClient, NgxStock};
 
 pub struct IngestionService;
 
 impl IngestionService {
     pub async fn ingest_stocks(
-        conn: &Connection,
+        db: &Database,
         client: &NgxPulseClient,
         cache: &PriceCache,
         calendar: &TradingCalendar,
@@ -23,21 +24,21 @@ impl IngestionService {
         {
             return Ok(0);
         }
-        let stocks = match client.get_stocks(conn).await {
-            Ok(s) => s,
-            Err(_) => return Ok(0),
-        };
+        let stocks = client.get_stocks().await?;
         let trade_date = calendar.today_wat();
-        let mut count = 0;
-        for stock in stocks {
-            Self::upsert_stock(conn, cache, &stock, &trade_date)?;
-            count += 1;
-        }
-        Ok(count)
+        db.with_conn(|conn| {
+            let mut count = 0;
+            for stock in &stocks {
+                Self::upsert_stock(conn, cache, stock, &trade_date)?;
+                count += 1;
+            }
+            tracing::info!(target: "ngx_pulse", count, "upserted pulse stocks");
+            Ok(count)
+        })
     }
 
     pub async fn ingest_market(
-        conn: &Connection,
+        db: &Database,
         client: &NgxPulseClient,
         calendar: &TradingCalendar,
         force: bool,
@@ -45,20 +46,22 @@ impl IngestionService {
         if !force && crate::runtime_util::enforce_market_hours() && !calendar.is_trading_day(None) {
             return Ok(());
         }
-        let market = match client.get_market(conn).await {
+        let market = match client.get_market().await {
             Ok(m) => m,
             Err(_) => return Ok(()),
         };
         let trade_date = calendar.today_wat();
-        if let Some(asi) = market.asi {
-            conn.execute(
-                "INSERT INTO index_history (index_code, trade_date, value, points)
-                 VALUES ('ASI', ?1, ?2, ?3)
-                 ON CONFLICT(index_code, trade_date) DO UPDATE SET value = excluded.value",
-                rusqlite::params![trade_date, asi.value, asi.change_percent.unwrap_or(0.0)],
-            )?;
-        }
-        Ok(())
+        db.with_conn(|conn| {
+            if let Some(asi) = market.asi {
+                conn.execute(
+                    "INSERT INTO index_history (index_code, trade_date, value, points)
+                     VALUES ('ASI', ?1, ?2, ?3)
+                     ON CONFLICT(index_code, trade_date) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![trade_date, asi.value, asi.change_percent.unwrap_or(0.0)],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub async fn ingest_indices(
@@ -70,7 +73,7 @@ impl IngestionService {
         if !force && !calendar.is_trading_day(None) {
             return Ok(());
         }
-        let indices = match client.get_indices(conn).await {
+        let indices = match client.get_indices().await {
             Ok(i) => i,
             Err(_) => return Ok(()),
         };
@@ -120,7 +123,7 @@ impl IngestionService {
         let from = (Utc::now() - chrono::Duration::days(365)).format("%Y-%m-%d").to_string();
 
         for symbol in symbols {
-            let history = match client.get_symbol_price(conn, &symbol, Some(&from), Some(&to)).await {
+            let history = match client.get_symbol_price(&symbol, Some(&from), Some(&to)).await {
                 Ok(h) => h,
                 Err(_) => continue,
             };
@@ -175,6 +178,35 @@ impl IngestionService {
             symbol: stock.symbol.clone(),
             price: stock.price,
             trade_date: trade_date.into(),
+            updated_at: Utc::now().to_rfc3339(),
+        });
+        Ok(())
+    }
+
+    pub fn upsert_last_quote(conn: &Connection, cache: &PriceCache, quote: &LatestQuote) -> Result<()> {
+        conn.execute(
+            "INSERT INTO instruments (symbol, name, sector, is_active)
+             VALUES (?1, ?1, 'Unknown', 1)
+             ON CONFLICT(symbol) DO NOTHING",
+            [&quote.symbol],
+        )?;
+        let change_pct = quote.prev_close.filter(|p| *p > 0.0).map(|p| (quote.last - p) / p * 100.0);
+        conn.execute(
+            "INSERT INTO price_history (symbol, trade_date, price, change_percent, ingested_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(symbol, trade_date) DO UPDATE SET
+               price = excluded.price, change_percent = excluded.change_percent, ingested_at = datetime('now')",
+            rusqlite::params![
+                quote.symbol,
+                quote.trade_date,
+                quote.last,
+                change_pct.unwrap_or(0.0)
+            ],
+        )?;
+        cache.set_price(&CachedPrice {
+            symbol: quote.symbol.clone(),
+            price: quote.last,
+            trade_date: quote.trade_date.clone(),
             updated_at: Utc::now().to_rfc3339(),
         });
         Ok(())

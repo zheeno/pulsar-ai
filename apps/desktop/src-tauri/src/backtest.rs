@@ -91,6 +91,7 @@ impl BacktestService {
         let mut positions: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new();
         let mut equity_curve = vec![];
         let mut trades = 0i64;
+        let mut buy_trades = 0i64;
         let mut wins = 0i64;
         let fill_sim = FillSimulator::from_settings(settings);
 
@@ -160,7 +161,7 @@ impl BacktestService {
                     cash,
                     &pos_list,
                     &prices,
-                    trades,
+                    buy_trades,
                     0.0,
                     fill_sim.fee_pct,
                 );
@@ -183,6 +184,7 @@ impl BacktestService {
                     entry.1 = (entry.1 * entry.0 + fill_price * quantity) / new_qty;
                     entry.0 = new_qty;
                     trades += 1;
+                    buy_trades += 1;
                 } else {
                     let entry = positions.get_mut(symbol).context("no position")?;
                     if entry.0 <= 0.0 {

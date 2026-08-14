@@ -54,21 +54,18 @@ impl PortfolioService {
         }
 
         let total_equity = p.3 + market_value;
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let pnl_today: f64 = conn
-            .query_row(
-                "SELECT pnl_daily FROM equity_curve_points WHERE venue = 'sandbox' AND snapshot_date = ?1",
-                [&today],
-                |row| row.get(0),
-            )
-            .or_else(|_| {
+        let pnl_today = match EquityCurveService::pnl_today(conn, "sandbox")? {
+            Some(v) => v,
+            None => {
+                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 conn.query_row(
                     "SELECT pnl_daily FROM daily_performance_snapshot WHERE portfolio_id = ?1 AND snapshot_date = ?2",
                     rusqlite::params![id, today],
                     |row| row.get(0),
                 )
-            })
-            .unwrap_or(0.0);
+                .unwrap_or(0.0)
+            }
+        };
 
         Ok(Some(PortfolioSummary {
             portfolio: serde_json::json!({
@@ -132,49 +129,83 @@ use rusqlite::OptionalExtension;
 pub struct EquityCurveService;
 
 impl EquityCurveService {
-    pub fn upsert_point(
+    pub fn insert_point(
         conn: &Connection,
         venue: &str,
         total_equity: f64,
         cash_balance: f64,
         market_value: f64,
     ) -> Result<()> {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let prev_equity: f64 = conn
+        let now = chrono::Utc::now();
+        let recorded_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let snapshot_date = now.format("%Y-%m-%d").to_string();
+        let prev_close: f64 = conn
             .query_row(
                 "SELECT total_equity FROM equity_curve_points
                  WHERE venue = ?1 AND snapshot_date < ?2
-                 ORDER BY snapshot_date DESC LIMIT 1",
-                rusqlite::params![venue, today],
+                 ORDER BY recorded_at DESC LIMIT 1",
+                rusqlite::params![venue, snapshot_date],
                 |row| row.get(0),
             )
             .unwrap_or(total_equity);
-        let pnl_daily = total_equity - prev_equity;
+        let pnl_daily = total_equity - prev_close;
         conn.execute(
-            "INSERT INTO equity_curve_points (venue, snapshot_date, total_equity, cash_balance, market_value, pnl_daily)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(venue, snapshot_date) DO UPDATE SET
-               total_equity = excluded.total_equity,
-               cash_balance = excluded.cash_balance,
-               market_value = excluded.market_value,
-               pnl_daily = excluded.pnl_daily",
-            rusqlite::params![venue, today, total_equity, cash_balance, market_value, pnl_daily],
+            "INSERT INTO equity_curve_points
+               (venue, recorded_at, snapshot_date, total_equity, cash_balance, market_value, pnl_daily)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                venue,
+                recorded_at,
+                snapshot_date,
+                total_equity,
+                cash_balance,
+                market_value,
+                pnl_daily
+            ],
         )?;
         Ok(())
     }
 
+    /// Last point today minus last point before today (prior close). `None` if no points today.
+    pub fn pnl_today(conn: &Connection, venue: &str) -> Result<Option<f64>> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let last: Option<f64> = conn
+            .query_row(
+                "SELECT total_equity FROM equity_curve_points
+                 WHERE venue = ?1 AND snapshot_date = ?2
+                 ORDER BY recorded_at DESC LIMIT 1",
+                rusqlite::params![venue, today],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(last) = last else {
+            return Ok(None);
+        };
+        let prev: f64 = conn
+            .query_row(
+                "SELECT total_equity FROM equity_curve_points
+                 WHERE venue = ?1 AND snapshot_date < ?2
+                 ORDER BY recorded_at DESC LIMIT 1",
+                rusqlite::params![venue, today],
+                |row| row.get(0),
+            )
+            .unwrap_or(last);
+        Ok(Some(last - prev))
+    }
+
     pub fn get_curve(conn: &Connection, venue: &str) -> Result<Vec<serde_json::Value>> {
         let mut stmt = conn.prepare(
-            "SELECT snapshot_date, total_equity, cash_balance, market_value, pnl_daily
-             FROM equity_curve_points WHERE venue = ?1 ORDER BY snapshot_date",
+            "SELECT recorded_at, snapshot_date, total_equity, cash_balance, market_value, pnl_daily
+             FROM equity_curve_points WHERE venue = ?1 ORDER BY recorded_at",
         )?;
         let rows = stmt.query_map([venue], |row| {
             Ok(serde_json::json!({
-                "snapshot_date": row.get::<_, String>(0)?,
-                "total_equity": row.get::<_, f64>(1)?,
-                "cash_balance": row.get::<_, f64>(2)?,
-                "market_value": row.get::<_, f64>(3)?,
-                "pnl_daily": row.get::<_, f64>(4)?,
+                "recorded_at": row.get::<_, String>(0)?,
+                "snapshot_date": row.get::<_, String>(1)?,
+                "total_equity": row.get::<_, f64>(2)?,
+                "cash_balance": row.get::<_, f64>(3)?,
+                "market_value": row.get::<_, f64>(4)?,
+                "pnl_daily": row.get::<_, f64>(5)?,
             }))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -279,7 +310,7 @@ impl DailySnapshotService {
             ],
         )?;
 
-        EquityCurveService::upsert_point(conn, "sandbox", total_equity, cash_balance, market_value)?;
+        EquityCurveService::insert_point(conn, "sandbox", total_equity, cash_balance, market_value)?;
         Ok(())
     }
 }

@@ -13,8 +13,15 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     return { payload: args };
   }
 
-  if (command === 'wealth_login' || command === 'wealth_verify_2fa') {
+  if (command === 'set_selected_broker' || command === 'wealth_login' || command === 'wealth_verify_2fa' || command === 'bamboo_login') {
     return { payload: args };
+  }
+
+  if (command === 'cycle_run') {
+    return {
+      confirmation_token: args.confirmationToken,
+      allow_bulk_liquidation: args.allowBulkLiquidation,
+    };
   }
 
   if (command === 'start_backtest') {
@@ -55,8 +62,16 @@ export interface AppSettings {
   simulatedFeePct: number;
   autoCycleEnabled: boolean;
   autoCycleIntervalMinutes: number;
+  selectedBroker?: string;
   wealthEmail?: string | null;
   wealthConnected?: boolean;
+  bambooPhone?: string | null;
+  bambooConnected?: boolean;
+  liveTradingEnabled?: boolean;
+  scheduledLiveAuthorized?: boolean;
+  maxLiveNotional?: number;
+  maxLiveActions?: number;
+  retainRawLlmLogs?: boolean;
 }
 
 export interface PortfolioData {
@@ -65,7 +80,12 @@ export interface PortfolioData {
   total_equity: number;
   market_value: number;
   pnl_today: number;
+  unrealized_pnl?: number;
+  quotesAsOf?: string | null;
+  stale?: boolean;
   tradingMode?: 'sandbox' | 'live' | string;
+  brokerId?: string | null;
+  brokerName?: string | null;
   tradingVerified?: boolean;
   wealthStatus?: {
     connected?: boolean;

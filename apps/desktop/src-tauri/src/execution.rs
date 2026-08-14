@@ -1,11 +1,21 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::cache::PriceCache;
+use crate::db::Database;
+use crate::intents;
+use crate::ngx::is_valid_ticker;
+use crate::broker::{insert_broker_order, BrokerSession};
 use crate::settings::AppSettings;
-use crate::wealth::{insert_broker_order, TradingMode, WealthClient};
+use crate::wealth::TradingMode;
+
+pub const MAX_QUOTE_DEVIATION: f64 = 0.05;
+pub const MAX_LIQUIDATION_PCT: f64 = 0.25;
+pub const MAX_SIGNAL_TOTAL: usize = 40;
+pub const MAX_SIGNAL_BUYS: usize = 15;
+pub const MAX_SIGNAL_SELLS: usize = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSet {
@@ -81,8 +91,10 @@ impl RiskPolicyService {
 
         if signal.action == "SELL" {
             if let Some((_, qty, _)) = position {
-                if *qty > 0.0 {
-                    return ("APPROVED".into(), *qty);
+                let pending_sell = 0.0; // applied by caller via reduced qty
+                let available = (*qty - pending_sell).max(0.0);
+                if available > 0.0 {
+                    return ("APPROVED".into(), available);
                 }
             }
             return ("BLOCKED_OTHER".into(), 0.0);
@@ -151,33 +163,52 @@ pub struct ExecutionService;
 
 impl ExecutionService {
     pub async fn process_signals(
-        conn: &Connection,
+        db: &Database,
         cache: &PriceCache,
         settings: &AppSettings,
         signal_ids: &[String],
-        wealth: Option<&WealthClient>,
+        broker: Option<&BrokerSession>,
         trading_mode: TradingMode,
         live_market_open: bool,
+        execute: bool,
+        allow_bulk_liquidation: bool,
+        cycle_id: Option<&str>,
     ) -> Result<(i64, Vec<String>)> {
         let mut executed = 0;
         let mut warnings = Vec::new();
+        let mut cycle_sell_notional = 0.0;
+
+        if !execute {
+            return Ok((0, warnings));
+        }
 
         if trading_mode == TradingMode::Live && !live_market_open {
             warnings.push(
-                "Live trader mode: Wealth market is closed — skipping live fills (no sandbox fallback)."
+                "Live trader mode: brokerage market is closed — skipping live fills (no sandbox fallback)."
                     .into(),
             );
             return Ok((0, warnings));
         }
 
-        for signal_id in signal_ids {
+        let ambiguous = db.with_conn(intents::ambiguous_pending).unwrap_or(true);
+        if trading_mode == TradingMode::Live && ambiguous {
+            return Ok((
+                0,
+                vec!["Live orders are in an ambiguous state — reconcile before placing new orders.".into()],
+            ));
+        }
+
+        for signal_id in signal_ids.iter().take(settings.max_live_actions.max(1) as usize) {
             match Self::process_signal(
-                conn,
+                db,
                 cache,
                 settings,
                 signal_id,
-                wealth,
+                broker,
                 trading_mode,
+                allow_bulk_liquidation,
+                cycle_id,
+                &mut cycle_sell_notional,
             )
             .await
             {
@@ -190,88 +221,46 @@ impl ExecutionService {
     }
 
     async fn process_signal(
-        conn: &Connection,
+        db: &Database,
         cache: &PriceCache,
         settings: &AppSettings,
         signal_id: &str,
-        wealth: Option<&WealthClient>,
+        broker: Option<&BrokerSession>,
         trading_mode: TradingMode,
+        allow_bulk_liquidation: bool,
+        cycle_id: Option<&str>,
+        cycle_sell_notional: &mut f64,
     ) -> Result<bool> {
-        let signal: Option<(String, String, f64)> = conn
-            .query_row(
-                "SELECT symbol, action, confidence FROM signals WHERE id = ?1",
-                [signal_id],
+        let loaded = db.with_conn(|conn| {
+            let signal: Option<(String, String, f64)> = conn
+                .query_row(
+                    "SELECT symbol, action, confidence FROM signals WHERE id = ?1",
+                    [signal_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .ok();
+            let Some((symbol, action, confidence)) = signal else {
+                return Ok(None);
+            };
+            if !is_valid_ticker(&symbol) {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_SYMBOL' WHERE id = ?1",
+                    [signal_id],
+                )?;
+                return Ok(None);
+            }
+            let portfolio: (String, f64, String) = conn.query_row(
+                "SELECT id, cash_balance, strategy_param_set_id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
+                [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .ok();
+            )?;
+            let param_set = Self::load_param_set(conn, &portfolio.2)?;
+            Ok(Some((symbol, action, confidence, portfolio, param_set)))
+        })?;
 
-        let Some((symbol, action, confidence)) = signal else {
+        let Some((symbol, action, confidence, portfolio, param_set)) = loaded else {
             return Ok(false);
         };
-
-        let portfolio: (String, f64, String) = conn.query_row(
-            "SELECT id, cash_balance, strategy_param_set_id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-
-        let param_set = Self::load_param_set(conn, &portfolio.2)?;
-
-        let (cash_balance, positions, prices, daily_trades) = if trading_mode == TradingMode::Live {
-            let client = wealth.ok_or_else(|| anyhow::anyhow!("Wealth client required for live mode"))?;
-            let wallet = client.get_wallet().await?;
-            let snap = client.get_portfolio().await?;
-            let positions: Vec<(String, f64, f64)> = snap
-                .holdings
-                .iter()
-                .map(|h| {
-                    (
-                        h.symbol.clone(),
-                        h.quantity,
-                        h.buy_price.unwrap_or(h.price),
-                    )
-                })
-                .collect();
-            let mut symbols: Vec<String> = positions.iter().map(|(s, _, _)| s.clone()).collect();
-            if !symbols.contains(&symbol) {
-                symbols.push(symbol.clone());
-            }
-            let mut prices = Self::get_prices(conn, cache, &symbols)?;
-            for h in &snap.holdings {
-                if h.price > 0.0 {
-                    prices.insert(h.symbol.clone(), h.price);
-                }
-            }
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let daily_trades: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM broker_orders WHERE date(created_at) = ?1 AND status = 'executed'",
-                [&today],
-                |row| row.get(0),
-            )?;
-            (wallet.brokerage_balance, positions, prices, daily_trades)
-        } else {
-            let positions = Self::load_positions(conn, &portfolio.0)?;
-            let mut symbols: Vec<String> = positions.iter().map(|(s, _, _)| s.clone()).collect();
-            if !symbols.contains(&symbol) {
-                symbols.push(symbol.clone());
-            }
-            let prices = Self::get_prices(conn, cache, &symbols)?;
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let daily_trades: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sandbox_trades WHERE portfolio_id = ?1 AND date(executed_at) = ?2",
-                rusqlite::params![portfolio.0, today],
-                |row| row.get(0),
-            )?;
-            (portfolio.1, positions, prices, daily_trades)
-        };
-
-        let daily_drawdown: f64 = conn
-            .query_row(
-                "SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = ?1 ORDER BY snapshot_date DESC LIMIT 1",
-                [&portfolio.0],
-                |row| row.get(0),
-            )
-            .unwrap_or(0.0);
 
         let input = SignalInput {
             id: signal_id.into(),
@@ -280,30 +269,257 @@ impl ExecutionService {
             confidence,
         };
         let fee_pct = settings.simulated_fee_pct.max(0.0);
-        let (result, quantity) = RiskPolicyService::evaluate(
-            &input,
-            &param_set,
-            cash_balance,
-            &positions,
-            &prices,
-            daily_trades,
-            daily_drawdown,
-            fee_pct,
-        );
-
-        conn.execute(
-            "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
-            rusqlite::params![result, signal_id],
-        )?;
-
-        if result != "APPROVED" || quantity <= 0.0 {
-            return Ok(false);
-        }
 
         if trading_mode == TradingMode::Live {
-            let client = wealth.ok_or_else(|| anyhow::anyhow!("Wealth client required for live mode"))?;
-            Self::execute_live_trade(conn, client, signal_id, &symbol, &action, quantity).await?;
-        } else {
+            let client = broker.ok_or_else(|| anyhow::anyhow!("Live broker session required"))?;
+            let instrument = client.resolve_instrument(&symbol).await?;
+            let broker_quote = instrument.quote;
+            if broker_quote <= 0.0 {
+                return Err(anyhow::anyhow!("No broker price for {symbol}"));
+            }
+            let wallet = client.get_wallet().await?;
+            let snap = client.get_portfolio().await?;
+            let current_equity = {
+                let mv = if snap.stock_value > 0.0 {
+                    snap.stock_value
+                } else {
+                    snap.holdings.iter().map(|h| h.current_value).sum()
+                };
+                wallet.brokerage_balance + mv
+            };
+
+            let eval = db.with_conn(|conn| {
+                let pulse_price = Self::get_prices(conn, cache, &[symbol.clone()])?
+                    .get(&symbol)
+                    .copied()
+                    .unwrap_or(0.0);
+                if pulse_price > 0.0 && !quote_within_deviation(pulse_price, broker_quote) {
+                    anyhow::bail!(
+                        "Broker quote for {symbol} deviates more than {:.0}% from Pulse",
+                        MAX_QUOTE_DEVIATION * 100.0
+                    );
+                }
+                let pending_buy = intents::pending_buy_notional(conn)?;
+                let pending_sell = intents::pending_sell_qty(conn, &symbol)?;
+                if intents::find_duplicate(conn, &symbol, &action, 0.0)?.is_some() {
+                    // duplicate check uses qty later
+                }
+                let mut positions: Vec<(String, f64, f64)> = snap
+                    .holdings
+                    .iter()
+                    .map(|h| {
+                        let mut qty = h.quantity;
+                        if h.symbol.eq_ignore_ascii_case(&symbol) {
+                            qty = (qty - pending_sell).max(0.0);
+                        }
+                        (h.symbol.clone(), qty, h.buy_price.unwrap_or(h.price))
+                    })
+                    .collect();
+                if !positions.iter().any(|(s, _, _)| s == &symbol) {
+                    positions.push((symbol.clone(), 0.0, broker_quote));
+                }
+                let mut prices = std::collections::HashMap::new();
+                prices.insert(symbol.clone(), broker_quote);
+                for h in &snap.holdings {
+                    if h.price > 0.0 {
+                        prices.insert(h.symbol.clone(), h.price);
+                    }
+                }
+                let spendable = (wallet.brokerage_balance - pending_buy).max(0.0);
+                let daily_trades = intents::pending_action_count(conn)?;
+                let daily_drawdown = live_drawdown_pct(conn, client.id().as_str(), current_equity)?;
+                let (result, mut quantity) = RiskPolicyService::evaluate(
+                    &input,
+                    &param_set,
+                    spendable,
+                    &positions,
+                    &prices,
+                    daily_trades,
+                    daily_drawdown,
+                    fee_pct,
+                );
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
+                    rusqlite::params![result, signal_id],
+                )?;
+                if result != "APPROVED" || quantity <= 0.0 {
+                    return Ok(None);
+                }
+                if action == "SELL" {
+                    let cap = current_equity * MAX_LIQUIDATION_PCT;
+                    if !allow_bulk_liquidation && *cycle_sell_notional + quantity * broker_quote > cap {
+                        quantity = ((cap - *cycle_sell_notional).max(0.0) / broker_quote).floor();
+                        if quantity < 1.0 {
+                            anyhow::bail!("Bulk liquidation requires extra confirmation");
+                        }
+                    }
+                }
+                if let Some(_) = intents::find_duplicate(conn, &symbol, &action, quantity)? {
+                    anyhow::bail!("Matching live order already submitted for {symbol}");
+                }
+                let intent = intents::insert_intent(
+                    conn,
+                    Some(signal_id),
+                    cycle_id,
+                    &symbol,
+                    &action,
+                    quantity,
+                    broker_quote,
+                    client.id().as_str(),
+                )?;
+                Ok(Some((intent, quantity, spendable)))
+            })?;
+
+            let Some((intent, mut quantity, spendable)) = eval else {
+                return Ok(false);
+            };
+
+            let mut fee = client
+                .calculate_fee(&instrument, &action, quantity, broker_quote)
+                .await?;
+            if action == "BUY" {
+                while quantity >= 1.0
+                    && (spendable < fee.total_price
+                        || fee.available_quantity < 1.0
+                        || fee.available_quantity + 1e-9 < quantity)
+                {
+                    quantity = (quantity - 1.0).floor();
+                    if quantity < 1.0 {
+                        break;
+                    }
+                    fee = client
+                        .calculate_fee(&instrument, &action, quantity, broker_quote)
+                        .await?;
+                }
+                if quantity < 1.0 {
+                    db.with_conn(|conn| {
+                        intents::mark_terminal(conn, &intent.id, "rejected", None, Some("insufficient cash"))
+                    })?;
+                    return Err(anyhow::anyhow!(
+                        "Insufficient brokerage balance for {symbol} (have ₦{:.2})",
+                        spendable
+                    ));
+                }
+            }
+
+            if fee.total_price.max(quantity * broker_quote) > settings.max_live_notional {
+                db.with_conn(|conn| {
+                    intents::mark_terminal(conn, &intent.id, "rejected", None, Some("notional cap"))
+                })?;
+                return Err(anyhow::anyhow!("Live notional exceeds configured cap"));
+            }
+
+            db.with_conn(|conn| intents::mark_submitted(conn, &intent.id, None))?;
+            let order = match client
+                .place_and_await_fill(
+                    &instrument,
+                    &action,
+                    &fee,
+                    Some(&intent.client_order_id),
+                )
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    db.with_conn(|conn| {
+                        intents::mark_terminal(conn, &intent.id, "unknown", None, Some(&e.to_string()))
+                    })?;
+                    return Err(e);
+                }
+            };
+
+            db.with_conn(|conn| {
+                let fill_price = order.unit_price.or(order.quote_price).or(Some(broker_quote));
+                insert_broker_order(
+                    conn,
+                    Some(signal_id),
+                    &symbol,
+                    &action,
+                    quantity,
+                    &order,
+                    fill_price,
+                    Some(fee.fee),
+                )?;
+                let state = if order.status == "executed" {
+                    "filled"
+                } else if order.status == "rejected" {
+                    "rejected"
+                } else {
+                    "unknown"
+                };
+                intents::mark_terminal(
+                    conn,
+                    &intent.id,
+                    state,
+                    Some(order.id.as_str()),
+                    order.rejection_reason.as_deref(),
+                )?;
+                if order.status == "executed" {
+                    conn.execute("UPDATE signals SET executed = 1 WHERE id = ?1", [signal_id])?;
+                }
+                Ok(())
+            })?;
+
+            if action == "SELL" {
+                *cycle_sell_notional += quantity * broker_quote;
+            }
+            if order.status == "rejected" {
+                return Err(anyhow::anyhow!(
+                    "Broker order rejected: {}",
+                    order
+                        .rejection_reason
+                        .unwrap_or_else(|| "unknown reason".into())
+                ));
+            }
+            if order.status != "executed" {
+                return Err(anyhow::anyhow!(
+                    "{} order still {} after polling (id {})",
+                    client.display_name(),
+                    order.status,
+                    order.id
+                ));
+            }
+            return Ok(true);
+        }
+
+        db.with_conn(|conn| {
+            let positions = Self::load_positions(conn, &portfolio.0)?;
+            let mut symbols: Vec<String> = positions.iter().map(|(s, _, _)| s.clone()).collect();
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol.clone());
+            }
+            let prices = Self::get_prices(conn, cache, &symbols)?;
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let daily_trades: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sandbox_trades
+                 WHERE portfolio_id = ?1 AND date(executed_at) = ?2 AND side = 'BUY'",
+                rusqlite::params![portfolio.0, today],
+                |row| row.get(0),
+            )?;
+            let daily_drawdown: f64 = conn
+                .query_row(
+                    "SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = ?1 ORDER BY snapshot_date DESC LIMIT 1",
+                    [&portfolio.0],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0.0);
+            let (result, quantity) = RiskPolicyService::evaluate(
+                &input,
+                &param_set,
+                portfolio.1,
+                &positions,
+                &prices,
+                daily_trades,
+                daily_drawdown,
+                fee_pct,
+            );
+            conn.execute(
+                "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
+                rusqlite::params![result, signal_id],
+            )?;
+            if result != "APPROVED" || quantity <= 0.0 {
+                return Ok(false);
+            }
             let current_price = prices.get(&symbol).copied().unwrap_or(0.0);
             if current_price <= 0.0 {
                 return Ok(false);
@@ -317,93 +533,11 @@ impl ExecutionService {
                 &action,
                 quantity,
                 current_price,
-                cash_balance,
+                portfolio.1,
             )?;
-        }
-
-        conn.execute("UPDATE signals SET executed = 1 WHERE id = ?1", [signal_id])?;
-        Ok(true)
-    }
-
-    async fn execute_live_trade(
-        conn: &Connection,
-        client: &WealthClient,
-        signal_id: &str,
-        symbol: &str,
-        side: &str,
-        mut quantity: f64,
-    ) -> Result<()> {
-        let (stock_id, price) = client.resolve_stock_id(symbol).await?;
-        if price <= 0.0 {
-            return Err(anyhow::anyhow!("No Wealth price for {symbol}"));
-        }
-
-        let mut fee = client.calculate_fee(stock_id, quantity, price).await?;
-        if side == "BUY" {
-            let wallet = client.get_wallet().await?;
-            let mut cost = price * quantity + fee.rounded_fee;
-            // Shrink-to-fit when brokerage balance cannot cover sized qty + fee.
-            while quantity >= 1.0 && wallet.brokerage_balance < cost {
-                quantity = (quantity - 1.0).floor();
-                if quantity < 1.0 {
-                    break;
-                }
-                fee = client.calculate_fee(stock_id, quantity, price).await?;
-                cost = price * quantity + fee.rounded_fee;
-            }
-            if quantity < 1.0 {
-                return Err(anyhow::anyhow!(
-                    "Insufficient brokerage balance for {symbol} (have ₦{:.2})",
-                    wallet.brokerage_balance
-                ));
-            }
-        } else {
-            let snap = client.get_portfolio().await?;
-            let held = snap
-                .holdings
-                .iter()
-                .find(|h| h.symbol.eq_ignore_ascii_case(symbol))
-                .map(|h| h.quantity)
-                .unwrap_or(0.0);
-            if quantity > held {
-                return Err(anyhow::anyhow!(
-                    "Cannot sell {quantity} of {symbol}; holding {held}"
-                ));
-            }
-        }
-
-        let order = client
-            .place_and_await_fill(stock_id, side, quantity)
-            .await?;
-
-        let fill_price = order.unit_price.or(order.quote_price).or(Some(price));
-        insert_broker_order(
-            conn,
-            Some(signal_id),
-            symbol,
-            side,
-            quantity,
-            &order,
-            fill_price,
-            Some(fee.rounded_fee),
-        )?;
-
-        if order.status == "rejected" {
-            return Err(anyhow::anyhow!(
-                "Wealth order rejected: {}",
-                order
-                    .rejection_reason
-                    .unwrap_or_else(|| "unknown reason".into())
-            ));
-        }
-        if order.status != "executed" {
-            return Err(anyhow::anyhow!(
-                "Wealth order still {} after polling (id {})",
-                order.status,
-                order.id
-            ));
-        }
-        Ok(())
+            conn.execute("UPDATE signals SET executed = 1 WHERE id = ?1", [signal_id])?;
+            Ok(true)
+        })
     }
 
     fn execute_trade(
@@ -417,6 +551,8 @@ impl ExecutionService {
         current_price: f64,
         mut cash_balance: f64,
     ) -> Result<()> {
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let result = (|| {
         let fill_sim = FillSimulator::from_settings(settings);
         let (fill_price, slippage_bps) = fill_sim.simulate_fill(side, current_price);
         let notional = fill_price * quantity;
@@ -481,6 +617,17 @@ impl ExecutionService {
             rusqlite::params![trade_id, portfolio_id, signal_id, symbol, side, quantity, fill_price, fee, slippage_bps, cash_balance],
         )?;
         Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
     }
 
     fn load_param_set(conn: &Connection, id: &str) -> Result<ParamSet> {
@@ -534,4 +681,137 @@ impl ExecutionService {
         }
         Ok(prices)
     }
+
+    pub async fn reconcile_if_possible(db: &Database, session: &BrokerSession) -> Result<()> {
+        let open = db.with_conn(crate::intents::load_open_intents)?;
+        for intent in open {
+            if let Some(eid) = intent.external_order_ref.clone() {
+                match session.get_order(&eid).await {
+                    Ok(order) => {
+                        let state = if order.status == "executed" {
+                            "filled"
+                        } else if order.status == "rejected" {
+                            "rejected"
+                        } else {
+                            "unknown"
+                        };
+                        db.with_conn(|conn| {
+                            crate::intents::mark_terminal(
+                                conn,
+                                &intent.id,
+                                state,
+                                Some(order.id.as_str()),
+                                order.rejection_reason.as_deref(),
+                            )
+                        })?;
+                    }
+                    Err(e) => {
+                        db.with_conn(|conn| {
+                            crate::intents::mark_terminal(
+                                conn,
+                                &intent.id,
+                                "unknown",
+                                Some(eid.as_str()),
+                                Some(&e.to_string()),
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+pub fn quote_within_deviation(reference: f64, broker: f64) -> bool {
+    if reference <= 0.0 || broker <= 0.0 || !reference.is_finite() || !broker.is_finite() {
+        return false;
+    }
+    ((broker - reference) / reference).abs() <= MAX_QUOTE_DEVIATION
+}
+
+pub fn live_drawdown_pct(conn: &Connection, venue: &str, current_equity: f64) -> Result<f64> {
+    if current_equity <= 0.0 || !current_equity.is_finite() {
+        anyhow::bail!("Live drawdown breaker: current brokerage equity is unavailable");
+    }
+    let prior: Option<f64> = conn
+        .query_row(
+            "SELECT total_equity FROM equity_curve_points
+             WHERE venue = ?1 AND date(recorded_at) < date('now')
+             ORDER BY recorded_at DESC LIMIT 1",
+            [venue],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(prior) = prior.filter(|p| *p > 0.0 && p.is_finite()) else {
+        anyhow::bail!("Live drawdown breaker: prior brokerage equity is unavailable");
+    };
+    Ok(((prior - current_equity) / prior).max(0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_stale_broker_quote() {
+        assert!(quote_within_deviation(100.0, 104.0));
+        assert!(!quote_within_deviation(100.0, 106.0));
+        assert!(!quote_within_deviation(0.0, 10.0));
+    }
+
+    fn test_param_set() -> ParamSet {
+        ParamSet {
+            id: "test".into(),
+            max_position_pct: 0.25,
+            max_daily_trades: 2,
+            stop_loss_pct: 0.08,
+            min_confidence_to_trade: 0.5,
+            max_daily_drawdown_pct: 0.05,
+            position_size_pct: 0.05,
+        }
+    }
+
+    #[test]
+    fn daily_trade_cap_blocks_buy_not_sell() {
+        let param_set = test_param_set();
+        let prices = std::collections::HashMap::from([("GTCO".into(), 50.0)]);
+        let positions = vec![("GTCO".into(), 100.0, 40.0)];
+        let buy = SignalInput {
+            id: "b".into(),
+            symbol: "GTCO".into(),
+            action: "BUY".into(),
+            confidence: 0.8,
+        };
+        let sell = SignalInput {
+            id: "s".into(),
+            symbol: "GTCO".into(),
+            action: "SELL".into(),
+            confidence: 0.8,
+        };
+        let (buy_result, _) = RiskPolicyService::evaluate(
+            &buy,
+            &param_set,
+            1_000_000.0,
+            &positions,
+            &prices,
+            param_set.max_daily_trades,
+            0.0,
+            0.01,
+        );
+        let (sell_result, sell_qty) = RiskPolicyService::evaluate(
+            &sell,
+            &param_set,
+            1_000_000.0,
+            &positions,
+            &prices,
+            param_set.max_daily_trades,
+            0.0,
+            0.01,
+        );
+        assert_eq!(buy_result, "BLOCKED_DAILY_TRADES");
+        assert_eq!(sell_result, "APPROVED");
+        assert_eq!(sell_qty, 100.0);
+    }
+}
+

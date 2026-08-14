@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { IconTrades } from '../components/Icons';
 import { api } from '../lib/api';
+import { formatNaira } from '../lib/format';
 import { useToast } from '../lib/toast';
 
 interface Trade {
@@ -33,7 +34,6 @@ export default function TradesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- load once on mount
   }, []);
 
-  const formatNaira = (n: number) => `₦${n.toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
   const hasLive = trades.some((t) => t.venue === 'wealth');
 
   return (

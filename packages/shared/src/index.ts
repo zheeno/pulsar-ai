@@ -10,15 +10,17 @@ export const LlmSignalOutputSchema = z.object({
 });
 export type LlmSignalOutput = z.infer<typeof LlmSignalOutputSchema>;
 
+export const TICKER_PATTERN = /^[A-Z0-9.-]{1,16}$/;
+
 export const LlmPortfolioSignalOutputSchema = z.object({
   signals: z.array(
     z.object({
-      symbol: z.string().min(1),
+      symbol: z.string().regex(TICKER_PATTERN),
       action: SignalActionSchema,
       confidence: z.number().min(0).max(1),
-      rationale: z.string().min(1),
+      rationale: z.string().min(1).max(2000),
     }),
-  ),
+  ).max(40),
 });
 export type LlmPortfolioSignalOutput = z.infer<typeof LlmPortfolioSignalOutputSchema>;
 
@@ -70,7 +72,7 @@ export const NGX_TRADING_HOURS = { open: 9, close: 16 };
 export const NGX_TIMEZONE = 'Africa/Lagos';
 
 export const PROMPT_VERSION = 'v1.0.0';
-export const PORTFOLIO_PROMPT_VERSION = 'v2.1.0';
+export const PORTFOLIO_PROMPT_VERSION = 'v2.3.1';
 
 export * from './types';
 export * from './desktop';

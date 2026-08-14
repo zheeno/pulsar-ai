@@ -31,8 +31,11 @@ export const AppSettingsSchema = z.object({
   simulatedFeePct: z.number().default(0.0015),
   autoCycleEnabled: z.boolean().default(false),
   autoCycleIntervalMinutes: z.number().int().min(5).max(120).default(30),
-  wealthEmail: z.string().email().optional(),
-  wealthConnected: z.boolean().default(false),
+  liveTradingEnabled: z.boolean().default(false),
+  scheduledLiveAuthorized: z.boolean().default(false),
+  maxLiveNotional: z.number().min(1000).max(50_000_000).default(500_000),
+  maxLiveActions: z.number().int().min(1).max(40).default(10),
+  retainRawLlmLogs: z.boolean().default(false),
 });
 export type AppSettings = z.infer<typeof AppSettingsSchema>;
 

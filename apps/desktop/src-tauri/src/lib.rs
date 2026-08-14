@@ -1,13 +1,19 @@
 mod agent;
 mod app_state;
 mod backtest;
+mod bamboo;
+mod broker;
 mod cache;
 mod calendar;
 mod commands;
+mod cycle_auth;
 mod db;
 mod execution;
+mod http_client;
 mod indicators;
 mod ingest;
+mod intents;
+mod net_policy;
 mod ngx;
 mod portfolio;
 mod rate_limit;
@@ -155,7 +161,6 @@ pub fn run() {
     load_dotenv();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
@@ -173,6 +178,8 @@ pub fn run() {
             tracing::info!(worker = %worker_path.display(), "agent worker path");
 
             let app_data = app.path().app_data_dir().expect("app data dir");
+            crate::secrets::init(&app_data);
+            crate::secrets::preload();
             let db = Database::open(&app_data).expect("open database");
             let settings = db.with_conn(get_settings).unwrap_or_default();
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
@@ -195,6 +202,7 @@ pub fn run() {
             commands::pulse_profile,
             commands::complete_onboarding,
             commands::portfolio_default,
+            commands::portfolio_quotes,
             commands::portfolio_performance,
             commands::usage_ngx_pulse,
             commands::market_status,
@@ -212,10 +220,16 @@ pub fn run() {
             commands::get_backtest,
             commands::export_database,
             commands::app_data_dir,
+            commands::reset_local_data,
             commands::wealth_login,
             commands::wealth_verify_2fa,
             commands::wealth_profile,
             commands::wealth_logout,
+            commands::bamboo_login,
+            commands::bamboo_profile,
+            commands::bamboo_logout,
+            commands::broker_list,
+            commands::set_selected_broker,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

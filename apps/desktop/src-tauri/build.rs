@@ -70,6 +70,27 @@ fn main() {
     emit_pulse_env("NGX_PULSE_BASE_URL", &file_env);
     emit_pulse_env("NGX_PULSE_SUPABASE_URL", &file_env);
     emit_pulse_env("NGX_PULSE_SUPABASE_ANON_KEY", &file_env);
+    emit_worker_sha256(&manifest_dir);
 
     tauri_build::build()
+}
+
+fn emit_worker_sha256(manifest_dir: &Path) {
+    use sha2::{Digest, Sha256};
+    let candidates = [
+        manifest_dir.join("resources/agent-worker.cjs"),
+        manifest_dir.join("../../../packages/agent/dist/worker.js"),
+    ];
+    for path in candidates {
+        if path.is_file() {
+            println!("cargo:rerun-if-changed={}", path.display());
+            if let Ok(bytes) = fs::read(&path) {
+                let digest = Sha256::digest(&bytes);
+                let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                println!("cargo:rustc-env=AGENT_WORKER_SHA256={hex}");
+                return;
+            }
+        }
+    }
+    println!("cargo:rustc-env=AGENT_WORKER_SHA256=");
 }

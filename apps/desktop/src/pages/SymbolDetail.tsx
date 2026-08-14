@@ -11,6 +11,7 @@ import {
 } from 'recharts';
 import { IconSpinner } from '../components/Icons';
 import { api } from '../lib/api';
+import { formatNaira } from '../lib/format';
 import { useToast } from '../lib/toast';
 
 type PricePoint = {
@@ -125,11 +126,6 @@ export default function SymbolDetailPage() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload on symbol change
   }, [symbol]);
-
-  const formatNaira = (n: number | null | undefined) => {
-    const value = Number(n ?? 0);
-    return `₦${(Number.isFinite(value) ? value : 0).toLocaleString('en-NG', { maximumFractionDigits: 2 })}`;
-  };
 
   const price = data?.pulseQuote?.price ?? data?.latest?.price;
   const change = data?.pulseQuote?.changePercent ?? data?.latest?.changePercent;

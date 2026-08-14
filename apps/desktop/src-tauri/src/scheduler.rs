@@ -84,18 +84,20 @@ fn catch_up_on_launch(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
     let calendar = TradingCalendar::default();
 
-    state.db.with_conn(|conn| {
-        block_on_local(async {
-            let _ = crate::ingest::IngestionService::ingest_stocks(
-                conn,
-                &client,
-                &state.cache,
-                &calendar,
-                false,
-            )
-            .await;
-            Ok(())
-        })
+    block_on_local(async {
+        match crate::ingest::IngestionService::ingest_stocks(
+            &state.db,
+            &client,
+            &state.cache,
+            &calendar,
+            false,
+        )
+        .await
+        {
+            Ok(n) => tracing::info!(target: "ngx_pulse", count = n, "launch stock ingest"),
+            Err(e) => tracing::warn!(target: "ngx_pulse", error = %e, "launch stock ingest failed"),
+        }
+        Ok::<_, anyhow::Error>(())
     })?;
 
     let _ = app.emit("ingest:complete", ());
@@ -121,28 +123,22 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
     let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
     let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
-    let wealth_password = crate::secrets::get_secret(crate::secrets::SECRET_WEALTH_PASSWORD)?;
-    let wealth = if settings.wealth_connected {
-        Some(crate::wealth::WealthClient::from_settings(
-            &settings,
-            wealth_password,
-        ))
-    } else {
-        None
-    };
+    let broker = crate::broker::open_live_broker(&settings);
     let calendar = TradingCalendar::default();
+    let execute = settings.live_trading_enabled && settings.scheduled_live_authorized;
 
-    match state.db.with_conn(|conn| {
-        block_on_local(run_cycle(
-            conn,
-            &state.agent,
-            &settings,
-            &state.cache,
-            &client,
-            &calendar,
-            wealth.as_ref(),
-        ))
-    }) {
+    match block_on_local(run_cycle(
+        &state.db,
+        &state.agent,
+        &settings,
+        &state.cache,
+        &client,
+        &calendar,
+        broker.as_ref(),
+        execute,
+        false,
+        None,
+    )) {
         Ok(result) => {
             let mut payload = result;
             if let Some(obj) = payload.as_object_mut() {

@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::rate_limit::RateLimiter;
+use crate::http_client::http_client;
 use crate::settings::AppSettings;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36";
@@ -57,6 +57,14 @@ pub struct PricePoint {
     pub volume: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LatestQuote {
+    pub symbol: String,
+    pub last: f64,
+    pub prev_close: Option<f64>,
+    pub trade_date: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     Session,
@@ -88,7 +96,6 @@ pub struct PulseAuthReport {
     pub login_url: Option<String>,
     pub http_status: Option<u16>,
     pub token_expires_at: Option<i64>,
-    pub token_preview: Option<String>,
     pub message: String,
     pub logs: Vec<String>,
 }
@@ -116,9 +123,35 @@ struct SessionTokens {
     expires_at: i64,
 }
 
-fn token_preview(token: &str) -> String {
-    let prefix: String = token.chars().take(12).collect();
-    format!("{prefix}…")
+fn correlation_id() -> String {
+    uuid::Uuid::new_v4().to_string().chars().take(8).collect()
+}
+
+fn redact_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) if !local.is_empty() => {
+            format!("{}***@{}", local.chars().next().unwrap_or('*'), domain)
+        }
+        _ => "[redacted]".into(),
+    }
+}
+
+fn sanitize_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\t')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+pub fn is_valid_ticker(symbol: &str) -> bool {
+    let s = symbol.trim();
+    let re_ok = s.len() <= 16
+        && !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.' || c == '-');
+    re_ok
 }
 
 pub struct NgxPulseClient {
@@ -162,7 +195,7 @@ impl NgxPulseClient {
         };
 
         Self {
-            http: Client::new(),
+            http: http_client().expect("http client"),
             base_url,
             auth_mode,
             api_key,
@@ -196,7 +229,7 @@ impl NgxPulseClient {
             self.auth_mode.as_str(),
             self.base_url,
             supabase_host,
-            self.email,
+            self.email.as_deref().map(redact_email),
             self.password.as_ref().is_some_and(|p| !p.is_empty()),
             self.anon_key.as_ref().is_some_and(|k| !k.is_empty()),
         ));
@@ -220,7 +253,6 @@ impl NgxPulseClient {
                     login_url,
                     http_status: None,
                     token_expires_at: None,
-                    token_preview: None,
                     message,
                     logs,
                 };
@@ -228,9 +260,8 @@ impl NgxPulseClient {
             AuthMode::ApiKey => {
                 logs.push("Using API key auth (not Supabase password grant)".into());
                 return match self.get_access_token().await {
-                    Ok(token) => {
-                        let preview = token_preview(&token);
-                        logs.push(format!("API key present, preview={preview}"));
+                    Ok(_token) => {
+                        logs.push("API key present".into());
                         PulseAuthReport {
                             ok: true,
                             auth_mode: self.auth_mode.as_str().into(),
@@ -243,7 +274,6 @@ impl NgxPulseClient {
                             login_url: None,
                             http_status: None,
                             token_expires_at: None,
-                            token_preview: Some(preview),
                             message: "API key auth configured".into(),
                             logs,
                         }
@@ -260,7 +290,6 @@ impl NgxPulseClient {
                         login_url: None,
                         http_status: None,
                         token_expires_at: None,
-                        token_preview: None,
                         message: e.to_string(),
                         logs,
                     },
@@ -284,27 +313,27 @@ impl NgxPulseClient {
                 login_url: None,
                 http_status: None,
                 token_expires_at: None,
-                token_preview: None,
                 message,
                 logs,
             };
         };
 
-        tracing::info!(target: "ngx_pulse", method = "POST", %url, email = ?self.email, "pulse supabase password grant");
-        logs.push(format!("POST {url} (email={:?}, password=[redacted])", self.email));
+        let email_log = self.email.as_deref().map(redact_email);
+        tracing::info!(target: "ngx_pulse", method = "POST", %url, email = ?email_log, "pulse supabase password grant");
+        logs.push(format!("POST {url} (email={:?}, password=[redacted])", email_log));
 
         match self.login_with_status().await {
             Ok((status, tokens)) => {
-                let preview = token_preview(&tokens.access_token);
+                let cid = correlation_id();
                 logs.push(format!(
-                    "response status={status} expires_at={} token_preview={preview}",
+                    "response status={status} expires_at={} cid={cid}",
                     tokens.expires_at
                 ));
                 tracing::info!(
                     target: "ngx_pulse",
                     %status,
                     expires_at = tokens.expires_at,
-                    token_preview = %preview,
+                    cid = %cid,
                     "pulse login ok"
                 );
                 *self.tokens.lock().unwrap() = Some(tokens.clone());
@@ -320,14 +349,13 @@ impl NgxPulseClient {
                     login_url: Some(url),
                     http_status: Some(status),
                     token_expires_at: Some(tokens.expires_at),
-                    token_preview: Some(preview),
                     message: "Supabase session login succeeded".into(),
                     logs,
                 }
             }
             Err((status, err)) => {
-                logs.push(format!("response status={:?} error={err}", status));
-                tracing::error!(target: "ngx_pulse", ?status, error = %err, "pulse login failed");
+                logs.push(format!("response status={:?} error=[redacted]", status));
+                tracing::error!(target: "ngx_pulse", ?status, cid = %correlation_id(), "pulse login failed");
                 PulseAuthReport {
                     ok: false,
                     auth_mode: self.auth_mode.as_str().into(),
@@ -340,7 +368,6 @@ impl NgxPulseClient {
                     login_url: Some(url),
                     http_status: status,
                     token_expires_at: None,
-                    token_preview: None,
                     message: err,
                     logs,
                 }
@@ -357,14 +384,14 @@ impl NgxPulseClient {
         }
     }
 
-    pub async fn get_market_status(&self, conn: &rusqlite::Connection) -> Result<NgxMarketStatus> {
+    pub async fn get_market_status(&self) -> Result<NgxMarketStatus> {
         if self.auth_mode == AuthMode::Mock {
             return Ok(NgxMarketStatus {
                 status: "Open".into(),
                 is_open: true,
             });
         }
-        let raw = self.fetch_raw(conn, "/ngxdata/market-status", "market-status").await?;
+        let raw = self.fetch_raw("/ngxdata/market-status", "market-status").await?;
         let data = unwrap(raw);
         Ok(NgxMarketStatus {
             status: data.get("status").and_then(|v| v.as_str()).unwrap_or("Unknown").into(),
@@ -494,15 +521,45 @@ impl NgxPulseClient {
         })
     }
 
-    pub async fn get_stocks(&self, conn: &rusqlite::Connection) -> Result<Vec<NgxStock>> {
+    pub async fn get_stocks(&self) -> Result<Vec<NgxStock>> {
         if self.auth_mode == AuthMode::Mock {
             return Ok(mock_stocks());
         }
-        let raw = self.fetch_raw(conn, "/ngxdata/stocks", "stocks").await?;
-        Ok(normalize_stocks(raw))
+
+        let mut by_symbol: std::collections::HashMap<String, NgxStock> =
+            std::collections::HashMap::new();
+        let mut page: u32 = 1;
+        loop {
+            let path = if page == 1 {
+                "/ngxdata/stocks".to_string()
+            } else {
+                format!("/ngxdata/stocks?page={page}")
+            };
+            let raw = self.fetch_raw(&path, "stocks").await?;
+            let has_more = page_has_more(&raw, page);
+            let chunk = normalize_stocks(raw);
+            if chunk.is_empty() {
+                break;
+            }
+            for stock in chunk {
+                by_symbol.insert(stock.symbol.clone(), stock);
+            }
+            if !has_more || page >= 50 {
+                break;
+            }
+            page += 1;
+        }
+
+        tracing::info!(
+            target: "ngx_pulse",
+            count = by_symbol.len(),
+            pages = page,
+            "pulse stocks ingested from API"
+        );
+        Ok(by_symbol.into_values().collect())
     }
 
-    pub async fn get_market(&self, conn: &rusqlite::Connection) -> Result<NgxMarketOverview> {
+    pub async fn get_market(&self) -> Result<NgxMarketOverview> {
         if self.auth_mode == AuthMode::Mock {
             return Ok(NgxMarketOverview {
                 asi: Some(AsiData {
@@ -512,11 +569,11 @@ impl NgxPulseClient {
                 market_cap: None,
             });
         }
-        let raw = self.fetch_raw(conn, "/ngxdata/market", "market").await?;
+        let raw = self.fetch_raw("/ngxdata/market", "market").await?;
         Ok(normalize_market(raw))
     }
 
-    pub async fn get_indices(&self, conn: &rusqlite::Connection) -> Result<Vec<NgxIndex>> {
+    pub async fn get_indices(&self) -> Result<Vec<NgxIndex>> {
         if self.auth_mode == AuthMode::Mock {
             return Ok(vec![NgxIndex {
                 code: "ASI".into(),
@@ -527,13 +584,12 @@ impl NgxPulseClient {
                 year_change: None,
             }]);
         }
-        let raw = self.fetch_raw(conn, "/ngxdata/indices", "indices").await?;
+        let raw = self.fetch_raw("/ngxdata/indices", "indices").await?;
         Ok(normalize_indices(raw))
     }
 
     pub async fn get_symbol_price(
         &self,
-        conn: &rusqlite::Connection,
         symbol: &str,
         from: Option<&str>,
         to: Option<&str>,
@@ -553,23 +609,65 @@ impl NgxPulseClient {
             path.push('?');
             path.push_str(&params.join("&"));
         }
-        let raw = self.fetch_raw(conn, &path, &format!("prices/{symbol}")).await?;
+        let raw = self.fetch_raw(&path, &format!("prices/{symbol}")).await?;
         Ok(normalize_prices(raw))
     }
 
-    async fn fetch_raw(&self, conn: &rusqlite::Connection, path: &str, endpoint: &str) -> Result<serde_json::Value> {
-        if self.auth_mode == AuthMode::ApiKey && !RateLimiter::can_make_request(conn)? {
-            return Err(anyhow!("NGX Pulse rate limit exceeded"));
+    /// Last print (and previous bar) for held names only. Caps at 20 symbols.
+    pub async fn get_latest_quotes(&self, symbols: &[String]) -> Result<Vec<LatestQuote>> {
+        let calendar = crate::calendar::TradingCalendar::default();
+        let today = calendar.today_wat();
+        let from = (calendar.now_wat() - chrono::Duration::days(7))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut out = Vec::new();
+        for symbol in symbols.iter().take(20) {
+            if symbol.is_empty() {
+                continue;
+            }
+            if self.auth_mode == AuthMode::ApiKey {
+                break;
+            }
+            let mut points = match self
+                .get_symbol_price(symbol, Some(&from), Some(&today))
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(target: "ngx_pulse", symbol = %symbol, error = %e, "quote fetch failed");
+                    continue;
+                }
+            };
+            if points.is_empty() {
+                continue;
+            }
+            points.sort_by(|a, b| a.date.cmp(&b.date));
+            let last = points.last().expect("non-empty");
+            let prev_close = if points.len() >= 2 {
+                points.get(points.len() - 2).map(|p| p.price)
+            } else {
+                None
+            };
+            out.push(LatestQuote {
+                symbol: symbol.clone(),
+                last: last.price,
+                prev_close,
+                trade_date: last.date.clone(),
+            });
         }
+        Ok(out)
+    }
 
+    async fn fetch_raw(&self, path: &str, endpoint: &str) -> Result<serde_json::Value> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let token = self.get_access_token().await?;
+        let cid = correlation_id();
         tracing::info!(
             target: "ngx_pulse",
             method = "GET",
             %url,
             auth_mode = self.auth_mode.as_str(),
-            token_preview = %token_preview(&token),
+            cid = %cid,
             "pulse API request"
         );
         let mut res = self
@@ -595,9 +693,6 @@ impl NgxPulseClient {
 
         let status = res.status();
         tracing::info!(target: "ngx_pulse", %url, %status, endpoint, "pulse API response");
-
-        let auth_str = self.auth_mode.as_str();
-        RateLimiter::record_request(conn, endpoint, auth_str)?;
 
         if !status.is_success() {
             return Err(anyhow!("NGX Pulse error: {status}"));
@@ -827,30 +922,92 @@ fn unwrap(payload: serde_json::Value) -> serde_json::Map<String, serde_json::Val
     payload.as_object().cloned().unwrap_or_default()
 }
 
+fn pagination_last_page(payload: &serde_json::Value) -> Option<u32> {
+    let candidates = [
+        payload.pointer("/meta/last_page"),
+        payload.pointer("/last_page"),
+        payload.pointer("/data/meta/last_page"),
+        payload.pointer("/data/last_page"),
+        payload.pointer("/pagination/last_page"),
+        payload.pointer("/meta/lastPage"),
+    ];
+    for v in candidates.into_iter().flatten() {
+        if let Some(n) = v.as_u64() {
+            return Some(n as u32);
+        }
+        if let Some(n) = v.as_i64().filter(|x| *x > 0) {
+            return Some(n as u32);
+        }
+    }
+    None
+}
+
+fn page_has_more(payload: &serde_json::Value, page: u32) -> bool {
+    if let Some(last) = pagination_last_page(payload) {
+        return page < last;
+    }
+    payload
+        .pointer("/links/next")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty() && s != "null")
+}
+
+fn stock_rows(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    payload
+        .get("stocks")
+        .and_then(|v| v.as_array())
+        .or_else(|| payload.get("data").and_then(|d| d.get("stocks")).and_then(|v| v.as_array()))
+        .or_else(|| payload.get("data").and_then(|v| v.as_array()))
+        .or_else(|| payload.as_array())
+}
+
+fn parse_stock_row(stock: &serde_json::Value) -> Option<NgxStock> {
+    let symbol = stock
+        .get("symbol")
+        .or_else(|| stock.get("ticker"))
+        .and_then(|v| v.as_str())?
+        .to_uppercase();
+    if !is_valid_ticker(&symbol) {
+        tracing::warn!(target: "ngx_pulse", %symbol, "dropping invalid ticker");
+        return None;
+    }
+    let price = stock
+        .get("current_price")
+        .or_else(|| stock.get("price"))
+        .or_else(|| stock.get("close_price"))
+        .or_else(|| stock.get("last_price"))
+        .and_then(|v| v.as_f64())?;
+    Some(NgxStock {
+        symbol,
+        name: stock
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(sanitize_text)
+            .filter(|s| !s.is_empty()),
+        price,
+        change_percent: stock
+            .get("change_percent")
+            .or_else(|| stock.get("official_change_percent"))
+            .or_else(|| stock.get("pct_change"))
+            .and_then(|v| v.as_f64()),
+        volume: stock
+            .get("volume")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64))),
+        market_cap: stock.get("market_cap").and_then(|v| v.as_f64()),
+        pe_ratio: stock.get("pe_ratio").and_then(|v| v.as_f64()),
+        sector: stock
+            .get("sector")
+            .and_then(|v| v.as_str())
+            .map(sanitize_text)
+            .filter(|s| !s.is_empty()),
+    })
+}
+
 fn normalize_stocks(payload: serde_json::Value) -> Vec<NgxStock> {
-    let root = payload.clone();
-    let data = unwrap(payload);
-    let stocks = data.get("stocks").or(root.get("stocks"));
-    let Some(arr) = stocks.and_then(|v| v.as_array()) else {
+    let Some(arr) = stock_rows(&payload) else {
         return vec![];
     };
-    arr.iter()
-        .filter_map(|stock| {
-            Some(NgxStock {
-                symbol: stock.get("symbol")?.as_str()?.into(),
-                name: stock.get("name").and_then(|v| v.as_str()).map(String::from),
-                price: stock.get("current_price").or(stock.get("price"))?.as_f64()?,
-                change_percent: stock
-                    .get("change_percent")
-                    .or(stock.get("official_change_percent"))
-                    .and_then(|v| v.as_f64()),
-                volume: stock.get("volume").and_then(|v| v.as_i64()),
-                market_cap: stock.get("market_cap").and_then(|v| v.as_f64()),
-                pe_ratio: stock.get("pe_ratio").and_then(|v| v.as_f64()),
-                sector: stock.get("sector").and_then(|v| v.as_str()).map(String::from),
-            })
-        })
-        .collect()
+    arr.iter().filter_map(parse_stock_row).collect()
 }
 
 fn normalize_market(payload: serde_json::Value) -> NgxMarketOverview {
@@ -919,7 +1076,11 @@ fn normalize_prices(payload: serde_json::Value) -> Vec<PricePoint> {
                 .to_string();
             Some(PricePoint {
                 date,
-                price: row.get("close_price").or(row.get("price"))?.as_f64()?,
+                price: row
+                    .get("last_price")
+                    .or(row.get("close_price"))
+                    .or(row.get("price"))?
+                    .as_f64()?,
                 volume: row.get("volume").and_then(|v| v.as_i64()),
             })
         })
@@ -933,6 +1094,21 @@ fn mock_stocks() -> Vec<NgxStock> {
         ("ZENITHBANK", 39.0),
         ("MTNN", 225.0),
         ("BUACEMENT", 98.0),
+        ("ACCESSCORP", 22.0),
+        ("UBA", 28.0),
+        ("FBNH", 18.0),
+        ("SEPLAT", 3200.0),
+        ("NESTLE", 1200.0),
+        ("BUAFOODS", 150.0),
+        ("AIRTELAFRI", 2100.0),
+        ("WAPCO", 35.0),
+        ("GUARANTY", 55.0),
+        ("STANBIC", 65.0),
+        ("FLOURMILL", 42.0),
+        ("PRESCO", 280.0),
+        ("OKOMUOIL", 350.0),
+        ("NASCON", 18.0),
+        ("INTBREW", 5.0),
     ];
     symbols
         .iter()
@@ -963,4 +1139,19 @@ fn mock_historical(_symbol: &str) -> Vec<PricePoint> {
         });
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_ticker;
+
+    #[test]
+    fn rejects_malicious_tickers() {
+        assert!(is_valid_ticker("GTCO"));
+        assert!(is_valid_ticker("MTN-N"));
+        assert!(!is_valid_ticker("GTCO\nDROP"));
+        assert!(!is_valid_ticker("ignore previous instructions"));
+        assert!(!is_valid_ticker(&"A".repeat(17)));
+        assert!(!is_valid_ticker(""));
+    }
 }

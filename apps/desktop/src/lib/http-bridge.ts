@@ -7,6 +7,12 @@ const SETTINGS_KEY = 'pulsar.browser.settings';
 const SECRETS_KEY = 'pulsar.browser.secrets';
 const STORE_KEY = 'pulsar.browser.store';
 
+try {
+  localStorage.removeItem(SECRETS_KEY);
+} catch {
+  /* ignore */
+}
+
 type Settings = Record<string, unknown>;
 
 interface MockStore {
@@ -26,7 +32,7 @@ interface MockStore {
   }[];
   signals: Record<string, unknown>[];
   trades: Record<string, unknown>[];
-  performance: { snapshot_date: string; total_equity: number; pnl_daily: number }[];
+  performance: { recorded_at: string; snapshot_date: string; total_equity: number; pnl_daily: number }[];
   strategy: Record<string, unknown>;
   backtests: Record<string, unknown>;
 }
@@ -44,8 +50,16 @@ function defaultSettings(): Settings {
     simulatedFeePct: 0.0015,
     autoCycleEnabled: false,
     autoCycleIntervalMinutes: 30,
+    selectedBroker: 'wealth',
     wealthEmail: undefined,
     wealthConnected: false,
+    bambooPhone: undefined,
+    bambooConnected: false,
+    liveTradingEnabled: false,
+    scheduledLiveAuthorized: false,
+    maxLiveNotional: 500_000,
+    maxLiveActions: 10,
+    retainRawLlmLogs: false,
   };
 }
 
@@ -80,9 +94,9 @@ function defaultStore(): MockStore {
     ],
     trades: [],
     performance: [
-      { snapshot_date: '2026-08-01', total_equity: 10_000_000, pnl_daily: 0 },
-      { snapshot_date: '2026-08-05', total_equity: 10_150_000, pnl_daily: 50_000 },
-      { snapshot_date: '2026-08-10', total_equity: 10_339_500, pnl_daily: 40_000 },
+      { recorded_at: '2026-08-01T00:00:00Z', snapshot_date: '2026-08-01', total_equity: 10_000_000, pnl_daily: 0 },
+      { recorded_at: '2026-08-05T00:00:00Z', snapshot_date: '2026-08-05', total_equity: 10_150_000, pnl_daily: 50_000 },
+      { recorded_at: '2026-08-10T00:00:00Z', snapshot_date: '2026-08-10', total_equity: 10_339_500, pnl_daily: 40_000 },
     ],
     strategy: {
       id: strategyId,
@@ -113,21 +127,35 @@ function saveSettingsLocal(settings: Settings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 }
 
-function loadSecrets(): Record<string, string> {
-  try {
-    return JSON.parse(localStorage.getItem(SECRETS_KEY) || '{}');
-  } catch {
-    return {};
-  }
+function selectedBrokerId(): string {
+  return String(loadSettings().selectedBroker || 'wealth');
 }
 
-function saveSecrets(partial: Record<string, string | undefined>) {
-  const current = loadSecrets();
-  for (const [k, v] of Object.entries(partial)) {
-    if (v === undefined || v === '') delete current[k];
-    else current[k] = v;
+function mockLiveConnected(): boolean {
+  const s = loadSettings();
+  const id = selectedBrokerId();
+  if (id === 'bamboo') return Boolean(s.bambooConnected);
+  return id === 'wealth' && Boolean(s.wealthConnected);
+}
+
+function mockBrokerMeta() {
+  const id = selectedBrokerId();
+  return {
+    brokerId: id,
+    brokerName: id === 'bamboo' ? 'Bamboo' : 'Wealth',
+  };
+}
+
+function loadSecrets(): Record<string, string> {
+  return {};
+}
+
+function saveSecrets(_partial: Record<string, string | undefined>) {
+  try {
+    localStorage.removeItem(SECRETS_KEY);
+  } catch {
+    /* ignore */
   }
-  localStorage.setItem(SECRETS_KEY, JSON.stringify(current));
 }
 
 function loadStore(): MockStore {
@@ -163,11 +191,10 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       // Match Rust: only complete_onboarding may flip this to true.
       next.onboardingComplete = current.onboardingComplete;
       saveSettingsLocal(next);
-      saveSecrets({
-        pulsePassword: payload.pulsePassword,
-        pulseApiKey: payload.pulseApiKey,
-        llmApiKey: payload.llmApiKey,
-      });
+      if (payload.pulsePassword || payload.pulseApiKey || payload.llmApiKey) {
+        throw new Error('Credentials cannot be stored in browser mock mode — use the Tauri desktop app');
+      }
+      saveSecrets({});
       return undefined as T;
     }
 
@@ -180,9 +207,12 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         onboardingComplete: false,
         wealthEmail: undefined,
         wealthConnected: false,
+        bambooPhone: undefined,
+        bambooConnected: false,
       };
       delete next.pulseEmail;
       delete next.wealthEmail;
+      delete next.bambooPhone;
       saveSettingsLocal(next);
       localStorage.removeItem(SECRETS_KEY);
       return undefined as T;
@@ -201,7 +231,6 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         loginUrl: null,
         httpStatus: null,
         tokenExpiresAt: null,
-        tokenPreview: null,
         message: 'Browser mock — use Tauri desktop for real Pulse auth',
         logs: ['browser-mock: no network call'],
       } as T;
@@ -235,8 +264,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
 
     case 'portfolio_default': {
       const store = loadStore();
-      const settings = loadSettings();
-      const live = Boolean(settings.wealthConnected);
+      const live = mockLiveConnected();
       const market_value = store.positions.reduce((s, p) => s + p.market_value, 0);
       return {
         portfolio: store.portfolio,
@@ -245,6 +273,35 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         market_value,
         pnl_today: store.performance.at(-1)?.pnl_daily ?? 0,
         tradingMode: live ? 'live' : 'sandbox',
+        ...mockBrokerMeta(),
+      } as T;
+    }
+
+    case 'portfolio_quotes': {
+      const store = loadStore();
+      const positions = store.positions.map((p) => {
+        const last = p.current_price * (1 + (Math.random() - 0.5) * 0.002);
+        return {
+          ...p,
+          current_price: last,
+          market_value: p.quantity * last,
+        };
+      });
+      saveStore({ ...store, positions });
+      const market_value = positions.reduce((s, p) => s + p.market_value, 0);
+      const unrealized_pnl = positions.reduce((s, p) => s + p.quantity * (p.current_price - p.avg_cost), 0);
+      return {
+        positions,
+        total_equity: store.portfolio.cash_balance + market_value,
+        market_value,
+        pnl_today: store.performance.at(-1)?.pnl_daily ?? 0,
+        unrealized_pnl,
+        quotesAsOf: new Date().toISOString(),
+        quotedSymbols: positions.map((p) => p.symbol),
+        stale: false,
+        tradingMode: mockLiveConnected() ? 'live' : 'sandbox',
+        ...mockBrokerMeta(),
+        portfolio: { id: store.portfolio.id, cash_balance: store.portfolio.cash_balance },
       } as T;
     }
 
@@ -364,8 +421,23 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         executed: false,
         risk_policy_result: 'BLOCKED_CONFIDENCE',
       });
+      if (command === 'cycle_run') {
+        const now = new Date();
+        const today = now.toISOString().slice(0, 10);
+        const last = store.performance.at(-1);
+        const equity = last?.total_equity ?? 10_000_000;
+        const priorClose = [...store.performance]
+          .reverse()
+          .find((p) => p.snapshot_date < today);
+        store.performance.push({
+          recorded_at: now.toISOString(),
+          snapshot_date: today,
+          total_equity: equity,
+          pnl_daily: equity - (priorClose?.total_equity ?? equity),
+        });
+      }
       saveStore(store);
-      return { signals: 1, executed: 0, signalIds: [id], count: 1, warnings: ['Browser mock mode'] } as T;
+      return { signals: 1, executed: 0, signalIds: [id], count: 1, universeSize: 20, warnings: ['Browser mock mode'] } as T;
     }
 
     case 'list_signals': {
@@ -440,7 +512,16 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
     case 'app_data_dir':
       return 'browser-mock' as T;
 
+    case 'reset_local_data':
+      localStorage.removeItem(SETTINGS_KEY);
+      localStorage.removeItem(SECRETS_KEY);
+      localStorage.removeItem(STORE_KEY);
+      return { ok: true } as T;
+
     case 'wealth_login': {
+      if (selectedBrokerId() !== 'wealth') {
+        throw new Error('Select Coronation Wealth as the live broker before connecting.');
+      }
       const email = String(args?.email || '');
       const password = String(args?.password || '');
       if (!email || !password) {
@@ -479,6 +560,9 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
     }
 
     case 'wealth_verify_2fa': {
+      if (selectedBrokerId() !== 'wealth') {
+        throw new Error('Select Coronation Wealth as the live broker before connecting.');
+      }
       const email = String(args?.email || '');
       const s = loadSettings();
       s.wealthEmail = email;
@@ -503,7 +587,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         email: s.wealthEmail ?? null,
         tradingProfile: connected ? 'verified' : null,
         tradingVerified: connected,
-        tradingMode: connected ? 'live' : 'sandbox',
+        tradingMode: mockLiveConnected() ? 'live' : 'sandbox',
         brokerageBalance: connected ? 250_000 : null,
         availableBalance: connected ? 200_000 : null,
         currentBalance: connected ? 250_000 : null,
@@ -521,6 +605,89 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       delete s.wealthEmail;
       saveSettingsLocal(s);
       return undefined as T;
+    }
+
+    case 'bamboo_login': {
+      if (selectedBrokerId() !== 'bamboo') {
+        throw new Error('Select Bamboo as the live broker before connecting.');
+      }
+      const phoneNumber = String(args?.phoneNumber || '');
+      const password = String(args?.password || '');
+      if (!phoneNumber || !password) {
+        return {
+          ok: false,
+          connected: false,
+          message: 'Phone number and password required',
+          phone: phoneNumber,
+          baseUrl: 'https://api.investbamboo.com',
+        } as T;
+      }
+      const s = loadSettings();
+      s.bambooPhone = phoneNumber;
+      s.bambooConnected = true;
+      saveSettingsLocal(s);
+      return {
+        ok: true,
+        connected: true,
+        message: 'Bamboo account connected.',
+        phone: phoneNumber,
+        baseUrl: 'https://api.investbamboo.com',
+      } as T;
+    }
+
+    case 'bamboo_profile': {
+      const s = loadSettings();
+      const connected = Boolean(s.bambooConnected);
+      return {
+        ok: connected,
+        connected,
+        email: s.bambooPhone ?? null,
+        tradingProfile: connected ? 'verified' : null,
+        tradingVerified: connected,
+        tradingMode: mockLiveConnected() ? 'live' : 'sandbox',
+        brokerageBalance: connected ? 180_000 : null,
+        availableBalance: connected ? 180_000 : null,
+        currentBalance: connected ? 180_000 : null,
+        baseUrl: 'https://api.investbamboo.com',
+        message: connected
+          ? 'Live trader mode — orders use Bamboo NGN cash.'
+          : 'Bamboo account not connected.',
+        displayName: connected ? 'Mock Bamboo User' : null,
+      } as T;
+    }
+
+    case 'bamboo_logout': {
+      const s = loadSettings();
+      s.bambooConnected = false;
+      delete s.bambooPhone;
+      saveSettingsLocal(s);
+      return undefined as T;
+    }
+
+    case 'broker_list': {
+      const s = loadSettings();
+      return [
+        {
+          id: 'wealth',
+          name: 'Coronation Wealth',
+          available: true,
+          connected: Boolean(s.wealthConnected),
+        },
+        {
+          id: 'bamboo',
+          name: 'Bamboo',
+          available: true,
+          connected: Boolean(s.bambooConnected),
+        },
+      ] as T;
+    }
+
+    case 'set_selected_broker': {
+      const brokerId = String(args?.brokerId || 'wealth') === 'bamboo' ? 'bamboo' : 'wealth';
+      const s = loadSettings();
+      s.selectedBroker = brokerId;
+      saveSettingsLocal(s);
+      return s as T;
     }
 
     default:
