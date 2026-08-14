@@ -266,6 +266,7 @@ pub fn clear_session_settings(conn: &Connection) -> Result<()> {
     set_setting(conn, "wealth_connected", "false")?;
     set_setting(conn, "live_trading_enabled", "false")?;
     set_setting(conn, "scheduled_live_authorized", "false")?;
+    clear_wealth_cache(conn)?;
     Ok(())
 }
 
@@ -274,6 +275,13 @@ pub fn clear_wealth_settings(conn: &Connection) -> Result<()> {
     set_setting(conn, "wealth_connected", "false")?;
     set_setting(conn, "live_trading_enabled", "false")?;
     set_setting(conn, "scheduled_live_authorized", "false")?;
+    clear_wealth_cache(conn)?;
+    Ok(())
+}
+
+pub fn clear_wealth_cache(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM wealth_positions", [])?;
+    conn.execute("DELETE FROM wealth_account", [])?;
     Ok(())
 }
 

@@ -248,75 +248,37 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
             return Ok(value);
         }
 
-        match block_on_local(async {
-            let snap = client.get_portfolio().await?;
-            let cash = match client.get_wallet().await {
-                Ok(w) => w.brokerage_balance,
-                Err(_) => status
-                    .brokerage_balance
-                    .unwrap_or(snap.balance),
-            };
-            Ok::<_, anyhow::Error>((cash, snap))
-        }) {
-            Ok((cash, snap)) => {
-                let positions: Vec<serde_json::Value> = snap
-                    .holdings
-                    .iter()
-                    .map(|h| {
-                        serde_json::json!({
-                            "id": format!("wealth-{}", h.stock_id),
-                            "symbol": h.symbol,
-                            "quantity": h.quantity,
-                            "avg_cost": h.buy_price.unwrap_or(h.price),
-                            "current_price": h.price,
-                            "market_value": h.current_value,
-                        })
-                    })
-                    .collect();
-                let market_value = if snap.stock_value > 0.0 {
-                    snap.stock_value
-                } else {
-                    snap.holdings.iter().map(|h| h.current_value).sum()
-                };
-                let total_equity = cash + market_value;
-                let pnl_today = state
-                    .db
-                    .with_conn(|conn| crate::portfolio::EquityCurveService::pnl_today(conn, "wealth"))
-                    .ok()
-                    .flatten()
-                    .unwrap_or(snap.profit);
-                Ok(serde_json::json!({
-                    "portfolio": {
-                        "id": id,
-                        "name": "wealth-live",
-                        "starting_capital": cash,
-                        "cash_balance": cash,
-                        "created_at": summary.portfolio.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
-                        "strategy_param_set_id": summary.portfolio.get("strategy_param_set_id").cloned().unwrap_or(serde_json::Value::Null),
-                    },
-                    "positions": positions,
-                    "total_equity": total_equity,
-                    "market_value": market_value,
-                    "pnl_today": pnl_today,
-                    "tradingMode": "live",
-                    "tradingVerified": status.trading_verified,
-                    "wealthStatus": status,
-                }))
-            }
+        match block_on_local(crate::wealth::WealthSyncService::refresh(&state.db, &client)) {
+            Ok(book) => Ok(live_portfolio_payload(
+                &id,
+                &summary,
+                &book,
+                &status,
+                false,
+                wealth_pnl_today(&state, book.profit),
+            )),
             Err(e) => {
-                tracing::warn!(target: "wealth", error = %e, "wealth portfolio overlay failed");
-                if let Some(obj) = value.as_object_mut() {
+                tracing::warn!(target: "wealth", error = %e, "wealth portfolio sync failed");
+                if let Some(book) = crate::wealth::WealthSyncService::load(&state.db).ok().flatten() {
+                    Ok(live_portfolio_payload(
+                        &id,
+                        &summary,
+                        &book,
+                        &status,
+                        true,
+                        wealth_pnl_today(&state, book.profit),
+                    ))
+                } else if let Some(obj) = value.as_object_mut() {
                     obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
                     obj.insert(
                         "wealthStatus".into(),
                         serde_json::to_value(&status).unwrap_or(serde_json::Value::Null),
                     );
-                    obj.insert(
-                        "wealthError".into(),
-                        serde_json::json!(e.to_string()),
-                    );
+                    obj.insert("wealthError".into(), serde_json::json!(e.to_string()));
+                    Ok(value)
+                } else {
+                    Ok(value)
                 }
-                Ok(value)
             }
         }
     })
@@ -347,7 +309,8 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
             .get("cash_balance")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
-        let mut lots: Vec<(String, String, f64, f64)> = sandbox
+        // id, symbol, qty, avg_cost, broker_last, broker_value
+        let mut lots: Vec<(String, String, f64, f64, f64, f64)> = sandbox
             .positions
             .iter()
             .filter_map(|p| {
@@ -356,27 +319,34 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
                     p.get("symbol").and_then(|v| v.as_str())?.to_string(),
                     p.get("quantity").and_then(|v| v.as_f64())?,
                     p.get("avg_cost").and_then(|v| v.as_f64())?,
+                    p.get("current_price").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    p.get("market_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 ))
             })
-            .filter(|(_, _, q, _)| *q > 0.0)
+            .filter(|(_, _, q, _, _, _)| *q > 0.0)
             .collect();
+
+        let mut live_pnl_fallback: Option<f64> = None;
+        let mut wealth_synced_at: Option<String> = None;
 
         if settings.wealth_connected {
             let wealth_password = get_secret(crate::secrets::SECRET_WEALTH_PASSWORD).ok().flatten();
             let client = crate::wealth::WealthClient::from_settings(&settings, wealth_password);
             let status = block_on_local(client.profile_status(&settings));
             if status.ok && status.connected {
-                if let Ok((w_cash, snap)) = block_on_local(async {
-                    let snap = client.get_portfolio().await?;
-                    let cash = match client.get_wallet().await {
-                        Ok(w) => w.brokerage_balance,
-                        Err(_) => status.brokerage_balance.unwrap_or(snap.balance),
-                    };
-                    Ok::<_, anyhow::Error>((cash, snap))
-                }) {
+                let book = match block_on_local(crate::wealth::WealthSyncService::refresh(
+                    &state.db,
+                    &client,
+                )) {
+                    Ok(b) => Some(b),
+                    Err(_) => crate::wealth::WealthSyncService::load(&state.db).ok().flatten(),
+                };
+                if let Some(book) = book {
                     trading_mode = "live";
-                    cash = w_cash;
-                    lots = snap
+                    cash = book.brokerage_balance;
+                    live_pnl_fallback = Some(wealth_pnl_today(&state, book.profit));
+                    wealth_synced_at = Some(book.synced_at.clone());
+                    lots = book
                         .holdings
                         .iter()
                         .filter(|h| h.quantity > 0.0)
@@ -386,6 +356,8 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
                                 h.symbol.clone(),
                                 h.quantity,
                                 h.buy_price.unwrap_or(h.price),
+                                h.price,
+                                h.current_value,
                             )
                         })
                         .collect();
@@ -393,8 +365,53 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
             }
         }
 
+        if trading_mode == "live" {
+            let mut market_value = 0.0;
+            let mut unrealized_pnl = 0.0;
+            let mut positions = Vec::new();
+            for (pid, symbol, qty, avg_cost, broker_last, broker_value) in &lots {
+                let last = if *broker_last > 0.0 { *broker_last } else { 0.0 };
+                let value = if *broker_value > 0.0 {
+                    *broker_value
+                } else if last > 0.0 {
+                    qty * last
+                } else {
+                    0.0
+                };
+                market_value += value;
+                if last > 0.0 && *avg_cost > 0.0 {
+                    unrealized_pnl += qty * (last - avg_cost);
+                }
+                positions.push(serde_json::json!({
+                    "id": pid,
+                    "symbol": symbol,
+                    "quantity": qty,
+                    "avg_cost": avg_cost,
+                    "current_price": last,
+                    "market_value": value,
+                }));
+            }
+            let pnl_today = live_pnl_fallback.unwrap_or(0.0);
+            let collapsed = !lots.is_empty() && market_value <= 0.0 && cash <= 0.0;
+            return Ok(serde_json::json!({
+                "positions": positions,
+                "total_equity": cash + market_value,
+                "market_value": market_value,
+                "pnl_today": pnl_today,
+                "unrealized_pnl": unrealized_pnl,
+                "quotesAsOf": wealth_synced_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                "quotedSymbols": Vec::<String>::new(),
+                "stale": collapsed,
+                "tradingMode": trading_mode,
+                "portfolio": {
+                    "id": id,
+                    "cash_balance": cash,
+                },
+            }));
+        }
+
         let mut symbols: Vec<String> = Vec::new();
-        for (_, sym, _, _) in &lots {
+        for (_, sym, _, _, _, _) in &lots {
             if !symbols.contains(sym) {
                 symbols.push(sym.clone());
             }
@@ -405,7 +422,7 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
         let pulse = NgxPulseClient::from_settings(&settings, password, api_key);
         let quotes = block_on_local(async { pulse.get_latest_quotes(&symbols).await })
             .unwrap_or_else(|_| vec![]);
-        let stale = quotes.is_empty() && !symbols.is_empty();
+        let quotes_empty = quotes.is_empty();
         let quoted_symbols: Vec<String> = quotes.iter().map(|q| q.symbol.clone()).collect();
 
         let _ = state.db.with_conn(|conn| {
@@ -422,9 +439,10 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
         let mut pnl_today = 0.0;
         let mut unrealized_pnl = 0.0;
         let mut positions = Vec::new();
+        let mut missing_pulse = 0usize;
 
-        for (pid, symbol, qty, avg_cost) in &lots {
-            let (last, prev) = if let Some(q) = quote_map.get(symbol) {
+        for (pid, symbol, qty, avg_cost, broker_last, broker_value) in &lots {
+            let (pulse_last, prev_close) = if let Some(q) = quote_map.get(symbol) {
                 (q.last, q.prev_close)
             } else {
                 let last = state
@@ -447,23 +465,42 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
                     .flatten();
                 (last, prev)
             };
-            let value = qty * last;
+            let last = if pulse_last > 0.0 {
+                pulse_last
+            } else if *broker_last > 0.0 {
+                missing_pulse += 1;
+                *broker_last
+            } else {
+                missing_pulse += 1;
+                0.0
+            };
+            let value = if last > 0.0 {
+                qty * last
+            } else if *broker_value > 0.0 {
+                *broker_value
+            } else {
+                0.0
+            };
             market_value += value;
-            if let Some(px) = prev {
-                pnl_today += qty * (last - px);
-            }
-            if *avg_cost > 0.0 {
-                unrealized_pnl += qty * (last - avg_cost);
+            if last > 0.0 {
+                if let Some(px) = prev_close {
+                    pnl_today += qty * (last - px);
+                }
+                if *avg_cost > 0.0 {
+                    unrealized_pnl += qty * (last - avg_cost);
+                }
             }
             positions.push(serde_json::json!({
                 "id": pid,
                 "symbol": symbol,
                 "quantity": qty,
                 "avg_cost": avg_cost,
-                "current_price": last,
+                "current_price": if last > 0.0 { last } else { *broker_last },
                 "market_value": value,
             }));
         }
+
+        let stale = quotes_empty && !symbols.is_empty() && missing_pulse == lots.len();
 
         Ok(serde_json::json!({
             "positions": positions,
@@ -483,6 +520,68 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn wealth_pnl_today(state: &Arc<AppState>, fallback: f64) -> f64 {
+    state
+        .db
+        .with_conn(|conn| crate::portfolio::EquityCurveService::pnl_today(conn, "wealth"))
+        .ok()
+        .flatten()
+        .unwrap_or(fallback)
+}
+
+fn live_portfolio_payload(
+    sandbox_id: &str,
+    summary: &crate::portfolio::PortfolioSummary,
+    book: &crate::wealth::CachedWealthBook,
+    status: &crate::wealth::WealthProfileStatus,
+    stale: bool,
+    pnl_today: f64,
+) -> serde_json::Value {
+    let cash = book.brokerage_balance;
+    let market_value = book.market_value();
+    let mut unrealized_pnl = 0.0;
+    let positions: Vec<serde_json::Value> = book
+        .holdings
+        .iter()
+        .filter(|h| h.quantity > 0.0)
+        .map(|h| {
+            let avg = h.buy_price.unwrap_or(h.price);
+            if h.price > 0.0 && avg > 0.0 {
+                unrealized_pnl += h.quantity * (h.price - avg);
+            }
+            serde_json::json!({
+                "id": format!("wealth-{}", h.stock_id),
+                "symbol": h.symbol,
+                "quantity": h.quantity,
+                "avg_cost": avg,
+                "current_price": h.price,
+                "market_value": h.current_value,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "portfolio": {
+            "id": sandbox_id,
+            "name": "wealth-live",
+            "starting_capital": cash,
+            "cash_balance": cash,
+            "created_at": summary.portfolio.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+            "strategy_param_set_id": summary.portfolio.get("strategy_param_set_id").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "positions": positions,
+        "total_equity": cash + market_value,
+        "market_value": market_value,
+        "pnl_today": pnl_today,
+        "unrealized_pnl": unrealized_pnl,
+        "quotesAsOf": book.synced_at,
+        "tradingMode": "live",
+        "tradingVerified": status.trading_verified,
+        "wealthStatus": status,
+        "stale": stale,
+        "syncedAt": book.synced_at,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,6 +616,7 @@ pub async fn wealth_login(
                 .db
                 .with_conn(|conn| crate::settings::mark_wealth_connected(conn, &payload.email))
                 .map_err(|e| e.to_string())?;
+            let _ = block_on_local(crate::wealth::WealthSyncService::refresh(&state.db, &client));
         } else if result.needs_2fa {
             let _ = set_secret(crate::secrets::SECRET_WEALTH_PASSWORD, &payload.password);
         }
@@ -543,6 +643,7 @@ pub async fn wealth_verify_2fa(
                 .db
                 .with_conn(|conn| crate::settings::mark_wealth_connected(conn, &payload.email))
                 .map_err(|e| e.to_string())?;
+            let _ = block_on_local(crate::wealth::WealthSyncService::refresh(&state.db, &client));
         }
         Ok(result)
     })
@@ -928,14 +1029,14 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
                     };
                     let (cash, venue, holdings) = if trading_mode == crate::wealth::TradingMode::Live {
                         if let Some(ref w) = wealth {
-                            let snap = w.get_portfolio().await.ok();
-                            let cash = match w.get_wallet().await {
-                                Ok(wallet) => Some(wallet.brokerage_balance),
-                                Err(_) => snap.as_ref().map(|s| s.balance),
+                            let book = match crate::wealth::WealthSyncService::refresh(&state.db, w).await {
+                                Ok(b) => Some(b),
+                                Err(_) => crate::wealth::WealthSyncService::load(&state.db).ok().flatten(),
                             };
-                            let holdings = snap
+                            let cash = book.as_ref().map(|b| b.brokerage_balance);
+                            let holdings = book
                                 .as_ref()
-                                .map(|s| crate::signals::HeldLot::from_wealth_holdings(&s.holdings))
+                                .map(|b| crate::signals::HeldLot::from_wealth_holdings(&b.holdings))
                                 .unwrap_or_default();
                             (cash, "wealth", holdings)
                         } else {

@@ -68,7 +68,7 @@ impl SignalGenerationService {
             Self::sandbox_lots(conn, pid.as_deref())?
         };
         let held_symbols: std::collections::HashSet<String> =
-            lots.iter().map(|l| l.symbol.clone()).collect();
+            lots.iter().map(|l| l.symbol.to_uppercase()).collect();
 
         let universe_rows = Self::build_universe(conn, &held_symbols)?;
         if universe_rows.is_empty() {
@@ -214,9 +214,9 @@ impl SignalGenerationService {
             "tradingVenue": venue,
             "estimatedFeePct": settings_fee,
         });
-        Ok(Some((context, valid_symbols, seen, signal_ids, universe_size)))
+        Ok(Some((context, valid_symbols, held_symbols, seen, signal_ids, universe_size)))
         })?;
-        let Some((context, valid_symbols, mut seen, mut signal_ids, universe_size)) = prep else {
+        let Some((context, valid_symbols, held_symbols, mut seen, mut signal_ids, universe_size)) = prep else {
             return Ok(PortfolioGeneration {
                 signal_ids: vec![],
                 universe_size: 0,
@@ -252,6 +252,9 @@ impl SignalGenerationService {
                     if buys >= crate::execution::MAX_SIGNAL_BUYS { continue; }
                     buys += 1;
                 } else if action == "SELL" {
+                    if !llm_sell_is_held(symbol, &held_symbols) {
+                        continue;
+                    }
                     if sells >= crate::execution::MAX_SIGNAL_SELLS { continue; }
                     sells += 1;
                 }
@@ -425,8 +428,8 @@ impl SignalGenerationService {
             .filter(|r| r.price.is_some())
             .collect();
         out.sort_by(|a, b| {
-            let ah = held_symbols.contains(&a.symbol);
-            let bh = held_symbols.contains(&b.symbol);
+            let ah = held_symbols.contains(&a.symbol.to_uppercase());
+            let bh = held_symbols.contains(&b.symbol.to_uppercase());
             bh.cmp(&ah).then_with(|| {
                 let ac = a.change_percent.unwrap_or(0.0).abs();
                 let bc = b.change_percent.unwrap_or(0.0).abs();
@@ -769,25 +772,25 @@ pub async fn run_cycle(
                 if execute {
                     let _ = crate::execution::ExecutionService::reconcile_if_possible(db, w).await;
                 }
-                let snap = match w.get_portfolio().await {
-                    Ok(s) => Some(s),
+                let book = match crate::wealth::WealthSyncService::refresh(db, w).await {
+                    Ok(b) => Some(b),
                     Err(e) => {
-                        warnings.push(format!("Could not load Wealth holdings for agent: {e}"));
-                        None
+                        warnings.push(format!("Could not refresh Wealth holdings: {e}"));
+                        crate::wealth::WealthSyncService::load(db).ok().flatten()
                     }
                 };
-                let cash = match w.get_wallet().await {
-                    Ok(wallet) => Some(wallet.brokerage_balance),
-                    Err(e) => {
-                        warnings.push(format!("Could not load Wealth brokerage balance for agent: {e}"));
-                        snap.as_ref().map(|s| s.balance)
-                    }
-                };
-                let holdings = snap
+                let cash = book.as_ref().map(|b| b.brokerage_balance);
+                let holdings = book
                     .as_ref()
-                    .map(|s| HeldLot::from_wealth_holdings(&s.holdings))
+                    .map(|b| HeldLot::from_wealth_holdings(&b.holdings))
                     .unwrap_or_default();
-                wealth_snap = snap;
+                wealth_snap = book.map(|b| crate::wealth::WealthPortfolioSnapshot {
+                    balance: b.brokerage_balance,
+                    profit: b.profit,
+                    stock_value: b.stock_value,
+                    holdings: b.holdings,
+                    stocks_present: true,
+                });
                 (cash, "wealth", holdings)
             } else {
                 (None, "wealth", Vec::new())
@@ -857,29 +860,34 @@ pub async fn run_cycle(
     if trading_mode == crate::wealth::TradingMode::Sandbox {
         db.with_conn(|conn| crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None))?;
     } else if execute {
-        if let Some(snap) = wealth_snap {
-            let cash = if let Some(w) = wealth {
-                match w.get_wallet().await {
-                    Ok(wallet) => wallet.brokerage_balance,
-                    Err(_) => snap.balance,
-                }
-            } else {
-                snap.balance
-            };
-            let market_value = if snap.stock_value > 0.0 {
-                snap.stock_value
-            } else {
-                snap.holdings.iter().map(|h| h.current_value).sum()
-            };
-            let _ = db.with_conn(|conn| {
-                crate::portfolio::EquityCurveService::insert_point(
-                    conn,
-                    "wealth",
-                    cash + market_value,
-                    cash,
-                    market_value,
-                )
-            });
+        if let Some(w) = wealth {
+            if let Ok(book) = crate::wealth::WealthSyncService::refresh(db, w).await {
+                let _ = db.with_conn(|conn| {
+                    crate::portfolio::EquityCurveService::insert_point(
+                        conn,
+                        "wealth",
+                        book.brokerage_balance + book.market_value(),
+                        book.brokerage_balance,
+                        book.market_value(),
+                    )
+                });
+            } else if let Some(snap) = wealth_snap {
+                let cash = snap.balance;
+                let market_value = if snap.stock_value > 0.0 {
+                    snap.stock_value
+                } else {
+                    snap.holdings.iter().map(|h| h.current_value).sum()
+                };
+                let _ = db.with_conn(|conn| {
+                    crate::portfolio::EquityCurveService::insert_point(
+                        conn,
+                        "wealth",
+                        cash + market_value,
+                        cash,
+                        market_value,
+                    )
+                });
+            }
         }
     }
 
@@ -915,4 +923,42 @@ pub async fn run_cycle(
         "universeSize": generated.universe_size,
         "instrumentsIngested": ingested,
     }))
+}
+
+fn llm_sell_is_held(symbol: &str, held: &std::collections::HashSet<String>) -> bool {
+    held.contains(&symbol.to_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn held(symbols: &[&str]) -> HashSet<String> {
+        symbols.iter().map(|s| s.to_uppercase()).collect()
+    }
+
+    #[test]
+    fn llm_sell_kept_when_held() {
+        assert!(llm_sell_is_held("GTCO", &held(&["GTCO", "DANGCEM"])));
+    }
+
+    #[test]
+    fn llm_sell_dropped_when_unheld() {
+        assert!(!llm_sell_is_held("SEPLAT", &held(&["GTCO"])));
+        assert!(!llm_sell_is_held("GTCO", &HashSet::new()));
+    }
+
+    #[test]
+    fn llm_sell_held_ignores_case() {
+        assert!(llm_sell_is_held("gtco", &held(&["GTCO"])));
+        assert!(llm_sell_is_held("Gtco", &held(&["gtco"])));
+    }
+
+    #[test]
+    fn llm_buy_unaffected_by_held_check() {
+        // BUY persistence does not call llm_sell_is_held; this documents that
+        // an unheld ticker still fails the SELL helper only.
+        assert!(!llm_sell_is_held("AIRTELAFRI", &held(&["GTCO"])));
+    }
 }

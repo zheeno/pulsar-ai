@@ -176,6 +176,8 @@ pub fn run() {
             tracing::info!(worker = %worker_path.display(), "agent worker path");
 
             let app_data = app.path().app_data_dir().expect("app data dir");
+            crate::secrets::init(&app_data);
+            crate::secrets::preload();
             let db = Database::open(&app_data).expect("open database");
             let settings = db.with_conn(get_settings).unwrap_or_default();
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))

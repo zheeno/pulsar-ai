@@ -46,6 +46,8 @@ impl Database {
         Self::migrate_equity_curve_recorded_at(conn)?;
         conn.execute_batch(include_str!("../../migrations/005_order_intents.sql"))
             .context("run order_intents migration")?;
+        conn.execute_batch(include_str!("../../migrations/006_wealth_positions.sql"))
+            .context("run wealth_positions migration")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
         Ok(())

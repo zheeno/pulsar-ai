@@ -470,7 +470,8 @@ impl ExecutionService {
             let prices = Self::get_prices(conn, cache, &symbols)?;
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
             let daily_trades: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sandbox_trades WHERE portfolio_id = ?1 AND date(executed_at) = ?2",
+                "SELECT COUNT(*) FROM sandbox_trades
+                 WHERE portfolio_id = ?1 AND date(executed_at) = ?2 AND side = 'BUY'",
                 rusqlite::params![portfolio.0, today],
                 |row| row.get(0),
             )?;
@@ -736,6 +737,60 @@ mod tests {
         assert!(quote_within_deviation(100.0, 104.0));
         assert!(!quote_within_deviation(100.0, 106.0));
         assert!(!quote_within_deviation(0.0, 10.0));
+    }
+
+    fn test_param_set() -> ParamSet {
+        ParamSet {
+            id: "test".into(),
+            max_position_pct: 0.25,
+            max_daily_trades: 2,
+            stop_loss_pct: 0.08,
+            min_confidence_to_trade: 0.5,
+            max_daily_drawdown_pct: 0.05,
+            position_size_pct: 0.05,
+        }
+    }
+
+    #[test]
+    fn daily_trade_cap_blocks_buy_not_sell() {
+        let param_set = test_param_set();
+        let prices = std::collections::HashMap::from([("GTCO".into(), 50.0)]);
+        let positions = vec![("GTCO".into(), 100.0, 40.0)];
+        let buy = SignalInput {
+            id: "b".into(),
+            symbol: "GTCO".into(),
+            action: "BUY".into(),
+            confidence: 0.8,
+        };
+        let sell = SignalInput {
+            id: "s".into(),
+            symbol: "GTCO".into(),
+            action: "SELL".into(),
+            confidence: 0.8,
+        };
+        let (buy_result, _) = RiskPolicyService::evaluate(
+            &buy,
+            &param_set,
+            1_000_000.0,
+            &positions,
+            &prices,
+            param_set.max_daily_trades,
+            0.0,
+            0.01,
+        );
+        let (sell_result, sell_qty) = RiskPolicyService::evaluate(
+            &sell,
+            &param_set,
+            1_000_000.0,
+            &positions,
+            &prices,
+            param_set.max_daily_trades,
+            0.0,
+            0.01,
+        );
+        assert_eq!(buy_result, "BLOCKED_DAILY_TRADES");
+        assert_eq!(sell_result, "APPROVED");
+        assert_eq!(sell_qty, 100.0);
     }
 }
 

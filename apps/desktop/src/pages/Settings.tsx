@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { IconLogout, IconSpinner } from '../components/Icons';
 import { api, type AppSettings } from '../lib/api';
+import { formatNaira } from '../lib/format';
 import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
 
@@ -554,9 +555,7 @@ export default function SettingsPage() {
               <div className="profile-meta__item">
                 <dt>Brokerage balance</dt>
                 <dd className="mono">
-                  {wealth.brokerageBalance != null
-                    ? `₦${Number(wealth.brokerageBalance).toLocaleString('en-NG', { maximumFractionDigits: 2 })}`
-                    : '—'}
+                  {wealth.brokerageBalance != null ? formatNaira(wealth.brokerageBalance) : '—'}
                 </dd>
               </div>
               <div className="profile-meta__item">

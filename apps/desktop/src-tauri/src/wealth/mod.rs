@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -28,6 +29,125 @@ pub fn wealth_base_url() -> &'static str {
         WEALTH_BASE_URL_DEV
     } else {
         WEALTH_BASE_URL_PROD
+    }
+}
+
+/// Parse money/qty fields that Wealth may send as numbers or numeric strings.
+fn json_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => {
+            let t = s.trim().replace(',', "");
+            if t.is_empty() {
+                None
+            } else {
+                t.parse().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn json_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_u64().map(|u| u as i64)).or_else(|| {
+            n.as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0)
+                .map(|f| f as i64)
+        }),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_field_f64(obj: &Value, key: &str) -> Option<f64> {
+    obj.get(key).and_then(json_f64)
+}
+
+fn pick_cash(wallet: Option<&WealthWallet>, previous: Option<f64>) -> f64 {
+    if let Some(w) = wallet {
+        return w.brokerage_balance;
+    }
+    previous.unwrap_or(0.0)
+}
+
+fn json_symbol(obj: Option<&Value>) -> Option<String> {
+    let obj = obj?;
+    ["symbol", "ticker", "stock_symbol", "code"]
+        .into_iter()
+        .find_map(|k| obj.get(k).and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_stock_lot(row: &Value) -> Option<WealthHolding> {
+    let nested = row.get("stock");
+    let symbol = json_symbol(nested).or_else(|| json_symbol(Some(row))).unwrap_or_default();
+    let stock_id = nested
+        .and_then(|s| s.get("id"))
+        .or_else(|| row.get("stock_id"))
+        .or_else(|| row.get("id"))
+        .and_then(json_i64)
+        .unwrap_or(0);
+    if symbol.is_empty() && stock_id <= 0 {
+        return None;
+    }
+    let quantity = json_field_f64(row, "quantity").unwrap_or(0.0);
+    let price = nested
+        .and_then(|s| s.get("price").or_else(|| s.get("close_price")))
+        .and_then(json_f64)
+        .or_else(|| json_field_f64(row, "price"))
+        .or_else(|| json_field_f64(row, "close_price"))
+        .unwrap_or(0.0);
+    let current_value = json_field_f64(row, "current_value").unwrap_or(quantity * price);
+    let buy_price = json_field_f64(row, "buy_price");
+    Some(WealthHolding {
+        stock_id,
+        symbol,
+        quantity,
+        current_value,
+        buy_price,
+        price,
+    })
+}
+
+fn parse_portfolio_snapshot(raw: &Value) -> WealthPortfolioSnapshot {
+    let root = if raw.get("stocks").is_some() {
+        raw
+    } else {
+        raw.get("data").unwrap_or(raw)
+    };
+    let stocks = root.get("stocks").and_then(|v| v.as_array());
+    let stocks_present = stocks.is_some();
+    let mut value_change_sum = 0.0;
+    let mut any_value_change = false;
+    let holdings: Vec<WealthHolding> = stocks
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|row| {
+                    if let Some(vc) = json_field_f64(row, "value_change") {
+                        value_change_sum += vc;
+                        any_value_change = true;
+                    }
+                    parse_stock_lot(row)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let stock_value = json_field_f64(root, "stock_value")
+        .filter(|v| *v > 0.0)
+        .unwrap_or_else(|| holdings.iter().map(|h| h.current_value).sum());
+    let profit = if any_value_change {
+        value_change_sum
+    } else {
+        json_field_f64(root, "profit").unwrap_or(0.0)
+    };
+    WealthPortfolioSnapshot {
+        balance: json_field_f64(root, "balance").unwrap_or(0.0),
+        profit,
+        stock_value,
+        holdings,
+        stocks_present,
     }
 }
 
@@ -105,6 +225,7 @@ pub struct WealthPortfolioSnapshot {
     pub profit: f64,
     pub stock_value: f64,
     pub holdings: Vec<WealthHolding>,
+    pub stocks_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -586,16 +707,11 @@ impl WealthClient {
                     .cloned();
                 let brokerage = wallet
                     .as_ref()
-                    .and_then(|w| w.get("brokerage_balance"))
-                    .and_then(|v| v.as_f64());
+                    .and_then(|w| json_field_f64(w, "brokerage_balance"));
                 let available = wallet
                     .as_ref()
-                    .and_then(|w| w.get("available_balance"))
-                    .and_then(|v| v.as_f64());
-                let current = wallet
-                    .as_ref()
-                    .and_then(|w| w.get("current_balance"))
-                    .and_then(|v| v.as_f64());
+                    .and_then(|w| json_field_f64(w, "available_balance"));
+                let current = wallet.as_ref().and_then(|w| json_field_f64(w, "current_balance"));
                 let display_name = root
                     .get("first_name")
                     .or_else(|| root.pointer("/user/first_name"))
@@ -680,18 +796,9 @@ impl WealthClient {
             .or_else(|| profile.pointer("/data/wallet"))
             .ok_or_else(|| anyhow!("Wealth profile missing wallet"))?;
         Ok(WealthWallet {
-            brokerage_balance: wallet
-                .get("brokerage_balance")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            available_balance: wallet
-                .get("available_balance")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            current_balance: wallet
-                .get("current_balance")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
+            brokerage_balance: json_field_f64(wallet, "brokerage_balance").unwrap_or(0.0),
+            available_balance: json_field_f64(wallet, "available_balance").unwrap_or(0.0),
+            current_balance: json_field_f64(wallet, "current_balance").unwrap_or(0.0),
         })
     }
 
@@ -703,55 +810,47 @@ impl WealthClient {
                 None,
             )
             .await?;
-        let root = if raw.get("stocks").is_some() {
-            &raw
-        } else {
-            raw.get("data").unwrap_or(&raw)
-        };
-        let holdings = root
-            .get("stocks")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| {
-                let stock = row.get("stock")?;
-                let symbol = stock.get("symbol")?.as_str()?.to_uppercase();
-                let stock_id = stock
-                    .get("id")
-                    .or_else(|| row.get("stock_id"))
-                    .and_then(|v| v.as_i64())?;
-                let quantity = row.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let price = stock
-                    .get("price")
-                    .or_else(|| stock.get("close_price"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let current_value = row
-                    .get("current_value")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(quantity * price);
-                let buy_price = row.get("buy_price").and_then(|v| v.as_f64());
-                Some(WealthHolding {
-                    stock_id,
-                    symbol,
-                    quantity,
-                    current_value,
-                    buy_price,
-                    price,
-                })
-            })
-            .collect();
+        let mut snap = parse_portfolio_snapshot(&raw);
+        self.fill_missing_symbols(&mut snap).await;
+        Ok(snap)
+    }
 
-        Ok(WealthPortfolioSnapshot {
-            balance: root.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            profit: root.get("profit").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            stock_value: root
-                .get("stock_value")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            holdings,
-        })
+    async fn fill_missing_symbols(&self, snap: &mut WealthPortfolioSnapshot) {
+        for h in &mut snap.holdings {
+            if crate::ngx::is_valid_ticker(&h.symbol) {
+                continue;
+            }
+            if h.stock_id <= 0 {
+                continue;
+            }
+            let Ok(raw) = self
+                .request_json(
+                    reqwest::Method::GET,
+                    &format!("/stocks/{}", h.stock_id),
+                    None,
+                )
+                .await
+            else {
+                continue;
+            };
+            let root = raw.get("data").unwrap_or(&raw);
+            if let Some(sym) = json_symbol(Some(root)) {
+                h.symbol = sym;
+            }
+            if h.price <= 0.0 {
+                h.price = json_field_f64(root, "price")
+                    .or_else(|| json_field_f64(root, "close_price"))
+                    .unwrap_or(0.0);
+            }
+            if h.buy_price.is_none() {
+                h.buy_price = root
+                    .pointer("/portfolio/buy_price")
+                    .and_then(json_f64);
+            }
+        }
+        snap.holdings.retain(|h| {
+            h.quantity > 0.0 && crate::ngx::is_valid_ticker(&h.symbol)
+        });
     }
 
     pub async fn market_is_open(&self) -> Result<bool> {
@@ -1174,4 +1273,333 @@ pub fn insert_broker_order(
         ],
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedWealthBook {
+    pub brokerage_balance: f64,
+    pub stock_value: f64,
+    pub profit: f64,
+    pub synced_at: String,
+    pub holdings: Vec<WealthHolding>,
+}
+
+impl CachedWealthBook {
+    pub fn from_snapshot(snap: &WealthPortfolioSnapshot, cash: f64, synced_at: String) -> Self {
+        let stock_value = if snap.stock_value > 0.0 {
+            snap.stock_value
+        } else {
+            snap.holdings.iter().map(|h| h.current_value).sum()
+        };
+        Self {
+            brokerage_balance: cash,
+            stock_value,
+            profit: snap.profit,
+            synced_at,
+            holdings: snap.holdings.clone(),
+        }
+    }
+
+    pub fn market_value(&self) -> f64 {
+        let from_lots: f64 = self
+            .holdings
+            .iter()
+            .filter(|h| h.quantity > 0.0)
+            .map(|h| h.current_value)
+            .sum();
+        if self.holdings.iter().any(|h| h.quantity > 0.0) {
+            from_lots
+        } else {
+            self.stock_value
+        }
+    }
+}
+
+pub struct WealthSyncService;
+
+impl WealthSyncService {
+    pub async fn refresh(
+        db: &crate::db::Database,
+        client: &WealthClient,
+    ) -> Result<CachedWealthBook> {
+        let previous = Self::load(db).ok().flatten();
+        let snap = client.get_portfolio().await?;
+        let wallet = client.get_wallet().await.ok();
+        let cash = pick_cash(
+            wallet.as_ref(),
+            previous.as_ref().map(|b| b.brokerage_balance),
+        );
+
+        if !snap.stocks_present && snap.holdings.is_empty() {
+            if let Some(prev) = previous.filter(|p| !p.holdings.is_empty() || p.stock_value > 0.0) {
+                tracing::warn!(
+                    target: "wealth",
+                    "refusing to overwrite Wealth cache; portfolio response missing stocks"
+                );
+                return Ok(CachedWealthBook {
+                    brokerage_balance: cash,
+                    ..prev
+                });
+            }
+        }
+
+        db.with_conn(|conn| persist_snapshot(conn, &snap, cash))?;
+        db.with_conn(load_snapshot)?
+            .ok_or_else(|| anyhow!("Wealth cache empty after persist"))
+    }
+
+    pub fn load(db: &crate::db::Database) -> Result<Option<CachedWealthBook>> {
+        db.with_conn(load_snapshot)
+    }
+}
+
+pub fn persist_snapshot(
+    conn: &rusqlite::Connection,
+    snap: &WealthPortfolioSnapshot,
+    cash: f64,
+) -> Result<()> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    let result = (|| {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let stock_value = if snap.stock_value > 0.0 {
+            snap.stock_value
+        } else {
+            snap.holdings.iter().map(|h| h.current_value).sum()
+        };
+        conn.execute("DELETE FROM wealth_positions", [])?;
+        for h in &snap.holdings {
+            if h.quantity <= 0.0 || !crate::ngx::is_valid_ticker(&h.symbol) {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO instruments (symbol, name, sector, is_active)
+                 VALUES (?1, ?1, 'Unknown', 1)
+                 ON CONFLICT(symbol) DO UPDATE SET is_active = 1",
+                [&h.symbol],
+            )?;
+            conn.execute(
+                "INSERT INTO wealth_positions (symbol, stock_id, quantity, avg_cost, last_price, current_value, synced_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    h.symbol,
+                    h.stock_id,
+                    h.quantity,
+                    h.buy_price.unwrap_or(h.price),
+                    h.price,
+                    h.current_value,
+                    now,
+                ],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO wealth_account (id, brokerage_balance, stock_value, profit, synced_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+               brokerage_balance = excluded.brokerage_balance,
+               stock_value = excluded.stock_value,
+               profit = excluded.profit,
+               synced_at = excluded.synced_at",
+            rusqlite::params![cash, stock_value, snap.profit, now],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute("COMMIT", [])?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
+pub fn load_snapshot(conn: &rusqlite::Connection) -> Result<Option<CachedWealthBook>> {
+    let account: Option<(f64, f64, f64, String)> = conn
+        .query_row(
+            "SELECT brokerage_balance, stock_value, profit, synced_at FROM wealth_account WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((brokerage_balance, stock_value, profit, synced_at)) = account else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT symbol, stock_id, quantity, avg_cost, last_price, current_value
+         FROM wealth_positions WHERE quantity > 0 ORDER BY symbol",
+    )?;
+    let holdings = stmt
+        .query_map([], |row| {
+            Ok(WealthHolding {
+                symbol: row.get(0)?,
+                stock_id: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                quantity: row.get(2)?,
+                buy_price: Some(row.get(3)?),
+                price: row.get(4)?,
+                current_value: row.get(5)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(Some(CachedWealthBook {
+        brokerage_balance,
+        stock_value,
+        profit,
+        synced_at,
+        holdings,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn json_f64_parses_numbers_and_numeric_strings() {
+        assert_eq!(json_f64(&json!(125000.5)), Some(125000.5));
+        assert_eq!(json_f64(&json!(12)), Some(12.0));
+        assert_eq!(json_f64(&json!("1,250,000.25")), Some(1_250_000.25));
+        assert_eq!(json_f64(&json!("")), None);
+        assert_eq!(json_f64(&json!(null)), None);
+    }
+
+    #[test]
+    fn pick_cash_uses_brokerage_only() {
+        let wallet = WealthWallet {
+            brokerage_balance: 80_000.0,
+            available_balance: 120_000.0,
+            current_balance: 150_000.0,
+        };
+        assert_eq!(pick_cash(Some(&wallet), Some(500_000.0)), 80_000.0);
+        assert_eq!(pick_cash(None, Some(80_000.0)), 80_000.0);
+        assert_eq!(
+            pick_cash(
+                Some(&WealthWallet {
+                    brokerage_balance: 0.0,
+                    available_balance: 12_000.0,
+                    current_balance: 50_000.0,
+                }),
+                Some(1.0)
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn parse_portfolio_stocks_ignores_funds() {
+        let raw = json!({
+            "id": 1,
+            "balance": 500000.00,
+            "profit": 25000.00,
+            "stock_value": 300000.00,
+            "fund_value": 200000.00,
+            "stocks": [{
+                "id": 1,
+                "stock_id": 42,
+                "quantity": 100,
+                "current_value": 150000.00,
+                "value_change": 5000.00,
+                "stock": {
+                    "id": 42,
+                    "symbol": "DANGCEM",
+                    "close_price": 1500.00,
+                    "price": 1500.00
+                }
+            }],
+            "mutual_funds": [{ "id": 9, "current_value": 200000.00 }]
+        });
+        let snap = parse_portfolio_snapshot(&raw);
+        assert!(snap.stocks_present);
+        assert_eq!(snap.holdings.len(), 1);
+        assert_eq!(snap.holdings[0].symbol, "DANGCEM");
+        assert_eq!(snap.holdings[0].quantity, 100.0);
+        assert_eq!(snap.holdings[0].stock_id, 42);
+        assert_eq!(snap.stock_value, 300000.0);
+        assert_eq!(snap.profit, 5000.0);
+        assert_eq!(snap.balance, 500000.0);
+    }
+
+    #[test]
+    fn parse_portfolio_flat_lots_and_string_ids() {
+        let raw = json!({
+            "data": {
+                "stock_value": "0",
+                "stocks": [{
+                    "symbol": "gtco",
+                    "stock_id": "7",
+                    "quantity": "50",
+                    "price": "45.5",
+                    "current_value": "2275"
+                }]
+            }
+        });
+        let snap = parse_portfolio_snapshot(&raw);
+        assert_eq!(snap.holdings.len(), 1);
+        assert_eq!(snap.holdings[0].symbol, "GTCO");
+        assert_eq!(snap.holdings[0].stock_id, 7);
+        assert_eq!(snap.holdings[0].quantity, 50.0);
+        assert_eq!(snap.stock_value, 2275.0);
+    }
+
+    #[test]
+    fn parse_portfolio_empty_stocks_is_real_empty_book() {
+        let raw = json!({
+            "balance": 1000,
+            "stock_value": 0,
+            "fund_value": 8000,
+            "stocks": [],
+            "mutual_funds": [{ "current_value": 8000 }]
+        });
+        let snap = parse_portfolio_snapshot(&raw);
+        assert!(snap.stocks_present);
+        assert!(snap.holdings.is_empty());
+        assert_eq!(snap.stock_value, 0.0);
+    }
+
+    #[test]
+    fn parse_portfolio_lots_without_nested_symbol() {
+        let raw = json!({
+            "stock_value": 8070.9,
+            "stocks": [{
+                "id": 1,
+                "stock_id": 42,
+                "quantity": 10,
+                "current_value": 1500,
+                "stock": {
+                    "id": 42,
+                    "close_price": 150,
+                    "company_name": "Dangote Cement Plc",
+                    "icon_url": "https://example"
+                }
+            }]
+        });
+        let snap = parse_portfolio_snapshot(&raw);
+        assert_eq!(snap.holdings.len(), 1);
+        assert_eq!(snap.holdings[0].stock_id, 42);
+        assert_eq!(snap.holdings[0].quantity, 10.0);
+        assert_eq!(snap.holdings[0].price, 150.0);
+        assert!(snap.holdings[0].symbol.is_empty());
+    }
+
+    #[test]
+    fn market_value_sums_lot_current_value_when_holdings_exist() {
+        let book = CachedWealthBook {
+            brokerage_balance: 1501.72,
+            stock_value: 8070.9,
+            profit: 0.0,
+            synced_at: "2026-08-14T15:00:00Z".into(),
+            holdings: vec![WealthHolding {
+                stock_id: 1,
+                symbol: "CWG".into(),
+                quantity: 59.0,
+                current_value: 1262.6,
+                buy_price: Some(21.54),
+                price: 21.4,
+            }],
+        };
+        assert_eq!(book.market_value(), 1262.6);
+    }
 }

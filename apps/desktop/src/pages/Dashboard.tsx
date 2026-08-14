@@ -10,6 +10,7 @@ import {
 } from 'recharts';
 import { IconShieldAlert, IconShieldCheck, IconSpinner } from '../components/Icons';
 import { api, type PortfolioData } from '../lib/api';
+import { formatNaira } from '../lib/format';
 import { useCycle } from '../lib/cycle';
 import { useToast } from '../lib/toast';
 import { Link } from 'react-router-dom';
@@ -58,7 +59,9 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
     unrealized_pnl: Number((raw as { unrealized_pnl?: number; unrealizedPnl?: number }).unrealized_pnl
       ?? (raw as { unrealizedPnl?: number }).unrealizedPnl
       ?? 0),
-    quotesAsOf: (raw as { quotesAsOf?: string }).quotesAsOf ?? null,
+    quotesAsOf: (raw as { quotesAsOf?: string; syncedAt?: string }).quotesAsOf
+      ?? (raw as { syncedAt?: string }).syncedAt
+      ?? null,
     stale: Boolean((raw as { stale?: boolean }).stale),
     tradingMode: (raw as { tradingMode?: string }).tradingMode || 'sandbox',
     tradingVerified: raw.tradingVerified ?? raw.wealthStatus?.tradingVerified,
@@ -156,19 +159,67 @@ export default function DashboardPage() {
           unrealized_pnl?: number;
           quotesAsOf?: string;
           stale?: boolean;
+          tradingMode?: string;
           portfolio?: { cash_balance?: number };
         }>('portfolio_quotes');
         if (cancelled) return;
         setData((prev) => {
           if (!prev) return prev;
           const stale = Boolean(q.stale);
-          const keep = (next: number | undefined, current: number) => {
+          const quoteLots = (q.positions ?? []).some((p) => Number(p.quantity) > 0);
+          const keep = (next: number | undefined, current: number, rejectZero = false) => {
             if (stale) return current;
             if (next == null || !Number.isFinite(Number(next))) return current;
-            return Number(next);
+            const n = Number(next);
+            if (rejectZero && n === 0 && current !== 0) return current;
+            return n;
           };
-          const cash = Number(q.portfolio?.cash_balance ?? prev.portfolio?.cash_balance);
-          const marketValue = keep(q.market_value, prev.market_value);
+          const cashRaw = Number(q.portfolio?.cash_balance);
+          const cashCollapsed =
+            Number.isFinite(cashRaw)
+            && cashRaw === 0
+            && Number(prev.portfolio?.cash_balance) > 0
+            && (stale || (Number(q.market_value) === 0 && quoteLots));
+          const quoteMode = q.tradingMode || 'sandbox';
+          const liveQuote = prev.tradingMode === 'live' && quoteMode === 'live';
+          const cash = cashCollapsed || stale || !Number.isFinite(cashRaw) || (prev.tradingMode === 'live' && !liveQuote)
+            ? Number(prev.portfolio?.cash_balance ?? 0)
+            : cashRaw;
+          if (prev.tradingMode === 'live') {
+            const positions = liveQuote && quoteLots && !stale
+              ? (q.positions ?? prev.positions)
+              : prev.positions;
+            const liveMvFromLots = positions.reduce((sum, p) => sum + Number(p.market_value || 0), 0);
+            const liveMv = positions.length > 0
+              ? liveMvFromLots
+              : (Number(prev.market_value) > 0 ? Number(prev.market_value) : liveMvFromLots);
+            return {
+              ...prev,
+              positions,
+              market_value: liveMv,
+              total_equity: cash + liveMv,
+              pnl_today: keep(q.pnl_today, prev.pnl_today),
+              unrealized_pnl: keep(q.unrealized_pnl, prev.unrealized_pnl ?? 0),
+              quotesAsOf: q.quotesAsOf ?? prev.quotesAsOf,
+              stale,
+              portfolio: {
+                ...prev.portfolio,
+                cash_balance: cash,
+              },
+            };
+          }
+          const marketValue = keep(q.market_value, prev.market_value, quoteLots);
+          const wipe = !stale
+            && Number(q.total_equity) === 0
+            && Number(prev.total_equity) > 0
+            && (quoteLots || Number(prev.market_value) > 0);
+          if (wipe) {
+            return {
+              ...prev,
+              quotesAsOf: q.quotesAsOf ?? prev.quotesAsOf,
+              stale: true,
+            };
+          }
           return {
             ...prev,
             positions: stale ? prev.positions : (q.positions ?? prev.positions),
@@ -215,6 +266,10 @@ export default function DashboardPage() {
       ]);
       const portfolio = normalizePortfolio(portfolioRaw);
       setData((prev) => {
+        if (prev?.tradingMode === 'live' && portfolio.tradingMode !== 'live') {
+          return prev;
+        }
+        if (portfolio.tradingMode === 'live') return portfolio;
         if (!prev?.quotesAsOf) return portfolio;
         const cash = Number(portfolio.portfolio?.cash_balance ?? prev.portfolio?.cash_balance);
         return {
@@ -287,11 +342,6 @@ export default function DashboardPage() {
   }
 
   const cycleBlocked = cycleRunning || cycleBusy;
-
-  const formatNaira = (n: number | null | undefined) => {
-    const value = Number(n ?? 0);
-    return `₦${(Number.isFinite(value) ? value : 0).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
-  };
 
   const chartData = useMemo(
     () =>
@@ -408,7 +458,7 @@ export default function DashboardPage() {
               {market.pulseStatus ? ` · Pulse: ${market.pulseStatus}` : ''}
               {!market.marketHoursEnforced ? ' · Hours bypassed (dev)' : ''}
               {data?.quotesAsOf
-                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : ' · Pulse'}`
+                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : data.tradingMode === 'live' ? ' · Wealth' : ' · Pulse'}`
                 : ''}
             </p>
           ) : null}
