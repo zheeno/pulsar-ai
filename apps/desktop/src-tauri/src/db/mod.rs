@@ -48,8 +48,28 @@ impl Database {
             .context("run order_intents migration")?;
         conn.execute_batch(include_str!("../../migrations/006_wealth_positions.sql"))
             .context("run wealth_positions migration")?;
+        conn.execute_batch(include_str!("../../migrations/007_bamboo.sql"))
+            .context("run bamboo cache migration")?;
+        Self::add_column_if_missing(conn, "broker_orders", "external_order_ref", "TEXT")?;
+        Self::add_column_if_missing(conn, "order_intents", "external_order_ref", "TEXT")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+        let has: bool = conn
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == column);
+        if !has {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"),
+                [],
+            )
+            .with_context(|| format!("add {table}.{column}"))?;
+        }
         Ok(())
     }
 

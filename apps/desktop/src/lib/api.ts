@@ -13,7 +13,7 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     return { payload: args };
   }
 
-  if (command === 'set_selected_broker' || command === 'wealth_login' || command === 'wealth_verify_2fa') {
+  if (command === 'set_selected_broker' || command === 'wealth_login' || command === 'wealth_verify_2fa' || command === 'bamboo_login') {
     return { payload: args };
   }
 
@@ -65,6 +65,8 @@ export interface AppSettings {
   selectedBroker?: string;
   wealthEmail?: string | null;
   wealthConnected?: boolean;
+  bambooPhone?: string | null;
+  bambooConnected?: boolean;
   liveTradingEnabled?: boolean;
   scheduledLiveAuthorized?: boolean;
   maxLiveNotional?: number;

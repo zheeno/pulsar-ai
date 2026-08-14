@@ -7,6 +7,7 @@ pub struct OrderIntent {
     pub id: String,
     pub client_order_id: String,
     pub external_order_id: Option<i64>,
+    pub external_order_ref: Option<String>,
     pub signal_id: Option<String>,
     pub symbol: String,
     pub side: String,
@@ -24,6 +25,7 @@ pub fn insert_intent(
     side: &str,
     qty: f64,
     quote: f64,
+    venue: &str,
 ) -> Result<OrderIntent> {
     let id = Uuid::new_v4().to_string();
     let client_order_id = Uuid::new_v4().to_string();
@@ -31,7 +33,7 @@ pub fn insert_intent(
         "INSERT INTO order_intents (
             id, client_order_id, cycle_id, signal_id, symbol, side,
             requested_qty, requested_quote, requested_notional, venue, state
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'wealth', 'created')",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'created')",
         rusqlite::params![
             id,
             client_order_id,
@@ -42,12 +44,14 @@ pub fn insert_intent(
             qty,
             quote,
             qty * quote,
+            venue,
         ],
     )?;
     Ok(OrderIntent {
         id,
         client_order_id,
         external_order_id: None,
+        external_order_ref: None,
         signal_id: signal_id.map(str::to_string),
         symbol: symbol.into(),
         side: side.into(),
@@ -58,10 +62,14 @@ pub fn insert_intent(
     })
 }
 
-pub fn mark_submitted(conn: &Connection, id: &str, external_order_id: Option<i64>) -> Result<()> {
+pub fn mark_submitted(conn: &Connection, id: &str, external_order_ref: Option<&str>) -> Result<()> {
+    let numeric = external_order_ref.and_then(|s| s.parse::<i64>().ok());
     conn.execute(
-        "UPDATE order_intents SET state = 'submitted', external_order_id = COALESCE(?2, external_order_id), updated_at = datetime('now') WHERE id = ?1",
-        rusqlite::params![id, external_order_id],
+        "UPDATE order_intents SET state = 'submitted',
+            external_order_ref = COALESCE(?2, external_order_ref),
+            external_order_id = COALESCE(?3, external_order_id),
+            updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, external_order_ref, numeric],
     )?;
     Ok(())
 }
@@ -70,12 +78,16 @@ pub fn mark_terminal(
     conn: &Connection,
     id: &str,
     state: &str,
-    external_order_id: Option<i64>,
+    external_order_ref: Option<&str>,
     error: Option<&str>,
 ) -> Result<()> {
+    let numeric = external_order_ref.and_then(|s| s.parse::<i64>().ok());
     conn.execute(
-        "UPDATE order_intents SET state = ?2, external_order_id = COALESCE(?3, external_order_id), last_error = ?4, updated_at = datetime('now') WHERE id = ?1",
-        rusqlite::params![id, state, external_order_id, error],
+        "UPDATE order_intents SET state = ?2,
+            external_order_ref = COALESCE(?3, external_order_ref),
+            external_order_id = COALESCE(?4, external_order_id),
+            last_error = ?5, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, state, external_order_ref, numeric, error],
     )?;
     Ok(())
 }
@@ -122,21 +134,24 @@ pub fn ambiguous_pending(conn: &Connection) -> Result<bool> {
 
 pub fn load_open_intents(conn: &Connection) -> Result<Vec<OrderIntent>> {
     let mut stmt = conn.prepare(
-        "SELECT id, client_order_id, external_order_id, signal_id, symbol, side, requested_qty, requested_quote, requested_notional, state
+        "SELECT id, client_order_id, external_order_id, external_order_ref, signal_id, symbol, side, requested_qty, requested_quote, requested_notional, state
          FROM order_intents WHERE state IN ('created', 'submitted', 'unknown')",
     )?;
     let rows = stmt.query_map([], |row| {
+        let numeric: Option<i64> = row.get(2)?;
+        let pref: Option<String> = row.get(3)?;
         Ok(OrderIntent {
             id: row.get(0)?,
             client_order_id: row.get(1)?,
-            external_order_id: row.get(2)?,
-            signal_id: row.get(3)?,
-            symbol: row.get(4)?,
-            side: row.get(5)?,
-            requested_qty: row.get(6)?,
-            requested_quote: row.get(7)?,
-            requested_notional: row.get(8)?,
-            state: row.get(9)?,
+            external_order_id: numeric,
+            external_order_ref: pref.or_else(|| numeric.map(|n| n.to_string())),
+            signal_id: row.get(4)?,
+            symbol: row.get(5)?,
+            side: row.get(6)?,
+            requested_qty: row.get(7)?,
+            requested_quote: row.get(8)?,
+            requested_notional: row.get(9)?,
+            state: row.get(10)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())

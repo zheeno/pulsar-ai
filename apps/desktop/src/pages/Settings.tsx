@@ -89,7 +89,7 @@ const BROKER_LOGOS: Record<string, string> = {
 
 const DEFAULT_BROKERS: BrokerListItem[] = [
   { id: 'wealth', name: 'Coronation Wealth', available: true, connected: false },
-  { id: 'bamboo', name: 'Bamboo', available: false, connected: false },
+  { id: 'bamboo', name: 'Bamboo', available: true, connected: false },
 ];
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -244,6 +244,11 @@ export default function SettingsPage() {
   const [wealth2fa, setWealth2fa] = useState('');
   const [wealthTempToken, setWealthTempToken] = useState<string | null>(null);
   const [wealthBusy, setWealthBusy] = useState(false);
+  const [bambooPhone, setBambooPhone] = useState('');
+  const [bambooPassword, setBambooPassword] = useState('');
+  const [bambooPin, setBambooPin] = useState('');
+  const [brokerModalOpen, setBrokerModalOpen] = useState(false);
+  const brokerModalTitleId = useId();
   const [strategyDraft, setStrategyDraft] = useState<StrategyDraft | null>(null);
   const [autoCycleEnabled, setAutoCycleEnabled] = useState(false);
   const [autoCycleMinutes, setAutoCycleMinutes] = useState(30);
@@ -283,7 +288,7 @@ export default function SettingsPage() {
     } catch {
       setBrokers([
         { id: 'wealth', name: 'Coronation Wealth', available: true, connected: !!s.wealthConnected },
-        { id: 'bamboo', name: 'Bamboo', available: false, connected: false },
+        { id: 'bamboo', name: 'Bamboo', available: true, connected: !!s.bambooConnected },
       ]);
     }
     try {
@@ -302,9 +307,14 @@ export default function SettingsPage() {
       });
     }
     try {
-      const w = await api<WealthProfile>('wealth_profile');
+      const cmd = (s.selectedBroker || 'wealth') === 'bamboo' ? 'bamboo_profile' : 'wealth_profile';
+      const w = await api<WealthProfile>(cmd);
       setWealth(w);
-      if (w.email) setWealthEmail(w.email);
+      if ((s.selectedBroker || 'wealth') === 'bamboo') {
+        if (s.bambooPhone) setBambooPhone(s.bambooPhone);
+      } else if (w.email) {
+        setWealthEmail(w.email);
+      }
     } catch {
       setWealth({
         ok: false,
@@ -312,7 +322,7 @@ export default function SettingsPage() {
         tradingVerified: false,
         tradingMode: 'sandbox',
         baseUrl: '',
-        message: 'Wealth status unavailable.',
+        message: 'Broker status unavailable.',
       });
     }
   }
@@ -404,24 +414,58 @@ export default function SettingsPage() {
     }
   }
 
+  useEffect(() => {
+    if (!brokerModalOpen) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape' && !wealthBusy) closeBrokerModal();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [brokerModalOpen, wealthBusy]);
+
+  function closeBrokerModal() {
+    if (wealthBusy) return;
+    setBrokerModalOpen(false);
+    setWealthTempToken(null);
+    setWealth2fa('');
+    setWealthPassword('');
+    setBambooPassword('');
+    setBambooPin('');
+  }
+
+  function brokerIsConnected(id: string, s: AppSettings | null) {
+    if (id === 'bamboo') return Boolean(s?.bambooConnected);
+    return Boolean(s?.wealthConnected);
+  }
+
   async function selectBroker(next: string) {
-    if (wealthBusy || next === selectedBroker) return;
-    setWealthBusy(true);
-    try {
-      const updated = await api<AppSettings>('set_selected_broker', { brokerId: next });
-      setSettings(updated);
-      setSelectedBroker(updated.selectedBroker || next);
-      toast.success(
-        next === 'bamboo'
-          ? 'Bamboo selected. Live orders stay in sandbox until Bamboo is integrated.'
-          : 'Coronation Wealth selected as the live broker.',
-        'Live broker',
-      );
-      await refresh();
-    } catch (err) {
-      toast.error(String(err), 'Could not change broker');
-    } finally {
-      setWealthBusy(false);
+    if (wealthBusy) return;
+    const switching = next !== selectedBroker;
+    if (switching) {
+      setWealthBusy(true);
+      try {
+        const updated = await api<AppSettings>('set_selected_broker', { brokerId: next });
+        setSettings(updated);
+        setSelectedBroker(updated.selectedBroker || next);
+        toast.success(
+          next === 'bamboo'
+            ? 'Bamboo selected as the live broker.'
+            : 'Coronation Wealth selected as the live broker.',
+          'Live broker',
+        );
+        await refresh();
+        if (!brokerIsConnected(next, updated)) {
+          setBrokerModalOpen(true);
+        }
+      } catch (err) {
+        toast.error(String(err), 'Could not change broker');
+      } finally {
+        setWealthBusy(false);
+      }
+      return;
+    }
+    if (!brokerIsConnected(next, settings) && !wealth?.connected) {
+      setBrokerModalOpen(true);
     }
   }
 
@@ -580,8 +624,8 @@ export default function SettingsPage() {
       <section className="panel" aria-labelledby="broker-heading" style={{ marginTop: 20 }}>
         <h2 id="broker-heading">Live broker</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
-          One live broker at a time. Pulse stays the market-data source. Without a connected live
-          broker, Pulsar runs in sandbox mode.
+          One live broker at a time. Pulse stays the market-data source. Click a broker to select it
+          and connect. Without a connected live broker, Pulsar runs in sandbox mode.
         </p>
         <div className="broker-grid" role="radiogroup" aria-labelledby="broker-heading">
           {(brokers.length ? brokers : DEFAULT_BROKERS).map((b) => {
@@ -613,214 +657,89 @@ export default function SettingsPage() {
         </div>
       </section>
 
+      {wealth?.connected ? (
       <section className="panel" aria-labelledby="wealth-heading" style={{ marginTop: 20 }}>
-        <h2 id="wealth-heading">Coronation Wealth</h2>
+        <h2 id="wealth-heading">{selectedBroker === 'bamboo' ? 'Bamboo' : 'Coronation Wealth'}</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
-          Without a connected Wealth account, Pulsar runs in sandbox mode. Connect a trading-verified
-          account to switch to live trader mode — cash and portfolio come from Wealth, and approved
-          signals place real market orders.
+          {selectedBroker === 'bamboo'
+            ? 'Cash and lots come from Bamboo. Approved signals place real NGX market orders when live trading is on.'
+            : 'Cash and portfolio come from Wealth. Approved signals place real market orders when live trading is on.'}
         </p>
-
-        {selectedBroker === 'bamboo' ? (
-          <div className="banner banner-warn" role="status">
-            Coming soon — live orders stay in sandbox until Bamboo is integrated.
-            {settings?.wealthConnected
-              ? ' Your Wealth account stays saved and idle until you select Coronation Wealth again.'
-              : ''}
+        <div className="profile-card__badges" style={{ marginBottom: 12 }}>
+          <span className={`status-pill ${wealth.tradingMode === 'live' ? 'status-pill--ok' : 'status-pill--warn'}`}>
+            <span className={`live-dot ${wealth.tradingMode === 'live' ? '' : 'live-dot--off'}`} aria-hidden />
+            {wealth.tradingMode === 'live' ? 'Live trader' : 'Sandbox (not verified)'}
+          </span>
+          {wealth.tradingProfile ? (
+            <span className="status-pill status-pill--muted">
+              Trading profile: {wealth.tradingProfile}
+            </span>
+          ) : null}
+        </div>
+        <dl className="profile-meta">
+          <div className="profile-meta__item">
+            <dt>Account</dt>
+            <dd>{wealth.displayName || wealth.email || '—'}</dd>
           </div>
-        ) : wealth?.connected ? (
-          <>
-            <div className="profile-card__badges" style={{ marginBottom: 12 }}>
-              <span className={`status-pill ${wealth.tradingMode === 'live' ? 'status-pill--ok' : 'status-pill--warn'}`}>
-                <span className={`live-dot ${wealth.tradingMode === 'live' ? '' : 'live-dot--off'}`} aria-hidden />
-                {wealth.tradingMode === 'live' ? 'Live trader' : 'Sandbox (not verified)'}
-              </span>
-              {wealth.tradingProfile ? (
-                <span className="status-pill status-pill--muted">
-                  Trading profile: {wealth.tradingProfile}
-                </span>
-              ) : null}
-            </div>
-            <dl className="profile-meta">
-              <div className="profile-meta__item">
-                <dt>Account</dt>
-                <dd>{wealth.displayName || wealth.email || '—'}</dd>
-              </div>
-              <div className="profile-meta__item">
-                <dt>Brokerage balance</dt>
-                <dd className="mono">
-                  {wealth.brokerageBalance != null ? formatNaira(wealth.brokerageBalance) : '—'}
-                </dd>
-              </div>
-              <div className="profile-meta__item">
-                <dt>API</dt>
-                <dd className="mono" style={{ fontSize: 12 }}>{wealth.baseUrl || '—'}</dd>
-              </div>
-            </dl>
-            {!wealth.ok && (
-              <div className="banner banner-bad" style={{ marginTop: 12 }} role="status">
-                {wealth.message}
-              </div>
-            )}
-            {wealth.ok && !wealth.tradingVerified && (
-              <div className="banner banner-warn" style={{ marginTop: 12 }} role="status">
-                {wealth.message}
-              </div>
-            )}
-            <div style={{ marginTop: 16 }}>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                disabled={wealthBusy}
-                onClick={() => {
-                  void (async () => {
-                    setWealthBusy(true);
-                    try {
-                      await api('wealth_logout');
-                      setWealthTempToken(null);
-                      setWealthPassword('');
-                      setWealth2fa('');
-                      toast.success('Wealth account disconnected. Sandbox mode restored.', 'Wealth');
-                      await refresh();
-                    } catch (e) {
-                      toast.error(String(e), 'Wealth logout failed');
-                    } finally {
-                      setWealthBusy(false);
-                    }
-                  })();
-                }}
-              >
-                {wealthBusy ? <IconSpinner /> : null}
-                Disconnect Wealth
-              </button>
-            </div>
-          </>
-        ) : wealthTempToken ? (
-          <div className="form-stack" style={{ maxWidth: 420 }}>
-            <label>
-              <span>2FA code</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                value={wealth2fa}
-                onChange={(e) => setWealth2fa(e.target.value)}
-                placeholder="Enter authentication code"
-              />
-            </label>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                type="button"
-                className="btn btn-primary"
-                disabled={wealthBusy || !wealth2fa.trim()}
-                onClick={() => {
-                  void (async () => {
-                    setWealthBusy(true);
-                    try {
-                      const result = await api<WealthLoginResult>('wealth_verify_2fa', {
-                        email: wealthEmail.trim(),
-                        tempToken: wealthTempToken,
-                        code: wealth2fa.trim(),
-                      });
-                      if (!result.ok) {
-                        toast.error(result.message, 'Wealth 2FA');
-                        return;
-                      }
-                      setWealthTempToken(null);
-                      setWealthPassword('');
-                      setWealth2fa('');
-                      toast.success(result.message, 'Wealth');
-                      await refresh();
-                    } catch (e) {
-                      toast.error(String(e), 'Wealth 2FA');
-                    } finally {
-                      setWealthBusy(false);
-                    }
-                  })();
-                }}
-              >
-                {wealthBusy ? <IconSpinner /> : null}
-                Verify
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                disabled={wealthBusy}
-                onClick={() => {
-                  setWealthTempToken(null);
-                  setWealth2fa('');
-                }}
-              >
-                Cancel
-              </button>
-            </div>
+          <div className="profile-meta__item">
+            <dt>Brokerage balance</dt>
+            <dd className="mono">
+              {wealth.brokerageBalance != null ? formatNaira(wealth.brokerageBalance) : '—'}
+            </dd>
           </div>
-        ) : (
-          <div className="form-stack" style={{ maxWidth: 420 }}>
-            <label>
-              <span>Email</span>
-              <input
-                type="email"
-                autoComplete="username"
-                value={wealthEmail}
-                onChange={(e) => setWealthEmail(e.target.value)}
-                placeholder="you@example.com"
-              />
-            </label>
-            <label>
-              <span>Password</span>
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={wealthPassword}
-                onChange={(e) => setWealthPassword(e.target.value)}
-                placeholder="Wealth app password"
-              />
-            </label>
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={wealthBusy || !wealthEmail.trim() || !wealthPassword}
-              onClick={() => {
-                void (async () => {
-                  setWealthBusy(true);
-                  try {
-                    const result = await api<WealthLoginResult>('wealth_login', {
-                      email: wealthEmail.trim(),
-                      password: wealthPassword,
-                    });
-                    if (result.needs2fa && result.tempToken) {
-                      setWealthTempToken(result.tempToken);
-                      toast.info('Enter your 2FA code to finish connecting.', 'Wealth');
-                      return;
-                    }
-                    if (!result.ok) {
-                      toast.error(result.message, 'Wealth login');
-                      return;
-                    }
-                    setWealthPassword('');
-                    toast.success(result.message, 'Wealth');
-                    await refresh();
-                  } catch (e) {
-                    toast.error(String(e), 'Wealth login');
-                  } finally {
-                    setWealthBusy(false);
-                  }
-                })();
-              }}
-            >
-              {wealthBusy ? <IconSpinner /> : null}
-              Connect Wealth
-            </button>
+        </dl>
+        {!wealth.ok && (
+          <div className="banner banner-bad" style={{ marginTop: 12 }} role="status">
+            {wealth.message}
           </div>
         )}
+        {wealth.ok && !wealth.tradingVerified && (
+          <div className="banner banner-warn" style={{ marginTop: 12 }} role="status">
+            {wealth.message}
+          </div>
+        )}
+        <div style={{ marginTop: 16 }}>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            disabled={wealthBusy}
+            onClick={() => {
+              void (async () => {
+                setWealthBusy(true);
+                try {
+                  if (selectedBroker === 'bamboo') {
+                    await api('bamboo_logout');
+                    setBambooPassword('');
+                    setBambooPin('');
+                    toast.success('Bamboo account disconnected. Sandbox mode restored.', 'Bamboo');
+                  } else {
+                    await api('wealth_logout');
+                    setWealthTempToken(null);
+                    setWealthPassword('');
+                    setWealth2fa('');
+                    toast.success('Wealth account disconnected. Sandbox mode restored.', 'Wealth');
+                  }
+                  await refresh();
+                } catch (e) {
+                  toast.error(String(e), selectedBroker === 'bamboo' ? 'Bamboo logout failed' : 'Wealth logout failed');
+                } finally {
+                  setWealthBusy(false);
+                }
+              })();
+            }}
+          >
+            {wealthBusy ? <IconSpinner /> : null}
+            Disconnect {selectedBroker === 'bamboo' ? 'Bamboo' : 'Wealth'}
+          </button>
+        </div>
       </section>
+      ) : null}
 
       <section className="panel" aria-labelledby="strategy-heading">
         <h2 id="strategy-heading">Strategy</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
           {wealth?.tradingMode === 'live'
-            ? 'Risk and sizing for live Wealth orders. The trading universe is all active NGX instruments from Pulse.'
+            ? `Risk and sizing for live ${selectedBroker === 'bamboo' ? 'Bamboo' : 'Wealth'} orders. The trading universe is all active NGX instruments from Pulse.`
             : 'Risk and sizing for the sandbox. The trading universe is all active NGX instruments from Pulse.'}
         </p>
 
@@ -1078,6 +997,254 @@ export default function SettingsPage() {
           </button>
         </div>
       </section>
+
+      {brokerModalOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) closeBrokerModal();
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={brokerModalTitleId}
+          >
+            <div className="modal__header">
+              <div>
+                <h2 id={brokerModalTitleId}>
+                  {selectedBroker === 'bamboo' ? 'Connect Bamboo' : 'Connect Wealth'}
+                </h2>
+                <p className="muted" style={{ margin: '6px 0 0', fontSize: 13 }}>
+                  {selectedBroker === 'bamboo'
+                    ? 'Sign in with your Bamboo phone and password. A CSCS-ready NGX account is required for live orders.'
+                    : 'Sign in with your Coronation Wealth email and password. A trading-verified account is required for live orders.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal__close"
+                aria-label="Close"
+                onClick={closeBrokerModal}
+                disabled={wealthBusy}
+              >
+                ×
+              </button>
+            </div>
+
+            {selectedBroker === 'bamboo' ? (
+              <div className="form-stack">
+                <label>
+                  <span>Phone number</span>
+                  <input
+                    type="tel"
+                    autoComplete="tel"
+                    value={bambooPhone}
+                    onChange={(e) => setBambooPhone(e.target.value)}
+                    placeholder="08012345678"
+                    disabled={wealthBusy}
+                  />
+                </label>
+                <label>
+                  <span>Password</span>
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    value={bambooPassword}
+                    onChange={(e) => setBambooPassword(e.target.value)}
+                    placeholder="Bamboo app password"
+                    disabled={wealthBusy}
+                  />
+                </label>
+                <label>
+                  <span>Transaction PIN (optional)</span>
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    autoComplete="off"
+                    maxLength={4}
+                    value={bambooPin}
+                    onChange={(e) => setBambooPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    placeholder="4-digit PIN"
+                    disabled={wealthBusy}
+                  />
+                </label>
+                <div className="btn-row">
+                  <button type="button" className="btn btn-ghost" disabled={wealthBusy} onClick={closeBrokerModal}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={wealthBusy || !bambooPhone.trim() || !bambooPassword}
+                    onClick={() => {
+                      void (async () => {
+                        setWealthBusy(true);
+                        try {
+                          const result = await api<{ ok: boolean; connected: boolean; message: string }>(
+                            'bamboo_login',
+                            {
+                              phoneNumber: bambooPhone.trim(),
+                              password: bambooPassword,
+                              transactionPin: bambooPin.trim() || undefined,
+                            },
+                          );
+                          if (!result.ok) {
+                            toast.error(result.message, 'Bamboo login');
+                            return;
+                          }
+                          setBambooPassword('');
+                          setBambooPin('');
+                          setBrokerModalOpen(false);
+                          toast.success(result.message, 'Bamboo');
+                          await refresh();
+                        } catch (e) {
+                          toast.error(String(e), 'Bamboo login');
+                        } finally {
+                          setWealthBusy(false);
+                        }
+                      })();
+                    }}
+                  >
+                    {wealthBusy ? <IconSpinner /> : null}
+                    Connect Bamboo
+                  </button>
+                </div>
+              </div>
+            ) : wealthTempToken ? (
+              <div className="form-stack">
+                <label>
+                  <span>2FA code</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    value={wealth2fa}
+                    onChange={(e) => setWealth2fa(e.target.value)}
+                    placeholder="Enter authentication code"
+                    disabled={wealthBusy}
+                  />
+                </label>
+                <div className="btn-row">
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    disabled={wealthBusy}
+                    onClick={() => {
+                      setWealthTempToken(null);
+                      setWealth2fa('');
+                    }}
+                  >
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={wealthBusy || !wealth2fa.trim()}
+                    onClick={() => {
+                      void (async () => {
+                        setWealthBusy(true);
+                        try {
+                          const result = await api<WealthLoginResult>('wealth_verify_2fa', {
+                            email: wealthEmail.trim(),
+                            tempToken: wealthTempToken,
+                            code: wealth2fa.trim(),
+                          });
+                          if (!result.ok) {
+                            toast.error(result.message, 'Wealth 2FA');
+                            return;
+                          }
+                          setWealthTempToken(null);
+                          setWealthPassword('');
+                          setWealth2fa('');
+                          setBrokerModalOpen(false);
+                          toast.success(result.message, 'Wealth');
+                          await refresh();
+                        } catch (e) {
+                          toast.error(String(e), 'Wealth 2FA');
+                        } finally {
+                          setWealthBusy(false);
+                        }
+                      })();
+                    }}
+                  >
+                    {wealthBusy ? <IconSpinner /> : null}
+                    Verify
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="form-stack">
+                <label>
+                  <span>Email</span>
+                  <input
+                    type="email"
+                    autoComplete="username"
+                    value={wealthEmail}
+                    onChange={(e) => setWealthEmail(e.target.value)}
+                    placeholder="you@example.com"
+                    disabled={wealthBusy}
+                  />
+                </label>
+                <label>
+                  <span>Password</span>
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    value={wealthPassword}
+                    onChange={(e) => setWealthPassword(e.target.value)}
+                    placeholder="Wealth app password"
+                    disabled={wealthBusy}
+                  />
+                </label>
+                <div className="btn-row">
+                  <button type="button" className="btn btn-ghost" disabled={wealthBusy} onClick={closeBrokerModal}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={wealthBusy || !wealthEmail.trim() || !wealthPassword}
+                    onClick={() => {
+                      void (async () => {
+                        setWealthBusy(true);
+                        try {
+                          const result = await api<WealthLoginResult>('wealth_login', {
+                            email: wealthEmail.trim(),
+                            password: wealthPassword,
+                          });
+                          if (result.needs2fa && result.tempToken) {
+                            setWealthTempToken(result.tempToken);
+                            toast.info('Enter your 2FA code to finish connecting.', 'Wealth');
+                            return;
+                          }
+                          if (!result.ok) {
+                            toast.error(result.message, 'Wealth login');
+                            return;
+                          }
+                          setWealthPassword('');
+                          setBrokerModalOpen(false);
+                          toast.success(result.message, 'Wealth');
+                          await refresh();
+                        } catch (e) {
+                          toast.error(String(e), 'Wealth login');
+                        } finally {
+                          setWealthBusy(false);
+                        }
+                      })();
+                    }}
+                  >
+                    {wealthBusy ? <IconSpinner /> : null}
+                    Connect Wealth
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {llmModalOpen && (
         <div

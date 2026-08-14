@@ -17,6 +17,12 @@ pub const SECRET_WEALTH_PASSWORD: &str = "wealth_password";
 pub const SECRET_WEALTH_TOKEN: &str = "wealth_token";
 pub const SECRET_WEALTH_TOKEN_EXPIRES: &str = "wealth_token_expires";
 pub const SECRET_WEALTH_REFRESH_TOKEN: &str = "wealth_refresh_token";
+pub const SECRET_BAMBOO_PASSWORD: &str = "bamboo_password";
+pub const SECRET_BAMBOO_TOKEN: &str = "bamboo_token";
+pub const SECRET_BAMBOO_TOKEN_EXPIRES: &str = "bamboo_token_expires";
+pub const SECRET_BAMBOO_USER_ID: &str = "bamboo_user_id";
+pub const SECRET_BAMBOO_NGN_WALLET_ID: &str = "bamboo_ngn_wallet_id";
+pub const SECRET_BAMBOO_TRANSACTION_PIN: &str = "bamboo_transaction_pin";
 
 const LEGACY_KEYS: &[&str] = &[
     SECRET_PULSE_PASSWORD,
@@ -26,6 +32,12 @@ const LEGACY_KEYS: &[&str] = &[
     SECRET_WEALTH_TOKEN,
     SECRET_WEALTH_TOKEN_EXPIRES,
     SECRET_WEALTH_REFRESH_TOKEN,
+    SECRET_BAMBOO_PASSWORD,
+    SECRET_BAMBOO_TOKEN,
+    SECRET_BAMBOO_TOKEN_EXPIRES,
+    SECRET_BAMBOO_USER_ID,
+    SECRET_BAMBOO_NGN_WALLET_ID,
+    SECRET_BAMBOO_TRANSACTION_PIN,
 ];
 
 static APP_DATA: OnceLock<PathBuf> = OnceLock::new();

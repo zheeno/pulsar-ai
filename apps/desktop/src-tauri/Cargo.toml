@@ -26,6 +26,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 anyhow = "1"
 dotenvy = "0.15"
 parking_lot = "0.12"
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tauri-plugin-single-instance = "2"

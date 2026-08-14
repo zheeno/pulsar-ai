@@ -1,6 +1,7 @@
 mod agent;
 mod app_state;
 mod backtest;
+mod bamboo;
 mod broker;
 mod cache;
 mod calendar;
@@ -224,6 +225,9 @@ pub fn run() {
             commands::wealth_verify_2fa,
             commands::wealth_profile,
             commands::wealth_logout,
+            commands::bamboo_login,
+            commands::bamboo_profile,
+            commands::bamboo_logout,
             commands::broker_list,
             commands::set_selected_broker,
         ])

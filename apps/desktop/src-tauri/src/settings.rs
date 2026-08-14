@@ -29,6 +29,10 @@ pub struct AppSettings {
     pub wealth_email: Option<String>,
     /// True when a Wealth session has been established.
     pub wealth_connected: bool,
+    /// Bamboo phone when connected (retail login).
+    pub bamboo_phone: Option<String>,
+    /// True when a Bamboo session has been established.
+    pub bamboo_connected: bool,
     /// User must opt in before any live order is submitted.
     pub live_trading_enabled: bool,
     /// Recurring authorization for scheduled live cycles.
@@ -62,6 +66,8 @@ impl Default for AppSettings {
             selected_broker: "wealth".into(),
             wealth_email: None,
             wealth_connected: false,
+            bamboo_phone: None,
+            bamboo_connected: false,
             live_trading_enabled: false,
             scheduled_live_authorized: false,
             max_live_notional: 500_000.0,
@@ -106,6 +112,8 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
             "selected_broker" => settings.selected_broker = value,
             "wealth_email" => settings.wealth_email = Some(value),
             "wealth_connected" => settings.wealth_connected = value == "true",
+            "bamboo_phone" => settings.bamboo_phone = Some(value),
+            "bamboo_connected" => settings.bamboo_connected = value == "true",
             "live_trading_enabled" => settings.live_trading_enabled = value == "true",
             "scheduled_live_authorized" => settings.scheduled_live_authorized = value == "true",
             "max_live_notional" => {
@@ -207,6 +215,18 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
             "false"
         },
     )?;
+    if let Some(v) = &settings.bamboo_phone {
+        set_setting(conn, "bamboo_phone", v)?;
+    }
+    set_setting(
+        conn,
+        "bamboo_connected",
+        if settings.bamboo_connected {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
     set_setting(
         conn,
         "live_trading_enabled",
@@ -274,9 +294,12 @@ pub fn clear_session_settings(conn: &Connection) -> Result<()> {
     set_setting(conn, "onboarding_complete", "false")?;
     conn.execute("DELETE FROM settings WHERE key = 'wealth_email'", [])?;
     set_setting(conn, "wealth_connected", "false")?;
+    conn.execute("DELETE FROM settings WHERE key = 'bamboo_phone'", [])?;
+    set_setting(conn, "bamboo_connected", "false")?;
     set_setting(conn, "live_trading_enabled", "false")?;
     set_setting(conn, "scheduled_live_authorized", "false")?;
     clear_wealth_cache(conn)?;
+    clear_bamboo_cache(conn)?;
     Ok(())
 }
 
@@ -289,15 +312,36 @@ pub fn clear_wealth_settings(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn clear_bamboo_settings(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = 'bamboo_phone'", [])?;
+    set_setting(conn, "bamboo_connected", "false")?;
+    set_setting(conn, "live_trading_enabled", "false")?;
+    set_setting(conn, "scheduled_live_authorized", "false")?;
+    clear_bamboo_cache(conn)?;
+    Ok(())
+}
+
 pub fn clear_wealth_cache(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM wealth_positions", [])?;
     conn.execute("DELETE FROM wealth_account", [])?;
     Ok(())
 }
 
+pub fn clear_bamboo_cache(conn: &Connection) -> Result<()> {
+    let _ = conn.execute("DELETE FROM bamboo_positions", []);
+    let _ = conn.execute("DELETE FROM bamboo_account", []);
+    Ok(())
+}
+
 pub fn mark_wealth_connected(conn: &Connection, email: &str) -> Result<()> {
     set_setting(conn, "wealth_email", email)?;
     set_setting(conn, "wealth_connected", "true")?;
+    Ok(())
+}
+
+pub fn mark_bamboo_connected(conn: &Connection, phone: &str) -> Result<()> {
+    set_setting(conn, "bamboo_phone", phone)?;
+    set_setting(conn, "bamboo_connected", "true")?;
     Ok(())
 }
 

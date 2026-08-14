@@ -7,9 +7,9 @@ use crate::cache::PriceCache;
 use crate::db::Database;
 use crate::intents;
 use crate::ngx::is_valid_ticker;
-use crate::broker::BrokerSession;
+use crate::broker::{insert_broker_order, BrokerSession};
 use crate::settings::AppSettings;
-use crate::wealth::{insert_broker_order, TradingMode};
+use crate::wealth::TradingMode;
 
 pub const MAX_QUOTE_DEVIATION: f64 = 0.05;
 pub const MAX_LIQUIDATION_PCT: f64 = 0.25;
@@ -272,7 +272,8 @@ impl ExecutionService {
 
         if trading_mode == TradingMode::Live {
             let client = broker.ok_or_else(|| anyhow::anyhow!("Live broker session required"))?;
-            let (stock_id, broker_quote) = client.resolve_instrument(&symbol).await?;
+            let instrument = client.resolve_instrument(&symbol).await?;
+            let broker_quote = instrument.quote;
             if broker_quote <= 0.0 {
                 return Err(anyhow::anyhow!("No broker price for {symbol}"));
             }
@@ -364,6 +365,7 @@ impl ExecutionService {
                     &action,
                     quantity,
                     broker_quote,
+                    client.id().as_str(),
                 )?;
                 Ok(Some((intent, quantity, spendable)))
             })?;
@@ -372,16 +374,22 @@ impl ExecutionService {
                 return Ok(false);
             };
 
-            let mut fee = client.calculate_fee(stock_id, quantity, broker_quote).await?;
+            let mut fee = client
+                .calculate_fee(&instrument, &action, quantity, broker_quote)
+                .await?;
             if action == "BUY" {
-                let mut cost = broker_quote * quantity + fee.rounded_fee;
-                while quantity >= 1.0 && spendable < cost {
+                while quantity >= 1.0
+                    && (spendable < fee.total_price
+                        || fee.available_quantity < 1.0
+                        || fee.available_quantity + 1e-9 < quantity)
+                {
                     quantity = (quantity - 1.0).floor();
                     if quantity < 1.0 {
                         break;
                     }
-                    fee = client.calculate_fee(stock_id, quantity, broker_quote).await?;
-                    cost = broker_quote * quantity + fee.rounded_fee;
+                    fee = client
+                        .calculate_fee(&instrument, &action, quantity, broker_quote)
+                        .await?;
                 }
                 if quantity < 1.0 {
                     db.with_conn(|conn| {
@@ -394,7 +402,7 @@ impl ExecutionService {
                 }
             }
 
-            if quantity * broker_quote > settings.max_live_notional {
+            if fee.total_price.max(quantity * broker_quote) > settings.max_live_notional {
                 db.with_conn(|conn| {
                     intents::mark_terminal(conn, &intent.id, "rejected", None, Some("notional cap"))
                 })?;
@@ -403,7 +411,12 @@ impl ExecutionService {
 
             db.with_conn(|conn| intents::mark_submitted(conn, &intent.id, None))?;
             let order = match client
-                .place_and_await_fill(stock_id, &action, quantity, Some(&intent.client_order_id))
+                .place_and_await_fill(
+                    &instrument,
+                    &action,
+                    &fee,
+                    Some(&intent.client_order_id),
+                )
                 .await
             {
                 Ok(o) => o,
@@ -425,7 +438,7 @@ impl ExecutionService {
                     quantity,
                     &order,
                     fill_price,
-                    Some(fee.rounded_fee),
+                    Some(fee.fee),
                 )?;
                 let state = if order.status == "executed" {
                     "filled"
@@ -434,7 +447,13 @@ impl ExecutionService {
                 } else {
                     "unknown"
                 };
-                intents::mark_terminal(conn, &intent.id, state, Some(order.id), order.rejection_reason.as_deref())?;
+                intents::mark_terminal(
+                    conn,
+                    &intent.id,
+                    state,
+                    Some(order.id.as_str()),
+                    order.rejection_reason.as_deref(),
+                )?;
                 if order.status == "executed" {
                     conn.execute("UPDATE signals SET executed = 1 WHERE id = ?1", [signal_id])?;
                 }
@@ -454,7 +473,8 @@ impl ExecutionService {
             }
             if order.status != "executed" {
                 return Err(anyhow::anyhow!(
-                    "Wealth order still {} after polling (id {})",
+                    "{} order still {} after polling (id {})",
+                    client.display_name(),
                     order.status,
                     order.id
                 ));
@@ -665,8 +685,8 @@ impl ExecutionService {
     pub async fn reconcile_if_possible(db: &Database, session: &BrokerSession) -> Result<()> {
         let open = db.with_conn(crate::intents::load_open_intents)?;
         for intent in open {
-            if let Some(eid) = intent.external_order_id {
-                match session.get_order(eid).await {
+            if let Some(eid) = intent.external_order_ref.clone() {
+                match session.get_order(&eid).await {
                     Ok(order) => {
                         let state = if order.status == "executed" {
                             "filled"
@@ -680,7 +700,7 @@ impl ExecutionService {
                                 conn,
                                 &intent.id,
                                 state,
-                                Some(order.id),
+                                Some(order.id.as_str()),
                                 order.rejection_reason.as_deref(),
                             )
                         })?;
@@ -691,7 +711,7 @@ impl ExecutionService {
                                 conn,
                                 &intent.id,
                                 "unknown",
-                                Some(eid),
+                                Some(eid.as_str()),
                                 Some(&e.to_string()),
                             )
                         })?;

@@ -693,6 +693,69 @@ pub async fn wealth_logout(state: State<'_, Arc<AppState>>) -> Result<(), String
     .map_err(|e| e.to_string())?
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BambooLoginPayload {
+    pub phone_number: String,
+    pub password: String,
+    pub transaction_pin: Option<String>,
+}
+
+#[tauri::command]
+pub async fn bamboo_login(
+    payload: BambooLoginPayload,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::bamboo::BambooLoginResult, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        if crate::broker::BrokerId::parse(&settings.selected_broker) != crate::broker::BrokerId::Bamboo {
+            return Err("Select Bamboo as the live broker before connecting.".into());
+        }
+        let client = crate::bamboo::BambooClient::from_settings(&settings);
+        let pin = payload.transaction_pin.as_deref();
+        let result = block_on_local(client.login(&payload.phone_number, &payload.password, pin))
+            .map_err(|e| e.to_string())?;
+        if result.ok {
+            let _ = set_secret(crate::secrets::SECRET_BAMBOO_PASSWORD, &payload.password);
+            state
+                .db
+                .with_conn(|conn| crate::settings::mark_bamboo_connected(conn, &payload.phone_number))
+                .map_err(|e| e.to_string())?;
+            let _ = block_on_local(crate::bamboo::BambooSyncService::refresh(&state.db, &client));
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn bamboo_profile(state: State<'_, Arc<AppState>>) -> Result<crate::wealth::WealthProfileStatus, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let client = crate::bamboo::BambooClient::from_settings(&settings);
+        Ok(block_on_local(client.profile_status(&settings)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn bamboo_logout(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        crate::bamboo::BambooClient::clear_local_secrets();
+        state
+            .db
+            .with_conn(crate::settings::clear_bamboo_settings)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub fn broker_list(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::broker::BrokerListItem>, String> {
     let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;

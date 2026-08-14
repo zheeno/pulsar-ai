@@ -53,6 +53,8 @@ function defaultSettings(): Settings {
     selectedBroker: 'wealth',
     wealthEmail: undefined,
     wealthConnected: false,
+    bambooPhone: undefined,
+    bambooConnected: false,
     liveTradingEnabled: false,
     scheduledLiveAuthorized: false,
     maxLiveNotional: 500_000,
@@ -130,7 +132,10 @@ function selectedBrokerId(): string {
 }
 
 function mockLiveConnected(): boolean {
-  return selectedBrokerId() === 'wealth' && Boolean(loadSettings().wealthConnected);
+  const s = loadSettings();
+  const id = selectedBrokerId();
+  if (id === 'bamboo') return Boolean(s.bambooConnected);
+  return id === 'wealth' && Boolean(s.wealthConnected);
 }
 
 function mockBrokerMeta() {
@@ -202,9 +207,12 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         onboardingComplete: false,
         wealthEmail: undefined,
         wealthConnected: false,
+        bambooPhone: undefined,
+        bambooConnected: false,
       };
       delete next.pulseEmail;
       delete next.wealthEmail;
+      delete next.bambooPhone;
       saveSettingsLocal(next);
       localStorage.removeItem(SECRETS_KEY);
       return undefined as T;
@@ -599,6 +607,63 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       return undefined as T;
     }
 
+    case 'bamboo_login': {
+      if (selectedBrokerId() !== 'bamboo') {
+        throw new Error('Select Bamboo as the live broker before connecting.');
+      }
+      const phoneNumber = String(args?.phoneNumber || '');
+      const password = String(args?.password || '');
+      if (!phoneNumber || !password) {
+        return {
+          ok: false,
+          connected: false,
+          message: 'Phone number and password required',
+          phone: phoneNumber,
+          baseUrl: 'https://api.investbamboo.com',
+        } as T;
+      }
+      const s = loadSettings();
+      s.bambooPhone = phoneNumber;
+      s.bambooConnected = true;
+      saveSettingsLocal(s);
+      return {
+        ok: true,
+        connected: true,
+        message: 'Bamboo account connected.',
+        phone: phoneNumber,
+        baseUrl: 'https://api.investbamboo.com',
+      } as T;
+    }
+
+    case 'bamboo_profile': {
+      const s = loadSettings();
+      const connected = Boolean(s.bambooConnected);
+      return {
+        ok: connected,
+        connected,
+        email: s.bambooPhone ?? null,
+        tradingProfile: connected ? 'verified' : null,
+        tradingVerified: connected,
+        tradingMode: mockLiveConnected() ? 'live' : 'sandbox',
+        brokerageBalance: connected ? 180_000 : null,
+        availableBalance: connected ? 180_000 : null,
+        currentBalance: connected ? 180_000 : null,
+        baseUrl: 'https://api.investbamboo.com',
+        message: connected
+          ? 'Live trader mode — orders use Bamboo NGN cash.'
+          : 'Bamboo account not connected.',
+        displayName: connected ? 'Mock Bamboo User' : null,
+      } as T;
+    }
+
+    case 'bamboo_logout': {
+      const s = loadSettings();
+      s.bambooConnected = false;
+      delete s.bambooPhone;
+      saveSettingsLocal(s);
+      return undefined as T;
+    }
+
     case 'broker_list': {
       const s = loadSettings();
       return [
@@ -608,7 +673,12 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
           available: true,
           connected: Boolean(s.wealthConnected),
         },
-        { id: 'bamboo', name: 'Bamboo', available: false, connected: false },
+        {
+          id: 'bamboo',
+          name: 'Bamboo',
+          available: true,
+          connected: Boolean(s.bambooConnected),
+        },
       ] as T;
     }
 

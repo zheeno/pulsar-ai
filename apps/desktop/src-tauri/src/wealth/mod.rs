@@ -1242,6 +1242,7 @@ fn urlencoding_encode(s: &str) -> String {
 }
 
 /// Persist a live broker order for local UI history.
+#[allow(dead_code)]
 pub fn insert_broker_order(
     conn: &rusqlite::Connection,
     signal_id: Option<&str>,
