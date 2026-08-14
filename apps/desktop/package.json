@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "desktop:dev": "node ../../scripts/run-with-cargo.mjs tauri dev",
-    "desktop:build": "tauri build",
+    "desktop:build": "node ../../scripts/tauri-build.mjs current",
+    "desktop:build:mac": "node ../../scripts/tauri-build.mjs mac",
+    "desktop:build:win": "node ../../scripts/tauri-build.mjs win",
     "icons": "rsvg-convert -w 1024 -h 1024 src/assets/pulsar-logo.svg -o src-tauri/app-icon.png && tauri icon src-tauri/app-icon.png",
     "test": "echo 'no tests'"
   },

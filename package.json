@@ -13,7 +13,9 @@
     "lint": "turbo run lint",
     "desktop:dev": "node scripts/run-with-cargo.mjs npm run desktop:dev -w @ngx/desktop",
     "desktop:ui": "npm run dev -w @ngx/desktop",
-    "desktop:build": "node scripts/run-with-cargo.mjs npm run desktop:build -w @ngx/desktop",
+    "desktop:build": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs current",
+    "desktop:build:mac": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs mac",
+    "desktop:build:win": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs win",
     "desktop:prepare": "node scripts/prepare-desktop-resources.mjs",
     "agent:build": "npm run build -w @ngx/agent",
     "agent:ping": "node scripts/test-agent-ping.js"

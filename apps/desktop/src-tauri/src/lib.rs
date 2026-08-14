@@ -28,6 +28,53 @@ use db::Database;
 use seed::SeedService;
 use settings::get_settings;
 
+const COMPILED_PULSE_BASE_URL: &str = env!("NGX_PULSE_BASE_URL");
+const COMPILED_PULSE_SUPABASE_URL: &str = env!("NGX_PULSE_SUPABASE_URL");
+const COMPILED_PULSE_ANON_KEY: &str = env!("NGX_PULSE_SUPABASE_ANON_KEY");
+
+fn is_placeholder_pulse_value(key: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    match key {
+        "NGX_PULSE_SUPABASE_URL" => {
+            value.contains("your-project.supabase.co") || value.contains("your-project")
+        }
+        "NGX_PULSE_SUPABASE_ANON_KEY" => {
+            value == "your-anon-key" || value.starts_with("your-anon")
+        }
+        _ => false,
+    }
+}
+
+fn set_env_skip_placeholder(key: &str, value: &str) {
+    let value = value.trim();
+    if is_placeholder_pulse_value(key, value) {
+        return;
+    }
+    match std::env::var(key) {
+        Ok(existing) if !is_placeholder_pulse_value(key, &existing) => {}
+        _ => std::env::set_var(key, value),
+    }
+}
+
+fn apply_compiled_pulse_env() {
+    set_env_skip_placeholder("NGX_PULSE_BASE_URL", COMPILED_PULSE_BASE_URL);
+    set_env_skip_placeholder("NGX_PULSE_SUPABASE_URL", COMPILED_PULSE_SUPABASE_URL);
+    set_env_skip_placeholder("NGX_PULSE_SUPABASE_ANON_KEY", COMPILED_PULSE_ANON_KEY);
+
+    let url = std::env::var("NGX_PULSE_SUPABASE_URL").unwrap_or_default();
+    let has_anon = std::env::var("NGX_PULSE_SUPABASE_ANON_KEY")
+        .ok()
+        .is_some_and(|k| !is_placeholder_pulse_value("NGX_PULSE_SUPABASE_ANON_KEY", &k));
+    tracing::info!(
+        supabase_url = %url,
+        anon_key = has_anon,
+        "pulse env ready"
+    );
+}
+
 /// Load repo-root `.env` for Pulse Supabase / base URL (email+password stay user-entered).
 fn load_dotenv() {
     let mut candidates = Vec::new();
@@ -56,7 +103,7 @@ fn load_dotenv() {
             }
         }
     }
-    tracing::warn!("no .env found; will try bundled app.env in setup");
+    tracing::warn!("no .env found; will try bundled app.env / compiled Pulse defaults");
 }
 
 fn load_bundled_app_env(resource_dir: &std::path::Path) {
@@ -77,8 +124,17 @@ fn load_bundled_app_env(resource_dir: &std::path::Path) {
                     let Some((key, value)) = trimmed.split_once('=') else {
                         continue;
                     };
-                    // Bundled production config must win over any ambient .env from the build machine.
-                    std::env::set_var(key.trim(), value.trim());
+                    let key = key.trim();
+                    let value = value.trim();
+                    if key.starts_with("NGX_PULSE_") {
+                        set_env_skip_placeholder(key, value);
+                        continue;
+                    }
+                    // Shipped APP_ENV=production (and other non-Pulse keys) still override ambient .env.
+                    if cfg!(dev) && key == "APP_ENV" && std::env::var("APP_ENV").is_ok() {
+                        continue;
+                    }
+                    std::env::set_var(key, value);
                 }
                 tracing::info!("loaded bundled env from {}", candidate.display());
                 return;
@@ -108,9 +164,10 @@ pub fn run() {
         .setup(|app| {
             let resource_dir = app.path().resource_dir().ok();
             if let Some(ref dir) = resource_dir {
-                // Bundled app.env wins for shipped builds (APP_ENV=production + Pulse URLs).
                 load_bundled_app_env(dir);
             }
+            // Compile-time Pulse config from repo .env fills gaps and beats placeholder app.env.
+            apply_compiled_pulse_env();
 
             let worker_path = crate::agent::resolve_worker_path(resource_dir.as_deref());
             tracing::info!(worker = %worker_path.display(), "agent worker path");
