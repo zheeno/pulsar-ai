@@ -55,6 +55,11 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
     total_equity: Number(raw.total_equity ?? raw.totalEquity ?? 0),
     market_value: Number(raw.market_value ?? raw.marketValue ?? 0),
     pnl_today: Number(raw.pnl_today ?? raw.pnlToday ?? 0),
+    unrealized_pnl: Number((raw as { unrealized_pnl?: number; unrealizedPnl?: number }).unrealized_pnl
+      ?? (raw as { unrealizedPnl?: number }).unrealizedPnl
+      ?? 0),
+    quotesAsOf: (raw as { quotesAsOf?: string }).quotesAsOf ?? null,
+    stale: Boolean((raw as { stale?: boolean }).stale),
     tradingMode: (raw as { tradingMode?: string }).tradingMode || 'sandbox',
     tradingVerified: raw.tradingVerified ?? raw.wealthStatus?.tradingVerified,
     wealthStatus: raw.wealthStatus ?? null,
@@ -68,11 +73,54 @@ function marketPhaseLabel(phase: string): string {
   return 'NGX Closed';
 }
 
+type EquityPoint = {
+  recorded_at?: string;
+  snapshot_date?: string;
+  total_equity: number;
+};
+
+function pointInstant(p: EquityPoint): string {
+  return p.recorded_at || (p.snapshot_date ? `${p.snapshot_date}T00:00:00Z` : '');
+}
+
+function calendarDay(iso: string): string {
+  return iso.slice(0, 10);
+}
+
+function formatCurveTick(iso: string, points: EquityPoint[]): string {
+  const day = calendarDay(iso);
+  const sameDayCount = points.filter((p) => calendarDay(pointInstant(p)) === day).length;
+  const d = new Date(iso.includes('T') ? iso : `${iso}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return iso;
+  if (sameDayCount > 1) {
+    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function formatCurveTooltipTime(iso: string): string {
+  const d = new Date(iso.includes('T') ? iso : `${iso}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function formatQuoteClock(iso?: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
 export default function DashboardPage() {
   const toast = useToast();
   const { running: cycleRunning } = useCycle();
   const [data, setData] = useState<PortfolioData | null>(null);
-  const [performance, setPerformance] = useState<{ snapshot_date: string; total_equity: number }[]>([]);
+  const [performance, setPerformance] = useState<EquityPoint[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
   const [market, setMarket] = useState<MarketStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -85,6 +133,79 @@ export default function DashboardPage() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    if (loading && !data) return;
+    const phase = market?.phase ?? 'closed';
+    const bypass = market != null && market.marketHoursEnforced === false;
+    const poll = bypass || phase === 'open' || phase === 'post_close';
+    if (!poll) return;
+
+    const intervalMs = bypass || phase === 'open' ? 60_000 : 300_000;
+    let cancelled = false;
+    let inFlight = false;
+
+    async function tickQuotes() {
+      if (document.hidden || inFlight) return;
+      inFlight = true;
+      try {
+        const q = await api<{
+          positions: PortfolioData['positions'];
+          total_equity: number;
+          market_value: number;
+          pnl_today: number;
+          unrealized_pnl?: number;
+          quotesAsOf?: string;
+          stale?: boolean;
+          portfolio?: { cash_balance?: number };
+        }>('portfolio_quotes');
+        if (cancelled) return;
+        setData((prev) => {
+          if (!prev) return prev;
+          const stale = Boolean(q.stale);
+          const keep = (next: number | undefined, current: number) => {
+            if (stale) return current;
+            if (next == null || !Number.isFinite(Number(next))) return current;
+            return Number(next);
+          };
+          const cash = Number(q.portfolio?.cash_balance ?? prev.portfolio?.cash_balance);
+          const marketValue = keep(q.market_value, prev.market_value);
+          return {
+            ...prev,
+            positions: stale ? prev.positions : (q.positions ?? prev.positions),
+            market_value: marketValue,
+            total_equity: Number.isFinite(Number(q.total_equity)) && !stale
+              ? Number(q.total_equity)
+              : cash + marketValue,
+            pnl_today: keep(q.pnl_today, prev.pnl_today),
+            unrealized_pnl: keep(q.unrealized_pnl, prev.unrealized_pnl ?? 0),
+            quotesAsOf: q.quotesAsOf ?? prev.quotesAsOf,
+            stale,
+            portfolio: {
+              ...prev.portfolio,
+              cash_balance: cash,
+            },
+          };
+        });
+      } catch {
+        /* keep last marks */
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    void tickQuotes();
+    const id = window.setInterval(() => void tickQuotes(), intervalMs);
+    const onVis = () => {
+      if (!document.hidden) void tickQuotes();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [loading, market?.phase, market?.marketHoursEnforced]);
+
   async function loadData() {
     try {
       const [portfolioRaw, usageData, marketData] = await Promise.all([
@@ -93,12 +214,29 @@ export default function DashboardPage() {
         api<MarketStatus>('market_status'),
       ]);
       const portfolio = normalizePortfolio(portfolioRaw);
-      setData(portfolio);
+      setData((prev) => {
+        if (!prev?.quotesAsOf) return portfolio;
+        const cash = Number(portfolio.portfolio?.cash_balance ?? prev.portfolio?.cash_balance);
+        return {
+          ...portfolio,
+          portfolio: {
+            ...portfolio.portfolio,
+            cash_balance: cash,
+          },
+          positions: prev.positions,
+          market_value: prev.market_value,
+          total_equity: cash + prev.market_value,
+          pnl_today: prev.pnl_today,
+          unrealized_pnl: prev.unrealized_pnl,
+          quotesAsOf: prev.quotesAsOf,
+          stale: prev.stale,
+        };
+      });
       setUsage(usageData);
       setMarket(marketData);
       setError(null);
       const venue = portfolio.tradingMode === 'live' ? 'wealth' : 'sandbox';
-      const perf = await api<{ snapshot_date: string; total_equity: number }[]>(
+      const perf = await api<EquityPoint[]>(
         'portfolio_performance',
         { venue, id: portfolio.portfolio?.id },
       );
@@ -134,6 +272,15 @@ export default function DashboardPage() {
     const value = Number(n ?? 0);
     return `₦${(Number.isFinite(value) ? value : 0).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
   };
+
+  const chartData = useMemo(
+    () =>
+      performance.map((p) => ({
+        ...p,
+        recorded_at: pointInstant(p),
+      })),
+    [performance],
+  );
 
   const status = useMemo(() => {
     if (error) {
@@ -240,6 +387,9 @@ export default function DashboardPage() {
               {market.nowWat}
               {market.pulseStatus ? ` · Pulse: ${market.pulseStatus}` : ''}
               {!market.marketHoursEnforced ? ' · Hours bypassed (dev)' : ''}
+              {data?.quotesAsOf
+                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : ' · Pulse'}`
+                : ''}
             </p>
           ) : null}
         </div>
@@ -284,17 +434,23 @@ export default function DashboardPage() {
             >
               {formatNaira(data.pnl_today)}
             </div>
+            <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+              Unrealized vs cost{' '}
+              <span style={{ color: (data.unrealized_pnl ?? 0) >= 0 ? 'var(--status-ok)' : 'var(--status-bad)' }}>
+                {formatNaira(data.unrealized_pnl ?? 0)}
+              </span>
+            </div>
           </div>
         </div>
       ) : (
         <p className="empty-state">{error ? 'Could not load portfolio.' : 'Loading portfolio…'}</p>
       )}
 
-      {performance.length > 0 ? (
+      {chartData.length > 0 ? (
         <div className="panel">
           <h2>Equity curve</h2>
           <ResponsiveContainer width="100%" height={280}>
-            <AreaChart data={performance}>
+            <AreaChart data={chartData}>
               <defs>
                 <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor="#38bdf8" stopOpacity={0.35} />
@@ -302,7 +458,13 @@ export default function DashboardPage() {
                 </linearGradient>
               </defs>
               <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
-              <XAxis dataKey="snapshot_date" stroke="var(--text-muted)" fontSize={11} tickMargin={8} />
+              <XAxis
+                dataKey="recorded_at"
+                stroke="var(--text-muted)"
+                fontSize={11}
+                tickMargin={8}
+                tickFormatter={(iso: string) => formatCurveTick(iso, chartData)}
+              />
               <YAxis
                 stroke="var(--text-muted)"
                 fontSize={11}
@@ -310,11 +472,25 @@ export default function DashboardPage() {
                 width={48}
               />
               <Tooltip
-                contentStyle={{
-                  background: '#0f172a',
-                  border: '1px solid #334155',
-                  borderRadius: 8,
-                  fontFamily: 'Fira Sans, sans-serif',
+                content={({ active, payload, label }) => {
+                  if (!active || !payload?.length) return null;
+                  const equity = Number(payload[0].value);
+                  return (
+                    <div
+                      style={{
+                        background: '#0f172a',
+                        border: '1px solid #334155',
+                        borderRadius: 8,
+                        padding: '8px 10px',
+                        fontFamily: 'Fira Sans, sans-serif',
+                      }}
+                    >
+                      <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                        {formatCurveTooltipTime(String(label ?? ''))}
+                      </div>
+                      <div>{formatNaira(equity)}</div>
+                    </div>
+                  );
                 }}
               />
               <Area
@@ -333,7 +509,7 @@ export default function DashboardPage() {
         <div className="panel">
           <h2>Equity curve</h2>
           <p className="muted" style={{ margin: 0 }}>
-            No Wealth equity history yet. Points are recorded when you open Home or complete a live cycle.
+            No Wealth equity history yet. Points are recorded after each live trading cycle.
           </p>
         </div>
       ) : null}

@@ -26,7 +26,7 @@ interface MockStore {
   }[];
   signals: Record<string, unknown>[];
   trades: Record<string, unknown>[];
-  performance: { snapshot_date: string; total_equity: number; pnl_daily: number }[];
+  performance: { recorded_at: string; snapshot_date: string; total_equity: number; pnl_daily: number }[];
   strategy: Record<string, unknown>;
   backtests: Record<string, unknown>;
 }
@@ -80,9 +80,9 @@ function defaultStore(): MockStore {
     ],
     trades: [],
     performance: [
-      { snapshot_date: '2026-08-01', total_equity: 10_000_000, pnl_daily: 0 },
-      { snapshot_date: '2026-08-05', total_equity: 10_150_000, pnl_daily: 50_000 },
-      { snapshot_date: '2026-08-10', total_equity: 10_339_500, pnl_daily: 40_000 },
+      { recorded_at: '2026-08-01T00:00:00Z', snapshot_date: '2026-08-01', total_equity: 10_000_000, pnl_daily: 0 },
+      { recorded_at: '2026-08-05T00:00:00Z', snapshot_date: '2026-08-05', total_equity: 10_150_000, pnl_daily: 50_000 },
+      { recorded_at: '2026-08-10T00:00:00Z', snapshot_date: '2026-08-10', total_equity: 10_339_500, pnl_daily: 40_000 },
     ],
     strategy: {
       id: strategyId,
@@ -248,6 +248,33 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       } as T;
     }
 
+    case 'portfolio_quotes': {
+      const store = loadStore();
+      const positions = store.positions.map((p) => {
+        const last = p.current_price * (1 + (Math.random() - 0.5) * 0.002);
+        return {
+          ...p,
+          current_price: last,
+          market_value: p.quantity * last,
+        };
+      });
+      saveStore({ ...store, positions });
+      const market_value = positions.reduce((s, p) => s + p.market_value, 0);
+      const unrealized_pnl = positions.reduce((s, p) => s + p.quantity * (p.current_price - p.avg_cost), 0);
+      return {
+        positions,
+        total_equity: store.portfolio.cash_balance + market_value,
+        market_value,
+        pnl_today: store.performance.at(-1)?.pnl_daily ?? 0,
+        unrealized_pnl,
+        quotesAsOf: new Date().toISOString(),
+        quotedSymbols: positions.map((p) => p.symbol),
+        stale: false,
+        tradingMode: Boolean(loadSettings().wealthConnected) ? 'live' : 'sandbox',
+        portfolio: { id: store.portfolio.id, cash_balance: store.portfolio.cash_balance },
+      } as T;
+    }
+
     case 'portfolio_performance': {
       const venue = String(args?.venue || 'sandbox');
       if (venue === 'wealth') {
@@ -364,8 +391,23 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         executed: false,
         risk_policy_result: 'BLOCKED_CONFIDENCE',
       });
+      if (command === 'cycle_run') {
+        const now = new Date();
+        const today = now.toISOString().slice(0, 10);
+        const last = store.performance.at(-1);
+        const equity = last?.total_equity ?? 10_000_000;
+        const priorClose = [...store.performance]
+          .reverse()
+          .find((p) => p.snapshot_date < today);
+        store.performance.push({
+          recorded_at: now.toISOString(),
+          snapshot_date: today,
+          total_equity: equity,
+          pnl_daily: equity - (priorClose?.total_equity ?? equity),
+        });
+      }
       saveStore(store);
-      return { signals: 1, executed: 0, signalIds: [id], count: 1, warnings: ['Browser mock mode'] } as T;
+      return { signals: 1, executed: 0, signalIds: [id], count: 1, universeSize: 20, warnings: ['Browser mock mode'] } as T;
     }
 
     case 'list_signals': {
@@ -439,6 +481,12 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
 
     case 'app_data_dir':
       return 'browser-mock' as T;
+
+    case 'reset_local_data':
+      localStorage.removeItem(SETTINGS_KEY);
+      localStorage.removeItem(SECRETS_KEY);
+      localStorage.removeItem(STORE_KEY);
+      return { ok: true } as T;
 
     case 'wealth_login': {
       const email = String(args?.email || '');

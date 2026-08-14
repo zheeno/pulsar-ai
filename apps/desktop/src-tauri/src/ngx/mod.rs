@@ -57,6 +57,14 @@ pub struct PricePoint {
     pub volume: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LatestQuote {
+    pub symbol: String,
+    pub last: f64,
+    pub prev_close: Option<f64>,
+    pub trade_date: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     Session,
@@ -498,8 +506,38 @@ impl NgxPulseClient {
         if self.auth_mode == AuthMode::Mock {
             return Ok(mock_stocks());
         }
-        let raw = self.fetch_raw(conn, "/ngxdata/stocks", "stocks").await?;
-        Ok(normalize_stocks(raw))
+
+        let mut by_symbol: std::collections::HashMap<String, NgxStock> =
+            std::collections::HashMap::new();
+        let mut page: u32 = 1;
+        loop {
+            let path = if page == 1 {
+                "/ngxdata/stocks".to_string()
+            } else {
+                format!("/ngxdata/stocks?page={page}")
+            };
+            let raw = self.fetch_raw(conn, &path, "stocks").await?;
+            let has_more = page_has_more(&raw, page);
+            let chunk = normalize_stocks(raw);
+            if chunk.is_empty() {
+                break;
+            }
+            for stock in chunk {
+                by_symbol.insert(stock.symbol.clone(), stock);
+            }
+            if !has_more || page >= 50 {
+                break;
+            }
+            page += 1;
+        }
+
+        tracing::info!(
+            target: "ngx_pulse",
+            count = by_symbol.len(),
+            pages = page,
+            "pulse stocks ingested from API"
+        );
+        Ok(by_symbol.into_values().collect())
     }
 
     pub async fn get_market(&self, conn: &rusqlite::Connection) -> Result<NgxMarketOverview> {
@@ -555,6 +593,56 @@ impl NgxPulseClient {
         }
         let raw = self.fetch_raw(conn, &path, &format!("prices/{symbol}")).await?;
         Ok(normalize_prices(raw))
+    }
+
+    /// Last print (and previous bar) for held names only. Caps at 20 symbols.
+    pub async fn get_latest_quotes(
+        &self,
+        conn: &rusqlite::Connection,
+        symbols: &[String],
+    ) -> Result<Vec<LatestQuote>> {
+        let calendar = crate::calendar::TradingCalendar::default();
+        let today = calendar.today_wat();
+        let from = (calendar.now_wat() - chrono::Duration::days(7))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut out = Vec::new();
+        for symbol in symbols.iter().take(20) {
+            if symbol.is_empty() {
+                continue;
+            }
+            if self.auth_mode == AuthMode::ApiKey && !RateLimiter::can_make_request(conn).unwrap_or(false)
+            {
+                break;
+            }
+            let mut points = match self
+                .get_symbol_price(conn, symbol, Some(&from), Some(&today))
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(target: "ngx_pulse", symbol = %symbol, error = %e, "quote fetch failed");
+                    continue;
+                }
+            };
+            if points.is_empty() {
+                continue;
+            }
+            points.sort_by(|a, b| a.date.cmp(&b.date));
+            let last = points.last().expect("non-empty");
+            let prev_close = if points.len() >= 2 {
+                points.get(points.len() - 2).map(|p| p.price)
+            } else {
+                None
+            };
+            out.push(LatestQuote {
+                symbol: symbol.clone(),
+                last: last.price,
+                prev_close,
+                trade_date: last.date.clone(),
+            });
+        }
+        Ok(out)
     }
 
     async fn fetch_raw(&self, conn: &rusqlite::Connection, path: &str, endpoint: &str) -> Result<serde_json::Value> {
@@ -827,30 +915,80 @@ fn unwrap(payload: serde_json::Value) -> serde_json::Map<String, serde_json::Val
     payload.as_object().cloned().unwrap_or_default()
 }
 
+fn pagination_last_page(payload: &serde_json::Value) -> Option<u32> {
+    let candidates = [
+        payload.pointer("/meta/last_page"),
+        payload.pointer("/last_page"),
+        payload.pointer("/data/meta/last_page"),
+        payload.pointer("/data/last_page"),
+        payload.pointer("/pagination/last_page"),
+        payload.pointer("/meta/lastPage"),
+    ];
+    for v in candidates.into_iter().flatten() {
+        if let Some(n) = v.as_u64() {
+            return Some(n as u32);
+        }
+        if let Some(n) = v.as_i64().filter(|x| *x > 0) {
+            return Some(n as u32);
+        }
+    }
+    None
+}
+
+fn page_has_more(payload: &serde_json::Value, page: u32) -> bool {
+    if let Some(last) = pagination_last_page(payload) {
+        return page < last;
+    }
+    payload
+        .pointer("/links/next")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty() && s != "null")
+}
+
+fn stock_rows(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    payload
+        .get("stocks")
+        .and_then(|v| v.as_array())
+        .or_else(|| payload.get("data").and_then(|d| d.get("stocks")).and_then(|v| v.as_array()))
+        .or_else(|| payload.get("data").and_then(|v| v.as_array()))
+        .or_else(|| payload.as_array())
+}
+
+fn parse_stock_row(stock: &serde_json::Value) -> Option<NgxStock> {
+    let symbol = stock
+        .get("symbol")
+        .or_else(|| stock.get("ticker"))
+        .and_then(|v| v.as_str())?
+        .to_uppercase();
+    let price = stock
+        .get("current_price")
+        .or_else(|| stock.get("price"))
+        .or_else(|| stock.get("close_price"))
+        .or_else(|| stock.get("last_price"))
+        .and_then(|v| v.as_f64())?;
+    Some(NgxStock {
+        symbol,
+        name: stock.get("name").and_then(|v| v.as_str()).map(String::from),
+        price,
+        change_percent: stock
+            .get("change_percent")
+            .or_else(|| stock.get("official_change_percent"))
+            .or_else(|| stock.get("pct_change"))
+            .and_then(|v| v.as_f64()),
+        volume: stock
+            .get("volume")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64))),
+        market_cap: stock.get("market_cap").and_then(|v| v.as_f64()),
+        pe_ratio: stock.get("pe_ratio").and_then(|v| v.as_f64()),
+        sector: stock.get("sector").and_then(|v| v.as_str()).map(String::from),
+    })
+}
+
 fn normalize_stocks(payload: serde_json::Value) -> Vec<NgxStock> {
-    let root = payload.clone();
-    let data = unwrap(payload);
-    let stocks = data.get("stocks").or(root.get("stocks"));
-    let Some(arr) = stocks.and_then(|v| v.as_array()) else {
+    let Some(arr) = stock_rows(&payload) else {
         return vec![];
     };
-    arr.iter()
-        .filter_map(|stock| {
-            Some(NgxStock {
-                symbol: stock.get("symbol")?.as_str()?.into(),
-                name: stock.get("name").and_then(|v| v.as_str()).map(String::from),
-                price: stock.get("current_price").or(stock.get("price"))?.as_f64()?,
-                change_percent: stock
-                    .get("change_percent")
-                    .or(stock.get("official_change_percent"))
-                    .and_then(|v| v.as_f64()),
-                volume: stock.get("volume").and_then(|v| v.as_i64()),
-                market_cap: stock.get("market_cap").and_then(|v| v.as_f64()),
-                pe_ratio: stock.get("pe_ratio").and_then(|v| v.as_f64()),
-                sector: stock.get("sector").and_then(|v| v.as_str()).map(String::from),
-            })
-        })
-        .collect()
+    arr.iter().filter_map(parse_stock_row).collect()
 }
 
 fn normalize_market(payload: serde_json::Value) -> NgxMarketOverview {
@@ -919,7 +1057,11 @@ fn normalize_prices(payload: serde_json::Value) -> Vec<PricePoint> {
                 .to_string();
             Some(PricePoint {
                 date,
-                price: row.get("close_price").or(row.get("price"))?.as_f64()?,
+                price: row
+                    .get("last_price")
+                    .or(row.get("close_price"))
+                    .or(row.get("price"))?
+                    .as_f64()?,
                 volume: row.get("volume").and_then(|v| v.as_i64()),
             })
         })
@@ -933,6 +1075,21 @@ fn mock_stocks() -> Vec<NgxStock> {
         ("ZENITHBANK", 39.0),
         ("MTNN", 225.0),
         ("BUACEMENT", 98.0),
+        ("ACCESSCORP", 22.0),
+        ("UBA", 28.0),
+        ("FBNH", 18.0),
+        ("SEPLAT", 3200.0),
+        ("NESTLE", 1200.0),
+        ("BUAFOODS", 150.0),
+        ("AIRTELAFRI", 2100.0),
+        ("WAPCO", 35.0),
+        ("GUARANTY", 55.0),
+        ("STANBIC", 65.0),
+        ("FLOURMILL", 42.0),
+        ("PRESCO", 280.0),
+        ("OKOMUOIL", 350.0),
+        ("NASCON", 18.0),
+        ("INTBREW", 5.0),
     ];
     symbols
         .iter()

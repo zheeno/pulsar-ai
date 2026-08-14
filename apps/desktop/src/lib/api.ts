@@ -65,6 +65,9 @@ export interface PortfolioData {
   total_equity: number;
   market_value: number;
   pnl_today: number;
+  unrealized_pnl?: number;
+  quotesAsOf?: string | null;
+  stale?: boolean;
   tradingMode?: 'sandbox' | 'live' | string;
   tradingVerified?: boolean;
   wealthStatus?: {

@@ -236,6 +236,9 @@ export default function SettingsPage() {
   const [draftApiKey, setDraftApiKey] = useState('');
   const [modalStatus, setModalStatus] = useState('');
   const [modalBusy, setModalBusy] = useState(false);
+  const [dataDir, setDataDir] = useState<string | null>(null);
+  const [resetConfirm, setResetConfirm] = useState('');
+  const [resetBusy, setResetBusy] = useState(false);
 
   async function refresh() {
     const [s, llm, strategy] = await Promise.all([
@@ -248,6 +251,11 @@ export default function SettingsPage() {
     setStrategyDraft(draftFromStrategy(strategy));
     setAutoCycleEnabled(!!s.autoCycleEnabled);
     setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
+    try {
+      setDataDir(await api<string>('app_data_dir'));
+    } catch {
+      setDataDir(null);
+    }
     try {
       setProfile(await api<PulseProfile>('pulse_profile'));
     } catch (e) {
@@ -741,7 +749,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={maxTradesId}
             label="Max daily trades"
-            hint="Hard limit on how many buys can execute in a single trading day. Lower values slow turnover and reduce fee drag; higher values allow more active rebalancing."
+            hint="Hard limit on how many buys can execute in a single trading day. It does not cap how many signals a cycle generates. Lower values slow turnover and reduce fee drag; higher values allow more fills."
             value={strategyDraft.maxDailyTrades}
             min={1}
             max={20}
@@ -774,7 +782,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={stopLossId}
             label="Stop loss"
-            hint="Planned exit threshold below entry for open positions. Stored for risk planning; keep it tight to cut losers sooner, or wider to tolerate normal volatility."
+            hint="Enforced each cycle: sell an open position when last price is this far below average cost."
             value={strategyDraft.stopLossPct}
             min={1}
             max={25}
@@ -785,7 +793,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={takeProfitId}
             label="Take profit"
-            hint="Planned exit threshold above entry for locking gains. Higher targets let winners run longer; lower targets bank profits earlier."
+            hint="Enforced each cycle: sell an open position when last price is this far above average cost."
             value={strategyDraft.takeProfitPct}
             min={2}
             max={40}
@@ -878,6 +886,56 @@ export default function SettingsPage() {
         <div className="btn-row">
           <button type="button" className="btn btn-ghost" onClick={openLlmModal}>
             Change LLM settings
+          </button>
+        </div>
+      </section>
+
+      <section className="panel panel--danger" aria-labelledby="danger-heading">
+        <h2 id="danger-heading">Danger zone</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Reset local Pulsar data: SQLite database (portfolio, signals, trades, history), settings,
+          and OS keychain secrets (Pulse, LLM, Wealth). You will go through onboarding again.
+          This does not affect your Coronation Wealth or NGX Pulse accounts.
+        </p>
+        {dataDir ? (
+          <p className="muted" style={{ fontSize: 12, lineHeight: 1.45 }}>
+            Data folder: <span className="mono">{dataDir}</span>
+          </p>
+        ) : null}
+        <label className="label" htmlFor="reset-confirm">
+          Type RESET to confirm
+        </label>
+        <input
+          id="reset-confirm"
+          className="input"
+          autoComplete="off"
+          value={resetConfirm}
+          disabled={resetBusy}
+          onChange={(e) => setResetConfirm(e.target.value)}
+          placeholder="RESET"
+        />
+        <div className="btn-row">
+          <button
+            type="button"
+            className="btn btn-danger"
+            disabled={resetBusy || resetConfirm.trim() !== 'RESET'}
+            onClick={() => {
+              void (async () => {
+                setResetBusy(true);
+                try {
+                  await api('reset_local_data');
+                  toast.success('Local data cleared. Reloading…', 'Reset');
+                  window.location.hash = '#/onboarding';
+                  window.location.reload();
+                } catch (e) {
+                  toast.error(String(e), 'Reset failed');
+                  setResetBusy(false);
+                }
+              })();
+            }}
+          >
+            {resetBusy ? <IconSpinner /> : null}
+            {resetBusy ? 'Resetting…' : 'Reset local data'}
           </button>
         </div>
       </section>

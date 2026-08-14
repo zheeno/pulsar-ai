@@ -8,8 +8,38 @@ use crate::execution::ExecutionService;
 use crate::indicators::IndicatorService;
 use crate::settings::AppSettings;
 
-const PORTFOLIO_PROMPT_VERSION: &str = "v2.1.0";
+const PORTFOLIO_PROMPT_VERSION: &str = "v2.3.1";
 const PROMPT_VERSION: &str = "v1.0.0";
+/// LLM may return this many BUY/SELL ideas per cycle. Executed BUYs still use max_daily_trades.
+const LLM_SIGNAL_CAP: usize = 40;
+
+#[derive(Debug, Clone)]
+pub struct HeldLot {
+    pub symbol: String,
+    pub quantity: f64,
+    pub avg_cost: f64,
+    pub last_price: Option<f64>,
+}
+
+impl HeldLot {
+    pub fn from_wealth_holdings(holdings: &[crate::wealth::WealthHolding]) -> Vec<Self> {
+        holdings
+            .iter()
+            .filter(|h| h.quantity > 0.0)
+            .map(|h| Self {
+                symbol: h.symbol.clone(),
+                quantity: h.quantity,
+                avg_cost: h.buy_price.unwrap_or(0.0),
+                last_price: if h.price > 0.0 { Some(h.price) } else { None },
+            })
+            .collect()
+    }
+}
+
+pub struct PortfolioGeneration {
+    pub signal_ids: Vec<String>,
+    pub universe_size: usize,
+}
 
 pub struct SignalGenerationService;
 
@@ -21,25 +51,37 @@ impl SignalGenerationService {
         portfolio_id: Option<&str>,
         cash_balance: Option<f64>,
         trading_venue: &str,
-    ) -> Result<Vec<String>> {
+        live_holdings: Option<&[HeldLot]>,
+    ) -> Result<PortfolioGeneration> {
         let param_set = Self::get_active_param_set(conn, portfolio_id)?;
         let Some(param_set) = param_set else {
-            return Ok(vec![]);
+            return Ok(PortfolioGeneration {
+                signal_ids: vec![],
+                universe_size: 0,
+            });
         };
 
-        let universe = Self::build_universe(conn, &param_set)?;
-        if universe.is_empty() {
-            return Ok(vec![]);
+        let lots = if trading_venue == "wealth" {
+            live_holdings
+                .map(|h| h.to_vec())
+                .unwrap_or_default()
+        } else {
+            Self::sandbox_lots(conn, portfolio_id)?
+        };
+        let held_symbols: std::collections::HashSet<String> =
+            lots.iter().map(|l| l.symbol.clone()).collect();
+
+        let universe_rows = Self::build_universe(conn, &held_symbols)?;
+        if universe_rows.is_empty() {
+            return Ok(PortfolioGeneration {
+                signal_ids: vec![],
+                universe_size: 0,
+            });
         }
 
-        let positions = Self::get_positions(conn, portfolio_id)?;
         let market_context = Self::get_market_context(conn)?;
-        let max_picks = param_set.max_daily_trades;
 
-        let mut memory_symbols: std::collections::HashSet<String> = positions
-            .iter()
-            .filter_map(|p| p.get("symbol").and_then(|s| s.as_str()).map(str::to_string))
-            .collect();
+        let mut memory_symbols = held_symbols.clone();
         for sym in Self::recent_active_symbols(conn, 30)? {
             memory_symbols.insert(sym);
             if memory_symbols.len() >= 40 {
@@ -57,11 +99,118 @@ impl SignalGenerationService {
             .unwrap_or(0.0)
         });
 
+        let universe_tsv = Self::encode_universe_tsv(&universe_rows);
+        let universe_size = universe_rows.len();
+        let valid_symbols: std::collections::HashSet<String> = universe_rows
+            .iter()
+            .map(|r| r.symbol.clone())
+            .collect();
+
+        let mut signal_ids = vec![];
+        let mut seen = std::collections::HashSet::new();
+        let mut held_context = Vec::new();
+        let mut positions_json = Vec::new();
+
+        for lot in &lots {
+            let last = lot
+                .last_price
+                .filter(|p| *p > 0.0)
+                .or_else(|| Self::last_db_price(conn, &lot.symbol));
+            let pnl_pct = if lot.avg_cost > 0.0 {
+                last.map(|px| (px - lot.avg_cost) / lot.avg_cost)
+            } else {
+                None
+            };
+            let (exit_hint, rule) = match (pnl_pct, last) {
+                (Some(pnl), Some(px)) if pnl <= -param_set.stop_loss_pct => (
+                    "stop_loss",
+                    Some((
+                        "rules:stop-loss",
+                        format!(
+                            "Stop loss: {:+.1}% vs {:.0}% threshold (avg {:.2}, last {:.2})",
+                            pnl * 100.0,
+                            param_set.stop_loss_pct * 100.0,
+                            lot.avg_cost,
+                            px
+                        ),
+                    )),
+                ),
+                (Some(pnl), Some(px))
+                    if param_set
+                        .take_profit_pct
+                        .map(|tp| tp > 0.0 && pnl >= tp)
+                        .unwrap_or(false) =>
+                {
+                    let tp = param_set.take_profit_pct.unwrap_or(0.0);
+                    (
+                        "take_profit",
+                        Some((
+                            "rules:take-profit",
+                            format!(
+                                "Take profit: {:+.1}% vs {:.0}% threshold (avg {:.2}, last {:.2})",
+                                pnl * 100.0,
+                                tp * 100.0,
+                                lot.avg_cost,
+                                px
+                            ),
+                        )),
+                    )
+                }
+                _ => ("hold", None),
+            };
+
+            positions_json.push(json!({
+                "symbol": lot.symbol,
+                "quantity": lot.quantity,
+                "avgCost": lot.avg_cost,
+            }));
+            held_context.push(json!({
+                "symbol": lot.symbol,
+                "qty": lot.quantity,
+                "avgCost": lot.avg_cost,
+                "last": last,
+                "pnlPct": pnl_pct,
+                "exitHint": exit_hint,
+            }));
+
+            if let Some((model_name, rationale)) = rule {
+                if seen.contains(&lot.symbol) {
+                    continue;
+                }
+                seen.insert(lot.symbol.clone());
+                let pick = json!({
+                    "action": "SELL",
+                    "confidence": 1.0,
+                    "rationale": rationale,
+                });
+                if let Some(id) = Self::persist_signal(
+                    conn,
+                    &pick,
+                    &lot.symbol,
+                    "",
+                    "",
+                    model_name,
+                    PORTFOLIO_PROMPT_VERSION,
+                )? {
+                    signal_ids.push(id);
+                }
+            }
+        }
+
+        let llm_cap = universe_size.min(LLM_SIGNAL_CAP) as i64;
+
         let context = json!({
-            "universe": universe,
-            "positions": positions,
+            "universeTsv": universe_tsv,
+            "universeSize": universe_size,
+            "positions": positions_json,
+            "held": held_context,
+            "strategy": {
+                "stopLossPct": param_set.stop_loss_pct,
+                "takeProfitPct": param_set.take_profit_pct,
+                "maxDailyTrades": param_set.max_daily_trades,
+            },
             "marketContext": market_context,
-            "maxPicks": max_picks,
+            "maxActions": llm_cap,
             "symbolMemory": symbol_memory,
             "cashBalance": cash,
             "brokerageBalance": if trading_venue == "wealth" { Some(cash) } else { None::<f64> },
@@ -80,14 +229,6 @@ impl SignalGenerationService {
         let prompt = result.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let raw_response = result.get("rawResponse").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let model_name = result.get("modelName").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-
-        let valid_symbols: std::collections::HashSet<String> = universe
-            .iter()
-            .filter_map(|u| u.get("symbol").and_then(|s| s.as_str()).map(String::from))
-            .collect();
-
-        let mut signal_ids = vec![];
-        let mut seen = std::collections::HashSet::new();
 
         if let Some(arr) = signals.as_array() {
             for pick in arr {
@@ -112,7 +253,10 @@ impl SignalGenerationService {
             }
         }
 
-        Ok(signal_ids)
+        Ok(PortfolioGeneration {
+            signal_ids,
+            universe_size,
+        })
     }
 
     pub async fn generate_for_symbol(
@@ -189,19 +333,23 @@ impl SignalGenerationService {
     }
 
     fn get_active_param_set(conn: &Connection, portfolio_id: Option<&str>) -> Result<Option<ParamSetRow>> {
+        let map_row = |row: &rusqlite::Row| {
+            Ok(ParamSetRow {
+                id: row.get(0)?,
+                max_daily_trades: row.get(1)?,
+                stop_loss_pct: row.get(2)?,
+                take_profit_pct: row.get(3)?,
+            })
+        };
         if let Some(pid) = portfolio_id {
             let row: Option<ParamSetRow> = conn
                 .query_row(
-                    "SELECT s.id, s.max_daily_trades FROM strategy_param_sets s
+                    "SELECT s.id, s.max_daily_trades, s.stop_loss_pct, s.take_profit_pct
+                     FROM strategy_param_sets s
                      JOIN sandbox_portfolios p ON p.strategy_param_set_id = s.id
                      WHERE p.id = ?1 AND s.is_active = 1 LIMIT 1",
                     [pid],
-                    |row| {
-                        Ok(ParamSetRow {
-                            id: row.get(0)?,
-                            max_daily_trades: row.get(1)?,
-                        })
-                    },
+                    map_row,
                 )
                 .ok();
             if row.is_some() {
@@ -210,21 +358,19 @@ impl SignalGenerationService {
         }
 
         conn.query_row(
-            "SELECT id, max_daily_trades FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
+            "SELECT id, max_daily_trades, stop_loss_pct, take_profit_pct FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
             [],
-            |row| {
-                Ok(ParamSetRow {
-                    id: row.get(0)?,
-                    max_daily_trades: row.get(1)?,
-                })
-            },
+            map_row,
         )
         .optional()
         .map_err(Into::into)
     }
 
-    fn build_universe(conn: &Connection, _param_set: &ParamSetRow) -> Result<Vec<Value>> {
-        let sql = "SELECT i.symbol, i.name, i.sector, ph.price, ph.change_percent, ph.volume
+    fn build_universe(
+        conn: &Connection,
+        held_symbols: &std::collections::HashSet<String>,
+    ) -> Result<Vec<UniverseRow>> {
+        let sql = "SELECT i.symbol, i.sector, ph.price, ph.change_percent, ph.volume
              FROM instruments i
              LEFT JOIN price_history ph ON ph.symbol = i.symbol AND ph.trade_date = (
                SELECT MAX(trade_date) FROM price_history WHERE symbol = i.symbol
@@ -233,19 +379,52 @@ impl SignalGenerationService {
 
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| {
-            Ok(json!({
-                "symbol": row.get::<_, String>(0)?,
-                "name": row.get::<_, Option<String>>(1)?,
-                "sector": row.get::<_, Option<String>>(2)?,
-                "price": row.get::<_, Option<f64>>(3)?,
-                "change_percent": row.get::<_, Option<f64>>(4)?,
-                "volume": row.get::<_, Option<i64>>(5)?,
-            }))
+            Ok(UniverseRow {
+                symbol: row.get::<_, String>(0)?,
+                sector: row.get::<_, Option<String>>(1)?,
+                price: row.get::<_, Option<f64>>(2)?,
+                change_percent: row.get::<_, Option<f64>>(3)?,
+                volume: row.get::<_, Option<i64>>(4)?,
+            })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut out: Vec<UniverseRow> = rows
+            .filter_map(|r| r.ok())
+            .filter(|r| r.price.is_some())
+            .collect();
+        out.sort_by(|a, b| {
+            let ah = held_symbols.contains(&a.symbol);
+            let bh = held_symbols.contains(&b.symbol);
+            bh.cmp(&ah).then_with(|| {
+                let ac = a.change_percent.unwrap_or(0.0).abs();
+                let bc = b.change_percent.unwrap_or(0.0).abs();
+                bc.partial_cmp(&ac)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.volume.unwrap_or(0).cmp(&a.volume.unwrap_or(0)))
+            })
+        });
+        Ok(out)
     }
 
-    fn get_positions(conn: &Connection, portfolio_id: Option<&str>) -> Result<Vec<Value>> {
+    fn encode_universe_tsv(rows: &[UniverseRow]) -> String {
+        let mut out = String::from("SYM\tpx\tpct\tvol\tsec\n");
+        for row in rows {
+            let px = row.price.unwrap_or(0.0);
+            let pct = row.change_percent.unwrap_or(0.0);
+            let vol = row.volume.unwrap_or(0);
+            let sec = sector_code(row.sector.as_deref());
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                row.symbol,
+                compact_num(px),
+                compact_num(pct),
+                compact_vol(vol),
+                sec
+            ));
+        }
+        out
+    }
+
+    fn sandbox_lots(conn: &Connection, portfolio_id: Option<&str>) -> Result<Vec<HeldLot>> {
         let pid = if let Some(id) = portfolio_id {
             id.to_string()
         } else {
@@ -257,16 +436,27 @@ impl SignalGenerationService {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT symbol, quantity, avg_cost FROM sandbox_positions WHERE portfolio_id = ?1",
+            "SELECT symbol, quantity, avg_cost FROM sandbox_positions WHERE portfolio_id = ?1 AND quantity > 0",
         )?;
         let rows = stmt.query_map([&pid], |row| {
-            Ok(json!({
-                "symbol": row.get::<_, String>(0)?,
-                "quantity": row.get::<_, f64>(1)?,
-                "avgCost": row.get::<_, f64>(2)?,
-            }))
+            Ok(HeldLot {
+                symbol: row.get(0)?,
+                quantity: row.get(1)?,
+                avg_cost: row.get(2)?,
+                last_price: None,
+            })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    fn last_db_price(conn: &Connection, symbol: &str) -> Option<f64> {
+        conn.query_row(
+            "SELECT price FROM price_history WHERE symbol = ?1 ORDER BY trade_date DESC LIMIT 1",
+            [symbol],
+            |row| row.get(0),
+        )
+        .ok()
+        .filter(|p: &f64| *p > 0.0)
     }
 
     fn recent_active_symbols(conn: &Connection, days: i64) -> Result<Vec<String>> {
@@ -308,11 +498,12 @@ impl SignalGenerationService {
                  FROM signals WHERE symbol = ?1 ORDER BY generated_at DESC LIMIT 5",
             )?;
             for row in stmt.query_map([symbol], |row| {
+                let rationale = row.get::<_, String>(3)?;
                 Ok(json!({
                     "generatedAt": row.get::<_, String>(0)?,
                     "action": row.get::<_, String>(1)?,
                     "confidence": row.get::<_, f64>(2)?,
-                    "rationale": row.get::<_, String>(3)?,
+                    "rationale": truncate_chars(&rationale, 240),
                     "executed": row.get::<_, i64>(4)? == 1,
                     "riskPolicyResult": row.get::<_, String>(5)?,
                 }))
@@ -381,14 +572,17 @@ impl SignalGenerationService {
                 continue;
             }
 
-            memory.insert(
-                symbol.clone(),
-                json!({
-                    "recentSignals": recent_signals,
-                    "recentTrades": recent_trades,
-                    "position": position,
-                }),
-            );
+            let mut entry = serde_json::Map::new();
+            if !recent_signals.is_empty() {
+                entry.insert("recentSignals".into(), json!(recent_signals));
+            }
+            if !recent_trades.is_empty() {
+                entry.insert("recentTrades".into(), json!(recent_trades));
+            }
+            if let Some(pos) = position {
+                entry.insert("position".into(), pos);
+            }
+            memory.insert(symbol.clone(), Value::Object(entry));
         }
         Ok(memory)
     }
@@ -410,9 +604,90 @@ impl SignalGenerationService {
     }
 }
 
+struct UniverseRow {
+    symbol: String,
+    sector: Option<String>,
+    price: Option<f64>,
+    change_percent: Option<f64>,
+    volume: Option<i64>,
+}
+
 struct ParamSetRow {
     id: String,
     max_daily_trades: i64,
+    stop_loss_pct: f64,
+    take_profit_pct: Option<f64>,
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut chars = s.chars();
+    let taken: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{taken}…")
+    } else {
+        taken
+    }
+}
+
+fn compact_num(n: f64) -> String {
+    if n.abs() >= 100.0 {
+        format!("{n:.1}")
+    } else {
+        format!("{n:.2}")
+    }
+    .trim_end_matches('0')
+    .trim_end_matches('.')
+    .to_string()
+}
+
+fn compact_vol(v: i64) -> String {
+    if v >= 1_000_000 {
+        format!("{:.1}e6", v as f64 / 1_000_000.0)
+    } else if v >= 10_000 {
+        format!("{:.0}e3", v as f64 / 1_000.0)
+    } else {
+        v.to_string()
+    }
+}
+
+fn sector_code(sector: Option<&str>) -> String {
+    let Some(raw) = sector.filter(|s| !s.is_empty()) else {
+        return "?".into();
+    };
+    let l = raw.to_ascii_lowercase();
+    let code = if l.contains("financial") || l.contains("bank") || l.contains("insurance") {
+        "FIN"
+    } else if l.contains("consumer") || l.contains("food") || l.contains("brew") {
+        "CG"
+    } else if l.contains("oil") || l.contains("gas") || l.contains("energy") {
+        "OG"
+    } else if l.contains("ict") || l.contains("telecom") || l.contains("tech") {
+        "ICT"
+    } else if l.contains("industrial") || l.contains("cement") || l.contains("construct") {
+        "IND"
+    } else if l.contains("agric") || l.contains("palm") {
+        "AGR"
+    } else if l.contains("health") || l.contains("pharma") {
+        "HLTH"
+    } else if l.contains("service") {
+        "SVC"
+    } else if l.contains("estate") || l.contains("property") {
+        "RE"
+    } else if l.contains("natural") || l.contains("mining") {
+        "RES"
+    } else {
+        let mut c: String = raw
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .take(3)
+            .collect::<String>()
+            .to_ascii_uppercase();
+        if c.is_empty() {
+            c = "?".into();
+        }
+        return c;
+    };
+    code.into()
 }
 
 pub async fn run_cycle(
@@ -424,45 +699,78 @@ pub async fn run_cycle(
     calendar: &crate::calendar::TradingCalendar,
     wealth: Option<&crate::wealth::WealthClient>,
 ) -> Result<serde_json::Value> {
-    let _ = crate::ingest::IngestionService::ingest_stocks(conn, client, cache, calendar, true).await;
-    let _ = crate::ingest::IngestionService::ingest_market(conn, client, calendar, true).await;
-
     let mut warnings: Vec<String> = Vec::new();
+    let ingested = match crate::ingest::IngestionService::ingest_stocks(conn, client, cache, calendar, true)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            warnings.push(format!("Pulse stock ingest failed: {e}"));
+            0
+        }
+    };
+    if let Err(e) = crate::ingest::IngestionService::ingest_market(conn, client, calendar, true).await {
+        warnings.push(format!("Pulse market ingest failed: {e}"));
+    }
     let trading_mode = if let Some(w) = wealth {
         w.resolve_trading_mode(settings).await
     } else {
         crate::wealth::TradingMode::Sandbox
     };
 
-    let (cash_for_agent, trading_venue) = if trading_mode == crate::wealth::TradingMode::Live {
-        let cash = if let Some(w) = wealth {
-            match w.get_wallet().await {
-                Ok(wallet) => Some(wallet.brokerage_balance),
-                Err(e) => {
-                    warnings.push(format!("Could not load Wealth brokerage balance for agent: {e}"));
-                    match w.get_portfolio().await {
-                        Ok(snap) => Some(snap.balance),
-                        Err(_) => None,
+    let mut wealth_snap: Option<crate::wealth::WealthPortfolioSnapshot> = None;
+    let (cash_for_agent, trading_venue, live_holdings) =
+        if trading_mode == crate::wealth::TradingMode::Live {
+            if let Some(w) = wealth {
+                let snap = match w.get_portfolio().await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warnings.push(format!("Could not load Wealth holdings for agent: {e}"));
+                        None
                     }
-                }
+                };
+                let cash = match w.get_wallet().await {
+                    Ok(wallet) => Some(wallet.brokerage_balance),
+                    Err(e) => {
+                        warnings.push(format!("Could not load Wealth brokerage balance for agent: {e}"));
+                        snap.as_ref().map(|s| s.balance)
+                    }
+                };
+                let holdings = snap
+                    .as_ref()
+                    .map(|s| HeldLot::from_wealth_holdings(&s.holdings))
+                    .unwrap_or_default();
+                wealth_snap = snap;
+                (cash, "wealth", holdings)
+            } else {
+                (None, "wealth", Vec::new())
             }
         } else {
-            None
+            (None, "sandbox", Vec::new())
         };
-        (cash, "wealth")
-    } else {
-        (None, "sandbox")
-    };
 
-    let signal_ids = SignalGenerationService::generate_for_portfolio(
+    let generated = SignalGenerationService::generate_for_portfolio(
         conn,
         agent,
         settings,
         None,
         cash_for_agent,
         trading_venue,
+        if trading_venue == "wealth" {
+            Some(live_holdings.as_slice())
+        } else {
+            None
+        },
     )
     .await?;
+    let signal_ids = generated.signal_ids;
+
+    if generated.universe_size > 0 && generated.universe_size <= 20 {
+        warnings.push(format!(
+            "Universe is only {} names (seed size). Pulse ingest may be incomplete.",
+            generated.universe_size
+        ));
+    }
 
     let live_market_open = if trading_mode == crate::wealth::TradingMode::Live {
         match wealth {
@@ -493,31 +801,27 @@ pub async fn run_cycle(
 
     if trading_mode == crate::wealth::TradingMode::Sandbox {
         crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None)?;
-    } else if let Some(w) = wealth {
-        // Record Wealth equity for the Home curve (do not write sandbox history).
-        if let Ok((cash, snap)) = async {
-            let snap = w.get_portfolio().await?;
-            let cash = match w.get_wallet().await {
+    } else if let Some(snap) = wealth_snap {
+        let cash = if let Some(w) = wealth {
+            match w.get_wallet().await {
                 Ok(wallet) => wallet.brokerage_balance,
                 Err(_) => snap.balance,
-            };
-            Ok::<_, anyhow::Error>((cash, snap))
-        }
-        .await
-        {
-            let market_value = if snap.stock_value > 0.0 {
-                snap.stock_value
-            } else {
-                snap.holdings.iter().map(|h| h.current_value).sum()
-            };
-            let _ = crate::portfolio::EquityCurveService::upsert_point(
-                conn,
-                "wealth",
-                cash + market_value,
-                cash,
-                market_value,
-            );
-        }
+            }
+        } else {
+            snap.balance
+        };
+        let market_value = if snap.stock_value > 0.0 {
+            snap.stock_value
+        } else {
+            snap.holdings.iter().map(|h| h.current_value).sum()
+        };
+        let _ = crate::portfolio::EquityCurveService::insert_point(
+            conn,
+            "wealth",
+            cash + market_value,
+            cash,
+            market_value,
+        );
     }
 
     Ok(json!({
@@ -525,5 +829,7 @@ pub async fn run_cycle(
         "executed": executed,
         "tradingMode": trading_mode.as_str(),
         "warnings": warnings,
+        "universeSize": generated.universe_size,
+        "instrumentsIngested": ingested,
     }))
 }

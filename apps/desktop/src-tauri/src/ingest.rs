@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 use crate::cache::{CachedPrice, PriceCache};
 use crate::calendar::TradingCalendar;
-use crate::ngx::{NgxPulseClient, NgxStock};
+use crate::ngx::{LatestQuote, NgxPulseClient, NgxStock};
 
 pub struct IngestionService;
 
@@ -23,16 +23,14 @@ impl IngestionService {
         {
             return Ok(0);
         }
-        let stocks = match client.get_stocks(conn).await {
-            Ok(s) => s,
-            Err(_) => return Ok(0),
-        };
+        let stocks = client.get_stocks(conn).await?;
         let trade_date = calendar.today_wat();
         let mut count = 0;
         for stock in stocks {
             Self::upsert_stock(conn, cache, &stock, &trade_date)?;
             count += 1;
         }
+        tracing::info!(target: "ngx_pulse", count, "upserted pulse stocks");
         Ok(count)
     }
 
@@ -175,6 +173,35 @@ impl IngestionService {
             symbol: stock.symbol.clone(),
             price: stock.price,
             trade_date: trade_date.into(),
+            updated_at: Utc::now().to_rfc3339(),
+        });
+        Ok(())
+    }
+
+    pub fn upsert_last_quote(conn: &Connection, cache: &PriceCache, quote: &LatestQuote) -> Result<()> {
+        conn.execute(
+            "INSERT INTO instruments (symbol, name, sector, is_active)
+             VALUES (?1, ?1, 'Unknown', 1)
+             ON CONFLICT(symbol) DO NOTHING",
+            [&quote.symbol],
+        )?;
+        let change_pct = quote.prev_close.filter(|p| *p > 0.0).map(|p| (quote.last - p) / p * 100.0);
+        conn.execute(
+            "INSERT INTO price_history (symbol, trade_date, price, change_percent, ingested_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(symbol, trade_date) DO UPDATE SET
+               price = excluded.price, change_percent = excluded.change_percent, ingested_at = datetime('now')",
+            rusqlite::params![
+                quote.symbol,
+                quote.trade_date,
+                quote.last,
+                change_pct.unwrap_or(0.0)
+            ],
+        )?;
+        cache.set_price(&CachedPrice {
+            symbol: quote.symbol.clone(),
+            price: quote.last,
+            trade_date: quote.trade_date.clone(),
             updated_at: Utc::now().to_rfc3339(),
         });
         Ok(())

@@ -53,6 +53,10 @@ impl PriceCache {
         }
         None
     }
+
+    pub fn clear(&self) {
+        self.inner.lock().clear();
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,8 @@ type CycleCompletePayload = {
   source?: string;
   signals?: number;
   executed?: number;
+  universeSize?: number;
+  instrumentsIngested?: number;
   warnings?: string[];
   error?: string;
 };
@@ -44,10 +46,11 @@ export function CycleProvider({ children }: { children: ReactNode }) {
       }
       const signals = payload.signals ?? 0;
       const executed = payload.executed ?? 0;
+      const universe = payload.universeSize != null ? ` Universe ${payload.universeSize}.` : '';
       const warnings = payload.warnings?.length
         ? ` Warnings: ${payload.warnings.join('; ')}`
         : '';
-      toast.success(`${signals} signals, ${executed} executed.${warnings}`, `${source} complete`);
+      toast.success(`${signals} signals, ${executed} executed.${universe}${warnings}`, `${source} complete`);
     },
     [toast],
   );

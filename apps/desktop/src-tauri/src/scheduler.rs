@@ -86,14 +86,18 @@ fn catch_up_on_launch(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<
 
     state.db.with_conn(|conn| {
         block_on_local(async {
-            let _ = crate::ingest::IngestionService::ingest_stocks(
+            match crate::ingest::IngestionService::ingest_stocks(
                 conn,
                 &client,
                 &state.cache,
                 &calendar,
                 false,
             )
-            .await;
+            .await
+            {
+                Ok(n) => tracing::info!(target: "ngx_pulse", count = n, "launch stock ingest"),
+                Err(e) => tracing::warn!(target: "ngx_pulse", error = %e, "launch stock ingest failed"),
+            }
             Ok(())
         })
     })?;

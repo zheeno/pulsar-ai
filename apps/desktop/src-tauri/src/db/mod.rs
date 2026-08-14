@@ -27,8 +27,12 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<()> {
-        let migration = include_str!("../../migrations/001_initial.sql");
         let conn = self.conn.lock();
+        Self::apply_migrations(&conn)
+    }
+
+    fn apply_migrations(conn: &Connection) -> Result<()> {
+        let migration = include_str!("../../migrations/001_initial.sql");
         conn.execute_batch(migration)
             .context("run migrations")?;
         let migration2 = include_str!("../../migrations/002_broker_orders.sql");
@@ -37,9 +41,48 @@ impl Database {
         let migration3 = include_str!("../../migrations/003_equity_curve_venue.sql");
         conn.execute_batch(migration3)
             .context("run equity_curve_venue migration")?;
-        // Discontinue strategy symbol allowlists — universe is all active instruments.
+        Self::migrate_equity_curve_recorded_at(conn)?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
+        Ok(())
+    }
+
+    fn migrate_equity_curve_recorded_at(conn: &Connection) -> Result<()> {
+        let has_recorded_at: bool = conn
+            .prepare("PRAGMA table_info(equity_curve_points)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "recorded_at");
+        if has_recorded_at {
+            return Ok(());
+        }
+        conn.execute_batch(include_str!("../../migrations/004_equity_curve_recorded_at.sql"))
+            .context("run equity_curve recorded_at migration")
+    }
+
+    /// Drop all app tables, re-run migrations, and seed a fresh sandbox.
+    pub fn wipe_and_reseed(&self, starting_capital: f64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .context("disable foreign keys")?;
+        let tables: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for name in tables {
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            conn.execute(&format!("DROP TABLE IF EXISTS \"{name}\""), [])
+                .with_context(|| format!("drop table {name}"))?;
+        }
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .context("enable foreign keys")?;
+        Self::apply_migrations(&conn)?;
+        crate::seed::SeedService::seed_if_empty(&conn, starting_capital)?;
         Ok(())
     }
 
