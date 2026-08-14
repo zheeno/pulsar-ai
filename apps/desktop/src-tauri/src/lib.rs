@@ -4,10 +4,14 @@ mod backtest;
 mod cache;
 mod calendar;
 mod commands;
+mod cycle_auth;
 mod db;
 mod execution;
+mod http_client;
 mod indicators;
 mod ingest;
+mod intents;
+mod net_policy;
 mod ngx;
 mod portfolio;
 mod rate_limit;
@@ -155,7 +159,6 @@ pub fn run() {
     load_dotenv();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();

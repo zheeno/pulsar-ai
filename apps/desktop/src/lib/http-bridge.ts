@@ -7,6 +7,12 @@ const SETTINGS_KEY = 'pulsar.browser.settings';
 const SECRETS_KEY = 'pulsar.browser.secrets';
 const STORE_KEY = 'pulsar.browser.store';
 
+try {
+  localStorage.removeItem(SECRETS_KEY);
+} catch {
+  /* ignore */
+}
+
 type Settings = Record<string, unknown>;
 
 interface MockStore {
@@ -46,6 +52,11 @@ function defaultSettings(): Settings {
     autoCycleIntervalMinutes: 30,
     wealthEmail: undefined,
     wealthConnected: false,
+    liveTradingEnabled: false,
+    scheduledLiveAuthorized: false,
+    maxLiveNotional: 500_000,
+    maxLiveActions: 10,
+    retainRawLlmLogs: false,
   };
 }
 
@@ -114,20 +125,15 @@ function saveSettingsLocal(settings: Settings) {
 }
 
 function loadSecrets(): Record<string, string> {
-  try {
-    return JSON.parse(localStorage.getItem(SECRETS_KEY) || '{}');
-  } catch {
-    return {};
-  }
+  return {};
 }
 
-function saveSecrets(partial: Record<string, string | undefined>) {
-  const current = loadSecrets();
-  for (const [k, v] of Object.entries(partial)) {
-    if (v === undefined || v === '') delete current[k];
-    else current[k] = v;
+function saveSecrets(_partial: Record<string, string | undefined>) {
+  try {
+    localStorage.removeItem(SECRETS_KEY);
+  } catch {
+    /* ignore */
   }
-  localStorage.setItem(SECRETS_KEY, JSON.stringify(current));
 }
 
 function loadStore(): MockStore {
@@ -163,11 +169,10 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       // Match Rust: only complete_onboarding may flip this to true.
       next.onboardingComplete = current.onboardingComplete;
       saveSettingsLocal(next);
-      saveSecrets({
-        pulsePassword: payload.pulsePassword,
-        pulseApiKey: payload.pulseApiKey,
-        llmApiKey: payload.llmApiKey,
-      });
+      if (payload.pulsePassword || payload.pulseApiKey || payload.llmApiKey) {
+        throw new Error('Credentials cannot be stored in browser mock mode — use the Tauri desktop app');
+      }
+      saveSecrets({});
       return undefined as T;
     }
 
@@ -201,7 +206,6 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         loginUrl: null,
         httpStatus: null,
         tokenExpiresAt: null,
-        tokenPreview: null,
         message: 'Browser mock — use Tauri desktop for real Pulse auth',
         logs: ['browser-mock: no network call'],
       } as T;

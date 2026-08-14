@@ -4,7 +4,6 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::agent::AgentBridge;
-use crate::execution::ExecutionService;
 use crate::indicators::IndicatorService;
 use crate::settings::AppSettings;
 
@@ -45,7 +44,7 @@ pub struct SignalGenerationService;
 
 impl SignalGenerationService {
     pub async fn generate_for_portfolio(
-        conn: &Connection,
+        db: &crate::db::Database,
         agent: &AgentBridge,
         settings: &AppSettings,
         portfolio_id: Option<&str>,
@@ -53,30 +52,27 @@ impl SignalGenerationService {
         trading_venue: &str,
         live_holdings: Option<&[HeldLot]>,
     ) -> Result<PortfolioGeneration> {
-        let param_set = Self::get_active_param_set(conn, portfolio_id)?;
+        let live_holdings_owned = live_holdings.map(|h| h.to_vec());
+        let settings_fee = settings.simulated_fee_pct;
+        let venue = trading_venue.to_string();
+        let pid = portfolio_id.map(|s| s.to_string());
+        let prep = db.with_conn(|conn| -> Result<Option<_>> {
+        let param_set = Self::get_active_param_set(conn, pid.as_deref())?;
         let Some(param_set) = param_set else {
-            return Ok(PortfolioGeneration {
-                signal_ids: vec![],
-                universe_size: 0,
-            });
+            return Ok(None);
         };
 
-        let lots = if trading_venue == "wealth" {
-            live_holdings
-                .map(|h| h.to_vec())
-                .unwrap_or_default()
+        let lots = if venue == "wealth" {
+            live_holdings_owned.clone().unwrap_or_default()
         } else {
-            Self::sandbox_lots(conn, portfolio_id)?
+            Self::sandbox_lots(conn, pid.as_deref())?
         };
         let held_symbols: std::collections::HashSet<String> =
             lots.iter().map(|l| l.symbol.clone()).collect();
 
         let universe_rows = Self::build_universe(conn, &held_symbols)?;
         if universe_rows.is_empty() {
-            return Ok(PortfolioGeneration {
-                signal_ids: vec![],
-                universe_size: 0,
-            });
+            return Ok(None);
         }
 
         let market_context = Self::get_market_context(conn)?;
@@ -88,7 +84,7 @@ impl SignalGenerationService {
                 break;
             }
         }
-        let symbol_memory = Self::build_symbol_memory(conn, portfolio_id, &memory_symbols)?;
+        let symbol_memory = Self::build_symbol_memory(conn, pid.as_deref(), &memory_symbols)?;
 
         let cash = cash_balance.unwrap_or_else(|| {
             conn.query_row(
@@ -191,6 +187,7 @@ impl SignalGenerationService {
                     "",
                     model_name,
                     PORTFOLIO_PROMPT_VERSION,
+                    false,
                 )? {
                     signal_ids.push(id);
                 }
@@ -213,10 +210,18 @@ impl SignalGenerationService {
             "maxActions": llm_cap,
             "symbolMemory": symbol_memory,
             "cashBalance": cash,
-            "brokerageBalance": if trading_venue == "wealth" { Some(cash) } else { None::<f64> },
-            "tradingVenue": trading_venue,
-            "estimatedFeePct": settings.simulated_fee_pct,
+            "brokerageBalance": if venue == "wealth" { Some(cash) } else { None::<f64> },
+            "tradingVenue": venue,
+            "estimatedFeePct": settings_fee,
         });
+        Ok(Some((context, valid_symbols, seen, signal_ids, universe_size)))
+        })?;
+        let Some((context, valid_symbols, mut seen, mut signal_ids, universe_size)) = prep else {
+            return Ok(PortfolioGeneration {
+                signal_ids: vec![],
+                universe_size: 0,
+            });
+        };
 
         let result = agent.portfolio_signals(settings, context).await?;
         let signals = result
@@ -230,11 +235,25 @@ impl SignalGenerationService {
         let raw_response = result.get("rawResponse").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let model_name = result.get("modelName").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
+        db.with_conn(|conn| {
         if let Some(arr) = signals.as_array() {
-            for pick in arr {
+            let mut buys = 0usize;
+            let mut sells = 0usize;
+            for pick in arr.iter().take(crate::execution::MAX_SIGNAL_TOTAL) {
                 let symbol = pick.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                 if symbol.is_empty() || seen.contains(symbol) || !valid_symbols.contains(symbol) {
                     continue;
+                }
+                if !crate::ngx::is_valid_ticker(symbol) {
+                    continue;
+                }
+                let action = pick.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if action == "BUY" {
+                    if buys >= crate::execution::MAX_SIGNAL_BUYS { continue; }
+                    buys += 1;
+                } else if action == "SELL" {
+                    if sells >= crate::execution::MAX_SIGNAL_SELLS { continue; }
+                    sells += 1;
                 }
                 seen.insert(symbol.to_string());
 
@@ -246,12 +265,15 @@ impl SignalGenerationService {
                     &raw_response,
                     &model_name,
                     PORTFOLIO_PROMPT_VERSION,
+                    settings.retain_raw_llm_logs,
                 )?;
                 if let Some(id) = signal_id {
                     signal_ids.push(id);
                 }
             }
         }
+        Ok(())
+        })?;
 
         Ok(PortfolioGeneration {
             signal_ids,
@@ -296,7 +318,7 @@ impl SignalGenerationService {
         let raw_response = result.get("rawResponse").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let model_name = result.get("modelName").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        Self::persist_signal(conn, &output, symbol, &prompt, &raw_response, &model_name, PROMPT_VERSION)
+        Self::persist_signal(conn, &output, symbol, &prompt, &raw_response, &model_name, PROMPT_VERSION, settings.retain_raw_llm_logs)
     }
 
     fn persist_signal(
@@ -307,12 +329,13 @@ impl SignalGenerationService {
         raw_response: &str,
         model_name: &str,
         prompt_version: &str,
+        retain_raw: bool,
     ) -> Result<Option<String>> {
         let action = pick.get("action").and_then(|v| v.as_str()).unwrap_or("HOLD");
         let confidence = pick.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let rationale = pick.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
 
-        if symbol.is_empty() {
+        if symbol.is_empty() || !crate::ngx::is_valid_ticker(symbol) {
             return Ok(None);
         }
 
@@ -324,9 +347,19 @@ impl SignalGenerationService {
         )?;
 
         let log_id = Uuid::new_v4().to_string();
+        let stored_prompt = if retain_raw {
+            redact_audit(prompt, 4000)
+        } else {
+            redact_audit(prompt, 400)
+        };
+        let stored_response = if retain_raw {
+            redact_audit(raw_response, 4000)
+        } else {
+            redact_audit(raw_response, 400)
+        };
         conn.execute(
             "INSERT INTO signal_llm_logs (id, signal_id, prompt, raw_response) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![log_id, signal_id, prompt, raw_response],
+            rusqlite::params![log_id, signal_id, stored_prompt, stored_response],
         )?;
 
         Ok(Some(signal_id))
@@ -619,6 +652,14 @@ struct ParamSetRow {
     take_profit_pct: Option<f64>,
 }
 
+fn redact_audit(s: &str, max: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect();
+    truncate_chars(&cleaned, max)
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     let mut chars = s.chars();
     let taken: String = chars.by_ref().take(max).collect();
@@ -691,16 +732,19 @@ fn sector_code(sector: Option<&str>) -> String {
 }
 
 pub async fn run_cycle(
-    conn: &Connection,
+    db: &crate::db::Database,
     agent: &AgentBridge,
     settings: &AppSettings,
     cache: &crate::cache::PriceCache,
     client: &crate::ngx::NgxPulseClient,
     calendar: &crate::calendar::TradingCalendar,
     wealth: Option<&crate::wealth::WealthClient>,
+    execute: bool,
+    allow_bulk_liquidation: bool,
+    cycle_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let mut warnings: Vec<String> = Vec::new();
-    let ingested = match crate::ingest::IngestionService::ingest_stocks(conn, client, cache, calendar, true)
+    let ingested = match crate::ingest::IngestionService::ingest_stocks(db, client, cache, calendar, true)
         .await
     {
         Ok(n) => n,
@@ -709,7 +753,7 @@ pub async fn run_cycle(
             0
         }
     };
-    if let Err(e) = crate::ingest::IngestionService::ingest_market(conn, client, calendar, true).await {
+    if let Err(e) = crate::ingest::IngestionService::ingest_market(db, client, calendar, true).await {
         warnings.push(format!("Pulse market ingest failed: {e}"));
     }
     let trading_mode = if let Some(w) = wealth {
@@ -722,6 +766,9 @@ pub async fn run_cycle(
     let (cash_for_agent, trading_venue, live_holdings) =
         if trading_mode == crate::wealth::TradingMode::Live {
             if let Some(w) = wealth {
+                if execute {
+                    let _ = crate::execution::ExecutionService::reconcile_if_possible(db, w).await;
+                }
                 let snap = match w.get_portfolio().await {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -750,7 +797,7 @@ pub async fn run_cycle(
         };
 
     let generated = SignalGenerationService::generate_for_portfolio(
-        conn,
+        db,
         agent,
         settings,
         None,
@@ -787,46 +834,82 @@ pub async fn run_cycle(
         true
     };
 
-    let (executed, exec_warnings) = ExecutionService::process_signals(
-        conn,
+    let do_execute = match trading_mode {
+        crate::wealth::TradingMode::Sandbox => true,
+        crate::wealth::TradingMode::Live => execute && settings.live_trading_enabled,
+    };
+
+    let (executed, exec_warnings) = crate::execution::ExecutionService::process_signals(
+        db,
         cache,
         settings,
         &signal_ids,
         wealth,
         trading_mode,
         live_market_open,
+        do_execute,
+        allow_bulk_liquidation,
+        cycle_id,
     )
     .await?;
     warnings.extend(exec_warnings);
 
     if trading_mode == crate::wealth::TradingMode::Sandbox {
-        crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None)?;
-    } else if let Some(snap) = wealth_snap {
-        let cash = if let Some(w) = wealth {
-            match w.get_wallet().await {
-                Ok(wallet) => wallet.brokerage_balance,
-                Err(_) => snap.balance,
-            }
-        } else {
-            snap.balance
-        };
-        let market_value = if snap.stock_value > 0.0 {
-            snap.stock_value
-        } else {
-            snap.holdings.iter().map(|h| h.current_value).sum()
-        };
-        let _ = crate::portfolio::EquityCurveService::insert_point(
-            conn,
-            "wealth",
-            cash + market_value,
-            cash,
-            market_value,
-        );
+        db.with_conn(|conn| crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None))?;
+    } else if execute {
+        if let Some(snap) = wealth_snap {
+            let cash = if let Some(w) = wealth {
+                match w.get_wallet().await {
+                    Ok(wallet) => wallet.brokerage_balance,
+                    Err(_) => snap.balance,
+                }
+            } else {
+                snap.balance
+            };
+            let market_value = if snap.stock_value > 0.0 {
+                snap.stock_value
+            } else {
+                snap.holdings.iter().map(|h| h.current_value).sum()
+            };
+            let _ = db.with_conn(|conn| {
+                crate::portfolio::EquityCurveService::insert_point(
+                    conn,
+                    "wealth",
+                    cash + market_value,
+                    cash,
+                    market_value,
+                )
+            });
+        }
     }
+
+    let _ = db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM cycle_audits WHERE expires_at < datetime('now')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO cycle_audits (id, cycle_id, summary, expires_at)
+             VALUES (?1, ?2, ?3, datetime('now', '+14 days'))",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                cycle_id.unwrap_or(""),
+                format!(
+                    "signals={} executed={} venue={} universe={}",
+                    signal_ids.len(),
+                    executed,
+                    trading_mode.as_str(),
+                    generated.universe_size
+                )
+            ],
+        )?;
+        Ok(())
+    });
 
     Ok(json!({
         "signals": signal_ids.len(),
         "executed": executed,
+        "signalIds": signal_ids,
         "tradingMode": trading_mode.as_str(),
         "warnings": warnings,
         "universeSize": generated.universe_size,

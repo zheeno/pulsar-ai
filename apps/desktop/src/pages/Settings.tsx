@@ -225,6 +225,8 @@ export default function SettingsPage() {
   const [strategyDraft, setStrategyDraft] = useState<StrategyDraft | null>(null);
   const [autoCycleEnabled, setAutoCycleEnabled] = useState(false);
   const [autoCycleMinutes, setAutoCycleMinutes] = useState(30);
+  const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
+  const [scheduledLiveAuthorized, setScheduledLiveAuthorized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [strategyBusy, setStrategyBusy] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
@@ -251,6 +253,8 @@ export default function SettingsPage() {
     setStrategyDraft(draftFromStrategy(strategy));
     setAutoCycleEnabled(!!s.autoCycleEnabled);
     setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
+    setLiveTradingEnabled(!!s.liveTradingEnabled);
+    setScheduledLiveAuthorized(!!s.scheduledLiveAuthorized);
     try {
       setDataDir(await api<string>('app_data_dir'));
     } catch {
@@ -380,12 +384,16 @@ export default function SettingsPage() {
           ...settings,
           autoCycleEnabled,
           autoCycleIntervalMinutes: minutes,
+          liveTradingEnabled,
+          scheduledLiveAuthorized,
         },
       });
       setSettings({
         ...settings,
         autoCycleEnabled,
         autoCycleIntervalMinutes: minutes,
+        liveTradingEnabled,
+        scheduledLiveAuthorized,
       });
       setAutoCycleMinutes(minutes);
       if (autoCycleEnabled) {
@@ -832,6 +840,44 @@ export default function SettingsPage() {
             className={`toggle ${autoCycleEnabled ? 'is-on' : ''}`}
             disabled={cycleBusy}
             onClick={() => setAutoCycleEnabled((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label">Enable live trading</label>
+            <p className="toggle-row__hint">
+              Required before any Wealth order is submitted. Manual live cycles still ask for a confirmation token.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={liveTradingEnabled}
+            className={`toggle ${liveTradingEnabled ? 'is-on' : ''}`}
+            disabled={cycleBusy}
+            onClick={() => setLiveTradingEnabled((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label">Authorize scheduled live cycles</label>
+            <p className="toggle-row__hint">
+              Recurring live execution for the scheduler. Revoke anytime; the next cycle is blocked immediately.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={scheduledLiveAuthorized}
+            className={`toggle ${scheduledLiveAuthorized ? 'is-on' : ''}`}
+            disabled={cycleBusy || !liveTradingEnabled}
+            onClick={() => setScheduledLiveAuthorized((v) => !v)}
           >
             <span className="toggle__thumb" />
           </button>

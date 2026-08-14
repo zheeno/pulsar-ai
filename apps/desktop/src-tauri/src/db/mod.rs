@@ -13,8 +13,10 @@ pub struct Database {
 impl Database {
     pub fn open(app_data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(app_data_dir).context("create app data dir")?;
+        harden_dir_permissions(app_data_dir);
         let db_path = app_data_dir.join("pulsar.db");
         let conn = Connection::open(&db_path).context("open sqlite db")?;
+        harden_file_permissions(&db_path);
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
             .context("set pragmas")?;
 
@@ -42,6 +44,8 @@ impl Database {
         conn.execute_batch(migration3)
             .context("run equity_curve_venue migration")?;
         Self::migrate_equity_curve_recorded_at(conn)?;
+        conn.execute_batch(include_str!("../../migrations/005_order_intents.sql"))
+            .context("run order_intents migration")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
         Ok(())
@@ -92,5 +96,21 @@ impl Database {
     {
         let conn = self.conn.lock();
         f(&conn)
+    }
+}
+
+fn harden_dir_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn harden_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
 }

@@ -59,14 +59,28 @@ pub fn settings_set(payload: SettingsUpdate, state: State<'_, Arc<AppState>>) ->
             set_secret(SECRET_PULSE_API_KEY, &key).map_err(|e| e.to_string())?;
         }
     }
-    if let Some(key) = payload.llm_api_key {
-        set_secret(SECRET_LLM_API_KEY, &key).map_err(|e| e.to_string())?;
+    let llm_key = payload.llm_api_key.clone();
+    if let Some(key) = &llm_key {
+        set_secret(SECRET_LLM_API_KEY, key).map_err(|e| e.to_string())?;
     }
 
-    // onboarding_complete may only be set by complete_onboarding (or cleared by logout).
     let mut settings = payload.settings;
     let current = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
     settings.onboarding_complete = current.onboarding_complete;
+
+    let new_url = settings.llm_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let old_url = current.llm_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(url) = new_url {
+        let allow_custom = llm_key.as_ref().is_some_and(|k| !k.is_empty())
+            && old_url.map(|u| u != url).unwrap_or(true);
+        crate::net_policy::validate_llm_base_url(url, allow_custom || crate::net_policy::is_default_provider_host(
+            reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| h.to_string())).as_deref().unwrap_or(""),
+        ))
+        .map_err(|e| e.to_string())?;
+        if old_url.is_some() && old_url != new_url && llm_key.as_ref().is_none_or(|k| k.is_empty()) {
+            return Err("Changing the LLM endpoint requires re-entering the API key".into());
+        }
+    }
 
     state
         .db
@@ -389,11 +403,8 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
         let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let pulse = NgxPulseClient::from_settings(&settings, password, api_key);
-        let quotes = state
-            .db
-            .with_conn(|conn| Ok(block_on_local(async { pulse.get_latest_quotes(conn, &symbols).await })))
-            .map_err(|e| e.to_string())?;
-        let quotes = quotes.unwrap_or_else(|_| vec![]);
+        let quotes = block_on_local(async { pulse.get_latest_quotes(&symbols).await })
+            .unwrap_or_else(|_| vec![]);
         let stale = quotes.is_empty() && !symbols.is_empty();
         let quoted_symbols: Vec<String> = quotes.iter().map(|q| q.symbol.clone()).collect();
 
@@ -649,17 +660,12 @@ pub async fn market_status(state: State<'_, Arc<AppState>>) -> Result<MarketStat
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
 
-        let (pulse_status, pulse_is_open) = state
-            .db
-            .with_conn(|conn| {
-                Ok(block_on_local(async {
-                    match client.get_market_status(conn).await {
-                        Ok(s) => (Some(s.status), Some(s.is_open)),
-                        Err(_) => (None, None),
-                    }
-                }))
-            })
-            .unwrap_or((None, None));
+        let (pulse_status, pulse_is_open) = block_on_local(async {
+            match client.get_market_status().await {
+                Ok(s) => (Some(s.status), Some(s.is_open)),
+                Err(_) => (None, None),
+            }
+        });
 
         Ok(MarketStatusResponse {
             is_open,
@@ -688,9 +694,12 @@ pub fn cycle_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
 #[tauri::command]
 pub async fn cycle_run(
     app: AppHandle,
+    confirmation_token: Option<String>,
+    allow_bulk_liquidation: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
     let state = state.inner().clone();
+    let allow_bulk = allow_bulk_liquidation.unwrap_or(false);
     tokio::task::spawn_blocking(move || {
         let Some(_gate) = CycleGateGuard::acquire(state.clone()) else {
             return Err("A trading cycle is already running.".into());
@@ -702,6 +711,9 @@ pub async fn cycle_run(
         );
 
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        if !settings.onboarding_complete {
+            return Err("Complete onboarding before running a cycle.".into());
+        }
         let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
@@ -731,22 +743,122 @@ pub async fn cycle_run(
             );
         }
 
-        match state.db.with_conn(|conn| {
-            block_on_local(run_cycle(
-                conn,
-                &state.agent,
-                &settings,
-                &state.cache,
-                &client,
-                &calendar,
-                wealth.as_ref(),
-            ))
-        }) {
+        let trading_mode = if let Some(ref w) = wealth {
+            block_on_local(w.resolve_trading_mode(&settings))
+        } else {
+            crate::wealth::TradingMode::Sandbox
+        };
+        if trading_mode == crate::wealth::TradingMode::Live && !settings.wealth_connected {
+            return Err("Wealth must be connected for live trading.".into());
+        }
+
+        let strategy_hash = state
+            .db
+            .with_conn(|conn| {
+                let id: String = conn.query_row(
+                    "SELECT id FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(id)
+            })
+            .unwrap_or_else(|_| "none".into());
+
+        let execute_live = trading_mode == crate::wealth::TradingMode::Live
+            && settings.live_trading_enabled
+            && confirmation_token.is_some();
+        let execute_sandbox = trading_mode != crate::wealth::TradingMode::Live;
+        let execute = execute_sandbox || execute_live;
+
+        if execute_live {
+            if let Some(token) = confirmation_token.as_deref() {
+                let confirm = state
+                    .live_intents
+                    .consume(token, "wealth", &strategy_hash, allow_bulk)
+                    .map_err(|e| e.to_string())?;
+                let live_open = wealth
+                    .as_ref()
+                    .map(|w| block_on_local(w.market_is_open()).unwrap_or(false))
+                    .unwrap_or(false);
+                let (executed, warnings) = block_on_local(crate::execution::ExecutionService::process_signals(
+                    &state.db,
+                    &state.cache,
+                    &settings,
+                    &confirm.signal_ids,
+                    wealth.as_ref(),
+                    crate::wealth::TradingMode::Live,
+                    live_open,
+                    true,
+                    allow_bulk,
+                    Some(&confirm.cycle_id),
+                ))
+                .map_err(|e| e.to_string())?;
+                let payload = serde_json::json!({
+                    "ok": true,
+                    "source": "manual",
+                    "signals": confirm.signal_ids.len(),
+                    "executed": executed,
+                    "warnings": warnings,
+                    "tradingMode": "live",
+                });
+                let _ = app.emit("cycle:complete", payload.clone());
+                return Ok(payload);
+            }
+        }
+
+        let cycle_id = uuid::Uuid::new_v4().to_string();
+        match block_on_local(run_cycle(
+            &state.db,
+            &state.agent,
+            &settings,
+            &state.cache,
+            &client,
+            &calendar,
+            wealth.as_ref(),
+            execute,
+            allow_bulk,
+            Some(&cycle_id),
+        )) {
             Ok(result) => {
                 let mut payload = result;
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("ok".into(), serde_json::json!(true));
                     obj.insert("source".into(), serde_json::json!("manual"));
+                    if trading_mode == crate::wealth::TradingMode::Live
+                        && settings.live_trading_enabled
+                        && confirmation_token.is_none()
+                    {
+                        let ids = obj
+                            .get("signalIds")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let issued = state.live_intents.issue(
+                            cycle_id,
+                            "wealth".into(),
+                            strategy_hash,
+                            ids,
+                            allow_bulk,
+                        );
+                        obj.insert("pendingLive".into(), serde_json::json!(true));
+                        obj.insert(
+                            "confirmationToken".into(),
+                            serde_json::json!(issued.token),
+                        );
+                        obj.insert("confirmationExpiresSec".into(), serde_json::json!(120));
+                        obj.insert("executed".into(), serde_json::json!(0));
+                    }
+                    if trading_mode == crate::wealth::TradingMode::Live && !settings.live_trading_enabled {
+                        obj.insert("pendingLive".into(), serde_json::json!(false));
+                        obj.insert(
+                            "liveDisabled".into(),
+                            serde_json::json!(true),
+                        );
+                    }
                 }
                 let _ = app.emit("cycle:complete", payload.clone());
                 Ok(payload)
@@ -779,18 +891,14 @@ pub async fn cycle_ingest(state: State<'_, Arc<AppState>>) -> Result<serde_json:
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
         let calendar = TradingCalendar::default();
-        let count = state
-            .db
-            .with_conn(|conn| {
-                block_on_local(IngestionService::ingest_stocks(
-                    conn,
-                    &client,
-                    &state.cache,
-                    &calendar,
-                    true,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
+        let count = block_on_local(IngestionService::ingest_stocks(
+            &state.db,
+            &client,
+            &state.cache,
+            &calendar,
+            true,
+        ))
+        .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "count": count }))
     })
     .await
@@ -812,10 +920,7 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
             None
         };
 
-        let ids = state
-            .db
-            .with_conn(|conn| {
-                block_on_local(async {
+        let ids = block_on_local(async {
                     let trading_mode = if let Some(ref w) = wealth {
                         w.resolve_trading_mode(&settings).await
                     } else {
@@ -840,7 +945,7 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
                         (None, "sandbox", Vec::new())
                     };
                     SignalGenerationService::generate_for_portfolio(
-                        conn,
+                        &state.db,
                         &state.agent,
                         &settings,
                         None,
@@ -854,7 +959,6 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
                     )
                     .await
                 })
-            })
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({
             "signalIds": ids.signal_ids,
@@ -1118,10 +1222,9 @@ pub async fn symbol_detail_pulse(
         let from_s = from.format("%Y-%m-%d").to_string();
         let to_s = to.format("%Y-%m-%d").to_string();
 
-        let result = state.db.with_conn(|conn| {
-            Ok(block_on_local(async {
+        let result = block_on_local(async {
                 match client
-                    .get_symbol_price(conn, &symbol_for_pulse, Some(&from_s), Some(&to_s))
+                    .get_symbol_price(&symbol_for_pulse, Some(&from_s), Some(&to_s))
                     .await
                 {
                     Ok(pts) => {
@@ -1175,10 +1278,9 @@ pub async fn symbol_detail_pulse(
                         "error": e.to_string(),
                     }),
                 }
-            }))
-        });
+            });
 
-        result.map_err(|e: anyhow::Error| e.to_string())
+        Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1290,17 +1392,42 @@ pub async fn start_backtest(
     end_date: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let run_id = state
+    let start = chrono::NaiveDate::parse_from_str(&start_date, "%Y-%m-%d")
+        .map_err(|_| "startDate must be YYYY-MM-DD".to_string())?;
+    let end = chrono::NaiveDate::parse_from_str(&end_date, "%Y-%m-%d")
+        .map_err(|_| "endDate must be YYYY-MM-DD".to_string())?;
+    if end < start {
+        return Err("endDate must be on or after startDate".into());
+    }
+    if (end - start).num_days() > 365 {
+        return Err("Backtest range cannot exceed 365 days".into());
+    }
+    if let Some(last) = state.last_backtest_at() {
+        if last.elapsed() < std::time::Duration::from_secs(15) {
+            return Err("Please wait before starting another backtest".into());
+        }
+    }
+    if !state.try_begin_backtest() {
+        return Err("A backtest is already running".into());
+    }
+
+    let run_id = match state
         .db
         .with_conn(|conn| BacktestService::start_run(conn, &strategy_param_set_id, &start_date, &end_date))
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(id) => id,
+        Err(e) => {
+            state.end_backtest();
+            return Err(e.to_string());
+        }
+    };
 
     let state_clone = state.inner().clone();
     let run_id_clone = run_id.clone();
     tauri::async_runtime::spawn(async move {
         let _ = tokio::task::spawn_blocking(move || {
             let settings = state_clone.db.with_conn(get_settings).unwrap_or_default();
-            state_clone.db.with_conn(|conn| {
+            let result = state_clone.db.with_conn(|conn| {
                 block_on_local(BacktestService::run_async(
                     conn,
                     &state_clone.agent,
@@ -1310,7 +1437,9 @@ pub async fn start_backtest(
                     &start_date,
                     &end_date,
                 ))
-            })
+            });
+            state_clone.end_backtest();
+            result
         })
         .await;
     });

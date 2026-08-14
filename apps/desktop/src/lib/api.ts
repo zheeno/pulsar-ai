@@ -17,6 +17,13 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     return { payload: args };
   }
 
+  if (command === 'cycle_run') {
+    return {
+      confirmation_token: args.confirmationToken,
+      allow_bulk_liquidation: args.allowBulkLiquidation,
+    };
+  }
+
   if (command === 'start_backtest') {
     return {
       strategy_param_set_id: args.strategyParamSetId,
@@ -57,6 +64,11 @@ export interface AppSettings {
   autoCycleIntervalMinutes: number;
   wealthEmail?: string | null;
   wealthConnected?: boolean;
+  liveTradingEnabled?: boolean;
+  scheduledLiveAuthorized?: boolean;
+  maxLiveNotional?: number;
+  maxLiveActions?: number;
+  retainRawLlmLogs?: boolean;
 }
 
 export interface PortfolioData {

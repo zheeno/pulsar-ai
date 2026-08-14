@@ -252,15 +252,35 @@ export default function DashboardPage() {
     if (cycleRunning || cycleBusy) return;
     setCycleBusy(true);
     try {
-      await api('cycle_run');
+      const first = await api<{
+        pendingLive?: boolean;
+        confirmationToken?: string;
+        signals?: number;
+        liveDisabled?: boolean;
+      }>('cycle_run');
+      if (first?.pendingLive && first.confirmationToken) {
+        const n = first.signals ?? 0;
+        const ok = window.confirm(
+          `Confirm live execution of ${n} signal(s)? This places real Wealth orders.`,
+        );
+        if (ok) {
+          const bulk = window.confirm(
+            'Allow bulk liquidation above 25% of portfolio? Click Cancel to keep the 25% cap.',
+          );
+          await api('cycle_run', {
+            confirmationToken: first.confirmationToken,
+            allowBulkLiquidation: bulk,
+          });
+        }
+      } else if (first?.liveDisabled) {
+        toast.warning('Live trading is off in Settings — signals were generated only.', 'Cycle');
+      }
       void loadData();
     } catch (e) {
       const msg = String(e);
-      // Gate rejection has no cycle:complete event.
       if (msg.toLowerCase().includes('already running')) {
         toast.warning(msg, 'Cycle');
       }
-      // Other failures emit cycle:complete (handled by CycleProvider).
     } finally {
       setCycleBusy(false);
     }

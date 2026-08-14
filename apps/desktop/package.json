@@ -19,11 +19,10 @@
   "dependencies": {
     "@ngx/shared": "*",
     "@tauri-apps/api": "^2.2.0",
-    "@tauri-apps/plugin-shell": "^2.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^7.1.1",
-    "recharts": "^2.15.0"
+    "recharts": "^2.15.4"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.2.0",

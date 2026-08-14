@@ -1,14 +1,20 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::net_policy::validate_llm_base_url;
 use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
+
+const AGENT_IPC_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct AgentBridge {
     child: Arc<Mutex<Option<AgentProcess>>>,
@@ -76,7 +82,8 @@ impl AgentBridge {
         });
         // Zod optional() rejects null — omit empty/unset baseUrl for OpenAI defaults.
         if let Some(url) = settings.llm_base_url.as_ref().filter(|u| !u.is_empty()) {
-            llm["baseUrl"] = json!(url);
+            let normalized = validate_llm_base_url(url, true)?;
+            llm["baseUrl"] = json!(normalized);
         }
         Ok(llm)
     }
@@ -88,35 +95,53 @@ impl AgentBridge {
         }
 
         let line = serde_json::to_string(&payload)?;
-        let mut guard = self.child.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(spawn_worker(&self.worker_path)?);
+        let child = self.child.clone();
+        let worker_path = self.worker_path.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| {
+                let mut guard = child.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(spawn_worker(&worker_path)?);
+                }
+                let process = guard.as_mut().unwrap();
+                writeln!(process.stdin, "{line}").context("write agent")?;
+                process.stdin.flush()?;
+                let mut response_line = String::new();
+                process.stdout.read_line(&mut response_line).context("read agent")?;
+                let response: Value =
+                    serde_json::from_str(response_line.trim()).context("parse agent response")?;
+                if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                    let err = response
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Agent error");
+                    return Err(anyhow!(err.to_string()));
+                }
+                Ok(response.get("data").cloned().unwrap_or(json!({})))
+            })();
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(AGENT_IPC_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                if let Ok(mut guard) = self.child.lock() {
+                    if let Some(mut proc) = guard.take() {
+                        let _ = proc._child.kill();
+                    }
+                }
+                Err(anyhow!("Agent worker timed out and was restarted"))
+            }
         }
-        let process = guard.as_mut().unwrap();
-
-        writeln!(process.stdin, "{line}").context("write agent")?;
-        process.stdin.flush()?;
-
-        let mut response_line = String::new();
-        process.stdout.read_line(&mut response_line).context("read agent")?;
-        let response: Value =
-            serde_json::from_str(response_line.trim()).context("parse agent response")?;
-
-        if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = response
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Agent error");
-            return Err(anyhow!(err.to_string()));
-        }
-
-        Ok(response.get("data").cloned().unwrap_or(json!({})))
     }
 }
 
 fn resolve_node_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("NGX_NODE_BIN") {
-        return PathBuf::from(path);
+    if cfg!(debug_assertions) {
+        if let Ok(path) = std::env::var("NGX_NODE_BIN") {
+            return PathBuf::from(path);
+        }
     }
     for candidate in [
         "/usr/local/bin/node",
@@ -132,6 +157,7 @@ fn resolve_node_bin() -> PathBuf {
 }
 
 fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
+    verify_bundled_worker(path)?;
     let node = resolve_node_bin();
     let mut child = Command::new(&node)
         .arg(path)
@@ -155,10 +181,29 @@ fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
     })
 }
 
+fn verify_bundled_worker(path: &Path) -> Result<()> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let expected = option_env!("AGENT_WORKER_SHA256").unwrap_or("");
+    if expected.is_empty() {
+        return Err(anyhow!("Release build is missing AGENT_WORKER_SHA256"));
+    }
+    let bytes = std::fs::read(path).context("read bundled agent worker")?;
+    let digest = Sha256::digest(&bytes);
+    let actual = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    if actual != expected {
+        return Err(anyhow!("Bundled agent worker digest mismatch"));
+    }
+    Ok(())
+}
+
 /// Prefer bundled resource worker in packaged apps; fall back to repo path in dev.
 pub fn resolve_worker_path(resource_dir: Option<&Path>) -> PathBuf {
-    if let Ok(path) = std::env::var("NGX_AGENT_WORKER") {
-        return PathBuf::from(path);
+    if cfg!(debug_assertions) {
+        if let Ok(path) = std::env::var("NGX_AGENT_WORKER") {
+            return PathBuf::from(path);
+        }
     }
 
     if let Some(dir) = resource_dir {

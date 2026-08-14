@@ -21,12 +21,7 @@
       }
     ],
     "security": {
-      "csp": null
-    }
-  },
-  "plugins": {
-    "shell": {
-      "open": true
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: https://asset.localhost; font-src 'self' data:; connect-src ipc: http://ipc.localhost https://ipc.localhost https: http://localhost:1420 ws://localhost:1420; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self'"
     }
   },
   "bundle": {

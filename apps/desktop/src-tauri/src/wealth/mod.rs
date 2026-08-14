@@ -9,6 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::http_client::http_client;
 use crate::runtime_util::is_dev;
 use crate::secrets::{
     delete_secret, get_secret, set_secret, SECRET_WEALTH_PASSWORD, SECRET_WEALTH_REFRESH_TOKEN,
@@ -153,7 +154,7 @@ impl WealthClient {
         };
 
         Self {
-            http: Client::new(),
+            http: http_client().expect("http client"),
             base_url: wealth_base_url().to_string(),
             email: settings.wealth_email.clone(),
             password,
@@ -501,17 +502,17 @@ impl WealthClient {
             let retry_res = retry.send().await.context("wealth retry")?;
             if !retry_res.status().is_success() {
                 let status = retry_res.status();
-                let err_body = retry_res.text().await.unwrap_or_default();
-                tracing::warn!(target: "wealth", %url, %status, body = %err_body.chars().take(200).collect::<String>(), "wealth retry failed");
-                return Err(anyhow!("Wealth API error {status}: {err_body}"));
+                let _err_body = retry_res.text().await.unwrap_or_default();
+                tracing::warn!(target: "wealth", %url, %status, "wealth retry failed");
+                return Err(anyhow!("Wealth API error {status}"));
             }
             return retry_res.json().await.context("parse wealth retry");
         }
         if !res.status().is_success() {
             let status = res.status();
-            let err_body = res.text().await.unwrap_or_default();
-            tracing::warn!(target: "wealth", %url, %status, body = %err_body.chars().take(200).collect::<String>(), "wealth API error");
-            return Err(anyhow!("Wealth API error {status}: {err_body}"));
+            let _err_body = res.text().await.unwrap_or_default();
+            tracing::warn!(target: "wealth", %url, %status, "wealth API error");
+            return Err(anyhow!("Wealth API error {status}"));
         }
         tracing::info!(target: "wealth", %url, status = %res.status(), "wealth API ok");
         // Some endpoints return empty body (204)
@@ -839,24 +840,25 @@ impl WealthClient {
         stock_id: i64,
         side: &str,
         quantity: f64,
+        client_order_id: Option<&str>,
     ) -> Result<WealthOrder> {
         let tx = if side.eq_ignore_ascii_case("SELL") {
             "sell"
         } else {
             "buy"
         };
+        let mut body = serde_json::json!({
+            "stock_id": stock_id,
+            "transaction_type": tx,
+            "quantity": quantity as i64,
+            "type": "market_price",
+            "with": ["stock"],
+        });
+        if let Some(cid) = client_order_id {
+            body["client_order_id"] = serde_json::json!(cid);
+        }
         let raw = self
-            .request_json(
-                reqwest::Method::POST,
-                "/orders",
-                Some(serde_json::json!({
-                    "stock_id": stock_id,
-                    "transaction_type": tx,
-                    "quantity": quantity as i64,
-                    "type": "market_price",
-                    "with": ["stock"],
-                })),
-            )
+            .request_json(reqwest::Method::POST, "/orders", Some(body))
             .await?;
         parse_order(&raw)
     }
@@ -878,8 +880,11 @@ impl WealthClient {
         stock_id: i64,
         side: &str,
         quantity: f64,
+        client_order_id: Option<&str>,
     ) -> Result<WealthOrder> {
-        let mut order = self.place_market_order(stock_id, side, quantity).await?;
+        let mut order = self
+            .place_market_order(stock_id, side, quantity, client_order_id)
+            .await?;
         if order.status == "executed" || order.status == "rejected" {
             return Ok(order);
         }
