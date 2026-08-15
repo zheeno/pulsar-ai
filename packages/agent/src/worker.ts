@@ -1,10 +1,42 @@
 #!/usr/bin/env node
 import * as readline from 'readline';
-import { AgentRequestSchema, type AgentResponse } from '@ngx/shared';
+import {
+  AgentRequestSchema,
+  AgentToolResultSchema,
+  type AgentResponse,
+} from '@ngx/shared';
 import { generatePortfolioSignals, generateSymbolSignal, testLlmConnection } from './llm';
 
 function respond(response: AgentResponse): void {
   process.stdout.write(`${JSON.stringify(response)}\n`);
+}
+
+const pendingLines: string[] = [];
+const waiters: Array<(line: string) => void> = [];
+
+function onIncoming(line: string): void {
+  const next = waiters.shift();
+  if (next) next(line);
+  else pendingLines.push(line);
+}
+
+function takeLine(): Promise<string> {
+  const queued = pendingLines.shift();
+  if (queued !== undefined) return Promise.resolve(queued);
+  return new Promise((resolve) => {
+    waiters.push(resolve);
+  });
+}
+
+async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  process.stdout.write(`${JSON.stringify({ type: 'tool', name, arguments: args })}\n`);
+  const line = await takeLine();
+  const parsed: unknown = JSON.parse(line);
+  const result = AgentToolResultSchema.safeParse(parsed);
+  if (!result.success) {
+    return { ok: false, error: 'invalid tool_result' };
+  }
+  return result.data.result;
 }
 
 async function handleRequest(line: string): Promise<void> {
@@ -35,7 +67,7 @@ async function handleRequest(line: string): Promise<void> {
         break;
       }
       case 'portfolio_signals': {
-        const result = await generatePortfolioSignals(req.context, req.llm);
+        const result = await generatePortfolioSignals(req.context, req.llm, callTool);
         respond({ id: req.id, ok: true, data: result });
         break;
       }
@@ -57,7 +89,14 @@ async function handleRequest(line: string): Promise<void> {
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
 rl.on('line', (line) => {
-  void handleRequest(line.trim());
+  onIncoming(line.trim());
 });
+
+void (async () => {
+  for (;;) {
+    const line = await takeLine();
+    await handleRequest(line);
+  }
+})();
 
 process.stderr.write('ngx-agent worker ready\n');

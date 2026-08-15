@@ -1,10 +1,10 @@
 # Bamboo — API Reference for Pulsar Live Broker
 
-> **Purpose:** Map Pulsar’s live-broker capabilities onto Bamboo so NGX trading can work the same way Wealth does today.  
+> **Purpose:** Map Pulsar’s live-broker capabilities onto Bamboo for **NGX and US** stocks.  
 > **Sources:** Powered-by-Bamboo OpenAPI (`reports/bamboo-api.yaml`), Flutter app `libapp.so` (v4.5.8), and live calls against `https://api.investbamboo.com`.  
 > **Last updated:** August 2026 (retail live-probed 14 Aug 2026 — GET + calculate only; no place-order)
 
-Wealth’s paths are the **reference implementation**. Bamboo paths below are what Pulsar should call. Prefer **NGX** (`/api/lsx/ng/*`) for the first live cut — that matches Wealth (Nigerian Exchange, naira cash). US (`/api/order`, `/api/my_stocks`) is documented as a second market.
+Wealth’s paths are the **reference implementation**. Bamboo uses **two product APIs**: NGX (`/api/lsx/ng/*`, Naira wallet) and US (`/api/order`, `/api/my_stocks`, `/api/portfolio`, DriveWealth). Do not mix them. Route a Pulsar symbol to NGX vs US **before** quoting or placing.
 
 ---
 
@@ -17,8 +17,8 @@ Wealth’s paths are the **reference implementation**. Bamboo paths below are wh
 5. [Spendable cash](#5-spendable-cash)
 6. [Book (positions)](#6-book-positions)
 7. [Market and instruments](#7-market-and-instruments)
-8. [Orders (NGX first live cut)](#8-orders-ngx-first-live-cut)
-9. [US market (optional second cut)](#9-us-market-optional-second-cut)
+8. [Orders (NGX)](#8-orders-ngx)
+9. [US stocks](#9-us-stocks)
 10. [Pulsar field mapping](#10-pulsar-field-mapping)
 11. [Bot workflow](#11-bot-workflow)
 12. [Gaps vs Wealth](#12-gaps-vs-wealth)
@@ -42,30 +42,30 @@ Wealth’s paths are the **reference implementation**. Bamboo paths below are wh
 
 | Capability | What Pulsar needs | Wealth today | Bamboo |
 |---|---|---|---|
-| Profile | Email, display name, KYC / trading-verified flag | `GET /profile` | `GET /api/profile` — `email`, `name`+`surname`, `email_verified`, `account_restriction.restricted`, `engagement_status`. Wallet: `GET /api/base_wallet_status`. **NGX trading-ready:** `GET /api/lsx/ng/cscs/account/status` → `ready_for_trading`. Do **not** use `GET /api/kyc_status` (can be `not_submitted` on an account that is already CSCS-ready). **Block live orders** if `restricted` or `ready_for_trading !== true`. |
+| Profile | Email, display name, KYC / trading-verified flag | `GET /profile` | Shared: `GET /api/profile` (`account_restriction.restricted`) + `GET /api/base_wallet_status`. **NGX:** also `GET /api/lsx/ng/cscs/account/status` → `ready_for_trading`. **US:** `GET /api/portfolio` → `account_restricted`; `extended_hours_status`. Do **not** use `GET /api/kyc_status` as the only gate (can be `not_submitted` while CSCS-ready). **Block** if `restricted` / `account_restricted`. For NGX also require `ready_for_trading`. |
 | Spendable cash | Brokerage cash for buys (not net worth) | Profile `brokerage_balance` | **NGX / Naira wallet:** `GET /api/wallet_balance` → NGN row `wallet_balance` (live: ₦4900). Pair with `GET /api/wallet` for ids only. **US / DriveWealth buying power:** `GET /api/portfolio` → `cash` / `dollar_cash` (can be 0 while Naira wallet is funded). **Not** `user_cash_balance` (422). **Not** NGX portfolio breakdown (no cash). `GET /api/user/networth?currency_code=NGN` can equal the wallet when you have no lots — do not treat it as the cash API. |
 
 ### Book (Home + cycles)
 
 | Capability | What Pulsar needs per holding | Wealth today | Bamboo |
 |---|---|---|---|
-| Portfolio / positions | Ticker (or resolvable id), qty, avg cost, last/mark, market value | `GET /portfolio?with[]=stocks.stock` | **NGX lots:** `GET /api/lsx/ng/my_stocks` → `stocks[]` with `symbol`, `quantity`, `average_cost` / `cost_basis`, `market_price`, equity. Totals: `GET /api/lsx/ng/portfolio/breakdown`. **US lots:** `GET /api/my_stocks`. Cash+equity snapshot: `GET /api/portfolio` (US-oriented). |
-| Instrument by id | Ticker when book only has internal id | `GET /stocks/{id}` | NGX book already has **`symbol`**. Quote: `GET /api/lsx/ng/stocks/{symbol}`. Search: `GET /api/lsx/ng/stocks?query=DANGCEM` (returns 1 hit). **`search_term` does not filter** — it still returns the first page of all listings. |
+| Portfolio / positions | Ticker, qty, avg cost, last/mark, market value | `GET /portfolio?with[]=stocks.stock` | **NGX:** `GET /api/lsx/ng/my_stocks`. **US:** `GET /api/my_stocks` (`symbol`, `quantity`, `cost_basis`, `market_price`, `user_equity`). Per-ticker US lot: `GET /api/stock/{symbol}/ownership`. Totals: NGX breakdown vs `GET /api/portfolio` / `GET /api/portfolio/breakdown` (US `$`). |
+| Instrument by id | Ticker when book only has internal id | `GET /stocks/{id}` | Both books use **`symbol`**. **NGX quote:** `GET /api/lsx/ng/stocks/{symbol}`; search `?query=`. **US quote:** `GET /api/stock/{symbol}/details` (retail) or `GET /api/tenant/stock/{symbol}/details` (tenant); search `GET /api/stock/search?query=AAPL`. Catalog: `GET /api/stocks?limit=&next_token=`. |
 
 ### Market and instruments (order path)
 
 | Capability | What Pulsar needs | Wealth today | Bamboo |
 |---|---|---|---|
 | Market open/closed | Boolean before live fills | `GET /market-status` | **NGX:** `GET /api/market/open_date?market=NGX` → `market_session.core_market` (boolean). **US:** `?market=US` or omit query (same US session). `?market=NG` returns **500**. |
-| Resolve NGX ticker | Broker instrument id + quote | `GET /stocks?query=…` | `GET /api/lsx/ng/stocks?query={symbol}` then `GET /api/lsx/ng/stocks/{symbol}`. Instrument id is the **symbol string**. |
+| Resolve ticker | Broker instrument id + quote | `GET /stocks?query=…` | **NGX:** `GET /api/lsx/ng/stocks?query=` then `/api/lsx/ng/stocks/{symbol}`. **`search_term` does not filter.** **US:** `GET /api/stock/search?query=` then `/api/stock/{symbol}/details`. Instrument id is the **symbol string**. |
 | Pre-trade fee | Fee for qty × price | `POST /stocks/fee` | **NGX:** `POST /api/lsx/ng/order/calculate`. **US:** `POST /api/order/calculate`. Reuse returned `fee`, `quantity`, `price_per_share`, `total_price` on place. |
 
 ### Orders
 
 | Capability | What Pulsar needs | Wealth today | Bamboo |
 |---|---|---|---|
-| Place market buy/sell | Broker order id, status, qty, quote/fill; optional `client_order_id` | `POST /orders` | **NGX:** `POST /api/lsx/ng/order` after calculate. **MARKET only.** Response `{ order_id }`. **US:** `POST /api/order`. Idempotency: details schema has `execution_history.idempotency_key`; **not a documented request field** — do not rely on `client_order_id` for v1. |
-| Get order by id | Status, fill price, rejection reason | `GET /portfolio/orders/{id}` | **NGX:** `GET /api/lsx/ng/order/{order_id}/status` (and `/api/lsx/ng/order/{order_id}` for details). **US:** `GET /api/order/{id}/status`. Poll until filled / rejected / cancelled. |
+| Place market buy/sell | Broker order id, status, qty, quote/fill; optional `client_order_id` | `POST /orders` | **NGX:** `POST /api/lsx/ng/order` after calculate. **MARKET only.** **US:** `POST /api/order` after calculate — MARKET (notional `amount`), LIMIT, STOP. Fractional US MARKET. No `client_order_id`. |
+| Get order by id | Status, fill price, rejection reason | `GET /portfolio/orders/{id}` | **NGX:** `GET /api/lsx/ng/order/{order_id}/status`. **US:** `GET /api/order/{id}/status` (`order_status`: New / Filled / Cancelled / Rejected). |
 
 ### Nice to have
 
@@ -97,7 +97,7 @@ JWT `sub` is the numeric Bamboo user id. Retail tokens seen in the wild have `au
 |------------|--------|
 | Prefix | All product routes under `/api/` (not `/v1`) |
 | JSON | `application/json`, snake_case |
-| NGX vs US | NGX = `/api/lsx/ng/...`. US = `/api/order`, `/api/my_stocks`, `/api/portfolio` |
+| NGX vs US | **Never mix.** NGX = `/api/lsx/ng/...` + Naira wallet. US = `/api/order`, `/api/stock/*`, `/api/my_stocks`, `/api/portfolio` + USD buying power |
 | Currency | NGX: NGN. Pass `currency: NGN` header on order/portfolio where documented |
 | Auth errors | `unauthenticated` · `invalid_token` · `missing required header x-subject-type` |
 
@@ -339,9 +339,25 @@ Use this for NGX **equity totals**, not buying power.
 GET /api/my_stocks
 ```
 
-`stocks` with `symbol`, `quantity`, `cost_basis`, `market_price`, `user_equity`.
+Live empty book: `{ "currency_symbol": "$", "equity_value": 0, "stocks": [] }`.
 
-`GET /api/portfolio` is **cash + US summary**, not the NGX lot list.
+When funded, OpenAPI `stocks[]`:
+
+| Pulsar lot | Bamboo US |
+|------------|-----------|
+| Symbol | `symbol` |
+| Qty | `quantity` (can be fractional) |
+| Avg / cost | `cost_basis` |
+| Mark | `market_price` (or `price`) |
+| Current value | `user_equity` |
+
+One ticker:
+
+```
+GET /api/stock/{symbol}/ownership
+```
+
+US cash + AUM (not the lot list): `GET /api/portfolio`, `GET /api/portfolio/breakdown` (`available_to_invest` in **USD**).
 
 ---
 
@@ -407,11 +423,35 @@ POST /api/lsx/ng/order/calculate
 
 SELL with no holding: **422** `You don't have enough stock quantity to complete this order.`
 
-US analog: `POST /api/order/calculate` with `order_type: MARKET`, `symbol`, `side`, **`amount`** (notional). Live `quantity` instead of `amount` → 422 `Invalid parameters`.
+### 7.4 Search / quote US ticker
+
+```
+GET /api/stock/search?query=AAPL
+```
+
+Live: `{ "result": [ { "symbol": "AAPL", "market_price": 305.175, "percent_change": … } ], "currency_symbol": "$" }`. Prefix match (AAPL, AAPW, …). Searching an NGX ticker here returns **no hits**.
+
+Quote / fundamentals (retail — route exists, 401 without JWT):
+
+```
+GET /api/stock/{symbol}/details
+```
+
+Tenant equivalent: `GET /api/tenant/stock/{symbol}/details` (`x-client-token` required). Fields: `symbol`, `price`, `percent_change`, `high`/`low`/`open`, `extended_hours_status`, `market_cap`, `pe_ratio`, `wk_52_high`/`wk_52_low`.
+
+Paginated universe (not a search):
+
+```
+GET /api/stocks?limit=20&next_token=
+```
+
+Live: `{ "stocks": [...], "next_token" }`.
+
+`GET /api/stock/{symbol}` and `GET /api/stocks/{symbol}` are **404** — do not use.
 
 ---
 
-## 8. Orders (NGX first live cut)
+## 8. Orders (NGX)
 
 NGX is **MARKET only**. Flow: calculate → place → poll status.
 
@@ -491,21 +531,116 @@ Wealth accepts Pulsar `client_order_id`. Bamboo place schema has **no** `client_
 
 ---
 
-## 9. US market (optional second cut)
+## 9. US stocks
 
-| Pulsar need | Bamboo |
-|-------------|--------|
-| Positions | `GET /api/my_stocks` |
-| Cash | `GET /api/portfolio` → `cash` / `dollar_cash` |
-| Quote / search | `GET /api/stock/search?query=AAPL`, stock details by symbol |
-| Fee | `POST /api/order/calculate` (`MARKET` + `amount` or LIMIT/STOP + qty/price) |
-| Place | `POST /api/order` — copy `fee`, `quantity`, `price_per_share`, `total_price` from calculate |
-| Poll | `GET /api/order/{id}/status` |
-| Cancel | `POST /api/order/{id}/cancel` |
-| Open orders | `GET /api/pending_orders` |
-| Extended hours | `extended_hours_order: true` if user `extended_hours_status === ENABLED` |
+US trading is DriveWealth-backed. Cash is **USD buying power** on `GET /api/portfolio`, not the Naira wallet. Fractional **MARKET** orders are allowed; LIMIT/STOP are whole-share (GTC / `expiration`).
 
-US market orders can be fractional/notional; NGX is whole shares.
+### 9.1 Eligibility and session
+
+| Check | Endpoint | Gate |
+|-------|----------|------|
+| Account blocked | `GET /api/profile` `account_restriction.restricted` or `GET /api/portfolio` `account_restricted` | Block |
+| US session | `GET /api/market/open_date?market=US` → `market_session.core_market` | `pre_market` / `post_market` for extended hours |
+| Extended hours (user) | `GET /api/portfolio` `extended_hours_status` (`ENABLED` / `DISABLED` / unset) | Only send `extended_hours_order: true` if `ENABLED` |
+| Opt in/out | `POST /api/extended_hours/opt_in` `{ "extended_hours_status": true, "market": "US" }` | GET on this path **404** (POST only) |
+| Stock AH status | `GET /api/stock/{symbol}/details` `extended_hours_status` | Active → MARKET+LIMIT; Inactive → LIMIT whole shares; Close Only → sells only |
+
+Closed-market US orders are **queued** for the next session (OpenAPI). NGX orders do not carry overnight.
+
+### 9.2 Spendable USD
+
+| Source | Field | Use |
+|--------|-------|-----|
+| `GET /api/portfolio` | `cash` / `dollar_cash` | **US buying power** (live can be 0 while Naira wallet is funded) |
+| `GET /api/portfolio/breakdown` | `available_to_invest` | USD buying power |
+| `GET /api/wallet_balance` USD row | `wallet_balance` | Bamboo USD **wallet**, not DriveWealth cash unless transferred |
+| `GET /api/user/networth?currency_code=USD` | `value` | Net worth, not buying power |
+
+Gate US buys on `cash` / `available_to_invest` **and** calculate success (no `gfv_occurs`).
+
+### 9.3 Pre-trade calculate
+
+```
+POST /api/order/calculate
+```
+
+**MARKET (notional — live 200):**
+```json
+{
+  "order_type": "MARKET",
+  "symbol": "AAPL",
+  "side": "BUY",
+  "amount": 10
+}
+```
+
+Live: `{ "quantity": 0.0295…, "price_per_share": 305.057, "fee": 1.0, "order_price": 9.0, "total_price": 10.0, "gfv_occurs": false, "number_of_violations": 0 }`.
+
+MARKET with `quantity` instead of `amount` → **422** `Invalid parameters`.
+
+**LIMIT / STOP** (OpenAPI): `order_type`, `symbol`, `side`, `price_per_share` (mark), `price` (limit or stop), `quantity`. Optional `sell_all: true` on sells.
+
+Reuse **exactly**: `fee`, `quantity`, `price_per_share`. Place `total_price` = calculate **`order_price`** (not `total_price` if they differ — OpenAPI: use `order_price` as `total_price`).
+
+### 9.4 Place
+
+```
+POST /api/order
+```
+
+**MARKET (copy calculate):**
+```json
+{
+  "order_type": "MARKET",
+  "symbol": "AAPL",
+  "side": "BUY",
+  "quantity": 0.02950268,
+  "price_per_share": 305.057,
+  "fee": 1.0,
+  "total_price": 9.0
+}
+```
+
+Optional: `"extended_hours_order": true`, `"sell_all": true` (sells).
+
+**LIMIT** also needs `price` (limit) and optional `expiration` (`YYYY-MM-DD`). **STOP** needs `price` (stop).
+
+Response: `{ "order_id": "KJ.…" }`. **Not live-placed.**
+
+Retail may still require `transaction_pin`. Tenant OpenAPI body does not include PIN.
+
+### 9.5 Poll / pending / cancel
+
+```
+GET /api/order/{id}/status
+GET /api/pending_orders
+POST /api/order/{id}/cancel
+```
+
+Dummy id → **404** `Missing required resource` (route exists). Live pending: `{ "currency_symbol": "$", "pending_orders": [] }`.
+
+| `order_status` | Pulsar |
+|----------------|--------|
+| Filled | `executed` |
+| Rejected | `rejected` |
+| New | pending (poll) |
+| Cancelled | cancelled |
+
+Status payload also has `side`, `quantity`, `price`, `dollar_fee` / `naira_fee`, `dollar_price` / `naira_price`, `type` (Market/Limit/Stop).
+
+### 9.6 US vs NGX cheat sheet
+
+| | NGX | US |
+|--|-----|-----|
+| Search | `/api/lsx/ng/stocks?query=` | `/api/stock/search?query=` |
+| Quote | `/api/lsx/ng/stocks/{symbol}` | `/api/stock/{symbol}/details` |
+| Lots | `/api/lsx/ng/my_stocks` | `/api/my_stocks` |
+| Cash | `/api/wallet_balance` NGN | `/api/portfolio` `cash` |
+| Calculate | `/api/lsx/ng/order/calculate` qty | `/api/order/calculate` **amount** (MARKET) |
+| Place | `/api/lsx/ng/order` MARKET only | `/api/order` MARKET / LIMIT / STOP |
+| Poll | `/api/lsx/ng/order/{id}/status` | `/api/order/{id}/status` |
+| Shares | Whole | Fractional MARKET |
+| Session | `?market=NGX` | `?market=US` |
 
 ---
 
@@ -525,6 +660,12 @@ US market orders can be fractional/notional; NGX is whole shares.
 |--------|--------|
 | Spendable brokerage naira | `GET /api/wallet_balance` NGN row → `wallet_balance` |
 
+### Cash (US)
+
+| Pulsar | Bamboo |
+|--------|--------|
+| Spendable USD buying power | `GET /api/portfolio` → `cash` / `dollar_cash` (or breakdown `available_to_invest`) |
+
 ### Lot (NGX)
 
 | Pulsar | Bamboo `lsx/ng/my_stocks.stocks[]` |
@@ -535,17 +676,27 @@ US market orders can be fractional/notional; NGX is whole shares.
 | Mark | `market_price` |
 | Current value | `quantity * market_price` |
 
+### Lot (US)
+
+| Pulsar | Bamboo `GET /api/my_stocks` `stocks[]` |
+|--------|----------------------------------------|
+| Symbol | `symbol` |
+| Qty | `quantity` |
+| Avg price | `cost_basis` |
+| Mark | `market_price` |
+| Current value | `user_equity` |
+
 ### Order
 
-| Pulsar | Bamboo NGX |
-|--------|------------|
-| Id | `order_id` / `id` |
-| Side | `side` (`BUY`/`SELL`) |
-| Qty | `quantity` / `filled_quantity` |
-| Status | `status` / `order_status` → map to executed/rejected/pending |
-| Fill / quote | `price`, `naira_price`, `price_per_share` |
-| Fee | `naira_fee` / calculate `fee` |
-| Rejection | details payload / 422 `message` |
+| Pulsar | NGX | US |
+|--------|-----|-----|
+| Id | `order_id` / `id` | `order_id` / `id` (`KJ.…`) |
+| Side | `side` | `side` |
+| Qty | `quantity` | `quantity` (fractional MARKET) |
+| Status | `status` | `order_status` |
+| Fill / quote | `price`, `naira_price` | `price`, `dollar_price` |
+| Fee | `naira_fee` / calculate `fee` | `dollar_fee` / calculate `fee` |
+| Rejection | 422 `message` | 422 `message` / `Rejected` |
 
 ---
 
@@ -575,11 +726,33 @@ US market orders can be fractional/notional; NGX is whole shares.
 7. Refresh cash + my_stocks
 ```
 
-### Sell
+### Startup (US)
 
 ```
-1. Holding qty from my_stocks
-2. Calculate + place side=SELL
+1. POST /api/login
+2. GET  /api/profile + GET /api/portfolio   → restricted / account_restricted
+3. GET  /api/portfolio                      → cash, extended_hours_status
+4. GET  /api/my_stocks                      → lots
+5. GET  /api/market/open_date?market=US     → core / pre / post
+```
+
+### Buy (US MARKET)
+
+```
+1. GET  /api/stock/search?query={symbol}     (or /api/stock/{symbol}/details)
+2. POST /api/order/calculate  { order_type: MARKET, symbol, side: BUY, amount }
+3. cash >= total_price / order_price; gfv_occurs == false
+4. POST /api/order  with fee, quantity, price_per_share, total_price=order_price
+5. Poll GET /api/order/{id}/status until Filled | Rejected
+6. Refresh portfolio + my_stocks
+```
+
+### Sell (US)
+
+```
+1. Qty from GET /api/my_stocks (or ownership)
+2. MARKET: calculate with amount (or sell_all) then place
+   LIMIT/STOP: calculate with quantity + price then place
 3. Poll status
 ```
 
@@ -590,17 +763,27 @@ flowchart TD
     A[Pulsar live cycle] --> B[Retail JWT or tenant token]
     B --> C{Profile restricted?}
     C -->|Yes| D[Block live orders]
-    C -->|No| E[NGX cash + my_stocks]
-    E --> F{Signal}
-    F -->|Buy| G[lsx/ng/order/calculate]
-    G --> H{total_price <= balance?}
-    H -->|Yes| I[POST lsx/ng/order]
-    H -->|No| J[Skip]
-    F -->|Sell| K[qty <= holding]
-    K --> I
-    I --> L[Poll order/status]
-    L -->|Filled| E
-    L -->|Rejected| M[Log message]
+    C -->|No| E{Market}
+    E -->|NGX| F[NGN wallet + lsx/ng/my_stocks]
+    E -->|US| U[portfolio cash + my_stocks]
+    F --> G{Signal}
+    G -->|Buy| H[lsx/ng/order/calculate]
+    H --> I{total_price <= NGN wallet?}
+    I -->|Yes| J[POST lsx/ng/order]
+    I -->|No| K[Skip]
+    G -->|Sell| L[qty <= holding]
+    L --> J
+    U --> V{Signal}
+    V -->|Buy| W[POST /api/order/calculate amount]
+    W --> X{cash >= order_price?}
+    X -->|Yes| Y[POST /api/order]
+    X -->|No| K
+    V -->|Sell| Z[qty <= holding]
+    Z --> Y
+    J --> P[Poll NGX order/status]
+    Y --> Q[Poll US order/status]
+    P -->|Filled| F
+    Q -->|Filled| U
 ```
 
 ---
@@ -614,7 +797,10 @@ flowchart TD
 | No proven retail refresh/logout | Re-login on 401 |
 | No numeric `stock_id` | Key book/orders by **symbol** |
 | No `client_order_id` on place | Pulsar-side idempotency only |
-| NGX MARKET-only | No GTC/limit on first cut |
+| NGX MARKET-only | US supports MARKET (notional) + LIMIT + STOP |
+| US MARKET must send `amount` | `quantity` on US MARKET calculate → 422 |
+| Naira wallet ≠ US `cash` | Fund DriveWealth buying power separately from NGN wallet |
+| US details path | Retail `GET /api/stock/{symbol}/details`; tenant `/api/tenant/stock/{symbol}/details` |
 | `GET /api/wallet` has no balances | Use `GET /api/wallet_balance` |
 | Retail `user_cash_balance` 422 | Partner OpenAPI only |
 | NGX breakdown has no cash on retail | Equity totals only |
@@ -661,6 +847,23 @@ curl -sS -X POST 'https://api.investbamboo.com/api/lsx/ng/order/calculate' \
   -d '{"type":"MARKET","symbol":"DANGCEM","side":"BUY","quantity":1,"price":0,"currency":"NGN"}'
 
 # Then POST /api/lsx/ng/order with calculate fields + source_wallet_id
+```
+
+### US search + calculate (MARKET)
+
+```bash
+curl -sS 'https://api.investbamboo.com/api/market/open_date?market=US' "${H[@]}"
+curl -sS 'https://api.investbamboo.com/api/stock/search?query=AAPL' "${H[@]}"
+curl -sS 'https://api.investbamboo.com/api/stock/AAPL/details' "${H[@]}"
+curl -sS 'https://api.investbamboo.com/api/my_stocks' "${H[@]}"
+curl -sS 'https://api.investbamboo.com/api/portfolio' "${H[@]}"
+
+curl -sS -X POST 'https://api.investbamboo.com/api/order/calculate' \
+  "${H[@]}" -H 'Content-Type: application/json' \
+  -d '{"order_type":"MARKET","symbol":"AAPL","side":"BUY","amount":10}'
+
+# Then POST /api/order with fee, quantity, price_per_share, total_price=order_price
+curl -sS "https://api.investbamboo.com/api/order/${ORDER_ID}/status" "${H[@]}"
 ```
 
 ### Poll order
@@ -711,15 +914,24 @@ curl -sS "https://api.investbamboo.com/api/lsx/ng/order/${ORDER_ID}/status" "${H
 | GET | `/api/lsx/ng/activity` | 200 — `{ activities }` |
 | POST | `/api/lsx/ng/order/{id}/cancel` | not probed |
 
-### US (second cut)
-| Method | Path | Live retail |
-|--------|------|-------------|
-| GET | `/api/my_stocks` | 200 — `{ stocks }` |
-| GET | `/api/stock/search?query=` | 200 — US symbols |
+### US book / market / orders
+| Method | Path | Live / existence |
+|--------|------|------------------|
+| GET | `/api/my_stocks` | 200 — US lots |
+| GET | `/api/stock/{symbol}/ownership` | exists (401 unauth) |
+| GET | `/api/stock/search?query=` | 200 — US search |
+| GET | `/api/stock/{symbol}/details` | exists (401 unauth) — **retail quote** |
+| GET | `/api/tenant/stock/{symbol}/details` | tenant token required |
+| GET | `/api/stocks` | 200 — paginated catalog |
+| GET | `/api/market/open_date?market=US` | 200 — US session |
 | POST | `/api/order/calculate` | 200 with `amount`; 422 with `quantity` |
-| POST | `/api/order` | not probed |
+| POST | `/api/order` | not probed (would place) |
 | GET | `/api/order/{id}/status` | 404 dummy — route exists |
 | GET | `/api/pending_orders` | 200 — `{ pending_orders: [] }` |
+| POST | `/api/order/{id}/cancel` | not probed |
+| GET | `/api/order/fee` | exists (401 unauth); prefer calculate |
+| POST | `/api/extended_hours/opt_in` | POST only (GET 404) |
+| GET | `/api/activity` | exists (401 unauth) |
 
 ---
 
@@ -742,8 +954,14 @@ Base: `https://api.investbamboo.com` · `Authorization: Bearer` · `x-subject-ty
 | Use | `POST /api/lsx/ng/order/calculate` | 200 | `fee`, `total_price`, `available_quantity` |
 | Use | `GET /api/lsx/ng/pending_orders` | 200 | Open NGX orders |
 | Use | `GET /api/my_stocks` | 200 | US lots |
+| Use | `GET /api/portfolio` | 200 | US `cash` / `dollar_cash`, `extended_hours_status` |
 | Use | `GET /api/stock/search?query=` | 200 | US quote search |
+| Use | `GET /api/stocks` | 200 | US catalog + `next_token` |
+| Use | `GET /api/market/open_date?market=US` | 200 | US `core_market` |
 | Use | `POST /api/order/calculate` | 200 | US fee (`amount` notional) |
+| Route exists | `GET /api/stock/{symbol}/details` | 401 unauth | Retail US quote |
+| Route exists | `GET /api/stock/{symbol}/ownership` | 401 unauth | Per-ticker US lot |
+| Skip | `GET /api/stock/{symbol}` | 404 | Use `/details` |
 | Totals only | `GET /api/lsx/ng/portfolio/breakdown` | 200 | Equity — **no cash** |
 | Totals only | `GET /api/investment_profile` | 200 | Suitability, not trading gate |
 | Totals only | `GET /api/user/networth?currency_code=NGN` | 200 | Net worth ≠ cash |

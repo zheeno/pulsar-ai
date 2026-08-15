@@ -54,13 +54,6 @@ export const StrategyParamSetSchema = z.object({
 });
 export type StrategyParamSet = z.infer<typeof StrategyParamSetSchema>;
 
-export const BacktestRequestSchema = z.object({
-  strategy_param_set_id: z.string().uuid(),
-  start_date: z.string(),
-  end_date: z.string(),
-});
-export type BacktestRequest = z.infer<typeof BacktestRequestSchema>;
-
 export const CURATED_SYMBOLS = [
   'DANGCEM', 'GTCO', 'ZENITHBANK', 'MTNN', 'BUACEMENT',
   'ACCESSCORP', 'UBA', 'FBNH', 'SEPLAT', 'NESTLE',
@@ -72,7 +65,7 @@ export const NGX_TRADING_HOURS = { open: 9, close: 16 };
 export const NGX_TIMEZONE = 'Africa/Lagos';
 
 export const PROMPT_VERSION = 'v1.0.0';
-export const PORTFOLIO_PROMPT_VERSION = 'v2.3.1';
+export const PORTFOLIO_PROMPT_VERSION = 'v2.4.0';
 
 export * from './types';
 export * from './desktop';

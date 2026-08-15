@@ -3,9 +3,9 @@ import { Link, useLocation } from 'react-router-dom';
 import { useCycle } from '../lib/cycle';
 import { useSession } from '../lib/session';
 import {
-  IconBacktest,
   IconHome,
   IconLogout,
+  IconMemory,
   IconSettings,
   IconSignals,
   IconSpinner,
@@ -18,7 +18,7 @@ const links = [
   { href: '/', label: 'Home', Icon: IconHome },
   { href: '/signals', label: 'Signals', Icon: IconSignals },
   { href: '/trades', label: 'Trades', Icon: IconTrades },
-  { href: '/backtest', label: 'Backtest', Icon: IconBacktest },
+  { href: '/memory', label: 'Memory', Icon: IconMemory },
   { href: '/settings', label: 'Settings', Icon: IconSettings },
 ];
 

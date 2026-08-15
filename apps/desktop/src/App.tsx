@@ -10,7 +10,7 @@ import { CycleProvider } from './lib/cycle';
 import Dashboard from './pages/Dashboard';
 import Signals from './pages/Signals';
 import Trades from './pages/Trades';
-import Backtest from './pages/Backtest';
+import Memory from './pages/Memory';
 import Settings from './pages/Settings';
 import Onboarding from './pages/Onboarding';
 import SymbolDetail from './pages/SymbolDetail';
@@ -119,7 +119,7 @@ function AppRoutes() {
           <Route path="/signals" element={<Signals />} />
           <Route path="/trades" element={<Trades />} />
           <Route path="/symbol/:symbol" element={<SymbolDetail />} />
-          <Route path="/backtest" element={<Backtest />} />
+          <Route path="/memory" element={<Memory />} />
           <Route path="/settings" element={<Settings />} />
         </Route>
       </Routes>
