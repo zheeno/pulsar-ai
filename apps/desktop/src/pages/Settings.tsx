@@ -64,18 +64,18 @@ type StrategyRecord = {
   id: string;
   name: string;
   max_position_pct: number;
-  max_daily_trades: number;
+  max_daily_trades?: number;
   stop_loss_pct: number;
   take_profit_pct?: number | null;
   min_confidence_to_trade: number;
   max_daily_drawdown_pct: number;
-  position_size_pct: number;
+  position_size_pct?: number;
+  cycle_budget_pct: number;
 };
 
 type StrategyDraft = {
   maxPositionPct: number;
-  positionSizePct: number;
-  maxDailyTrades: number;
+  cycleBudgetPct: number;
   minConfidenceToTrade: number;
   maxDailyDrawdownPct: number;
   stopLossPct: number;
@@ -115,8 +115,7 @@ function toPct(ratio: number, min: number, max: number) {
 function draftFromStrategy(s: StrategyRecord): StrategyDraft {
   return {
     maxPositionPct: toPct(s.max_position_pct, 1, 50),
-    positionSizePct: toPct(s.position_size_pct, 1, 25),
-    maxDailyTrades: clamp(Math.round(s.max_daily_trades), 1, 20),
+    cycleBudgetPct: toPct(s.cycle_budget_pct ?? 0.2, 5, 50),
     minConfidenceToTrade: toPct(s.min_confidence_to_trade, 40, 95),
     maxDailyDrawdownPct: toPct(s.max_daily_drawdown_pct, 1, 15),
     stopLossPct: toPct(s.stop_loss_pct, 1, 25),
@@ -224,7 +223,6 @@ export default function SettingsPage() {
   const titleId = useId();
   const maxPosId = useId();
   const posSizeId = useId();
-  const maxTradesId = useId();
   const minConfId = useId();
   const maxDdId = useId();
   const stopLossId = useId();
@@ -397,8 +395,7 @@ export default function SettingsPage() {
       const updated = await api<StrategyRecord>('update_strategy', {
         strategy: {
           maxPositionPct: strategyDraft.maxPositionPct / 100,
-          positionSizePct: strategyDraft.positionSizePct / 100,
-          maxDailyTrades: strategyDraft.maxDailyTrades,
+          cycleBudgetPct: strategyDraft.cycleBudgetPct / 100,
           minConfidenceToTrade: strategyDraft.minConfidenceToTrade / 100,
           maxDailyDrawdownPct: strategyDraft.maxDailyDrawdownPct / 100,
           stopLossPct: strategyDraft.stopLossPct / 100,
@@ -757,25 +754,14 @@ export default function SettingsPage() {
           />
           <ParamSlider
             id={posSizeId}
-            label="Position size"
-            hint="Target size for each new buy as a percent of equity. This sets the default order size before max-position and cash limits are applied."
-            value={strategyDraft.positionSizePct}
-            min={1}
-            max={25}
+            label="Cycle cash budget"
+            hint="Share of available cash reserved for buys in a single cycle. That budget is split across approved buys by model confidence (higher confidence gets a larger slice), then capped by max position, fees, and whole shares."
+            value={strategyDraft.cycleBudgetPct}
+            min={5}
+            max={50}
             format={(v) => `${v}%`}
             disabled={strategyBusy}
-            onChange={(v) => setStrategyDraft({ ...strategyDraft, positionSizePct: v })}
-          />
-          <ParamSlider
-            id={maxTradesId}
-            label="Max daily trades"
-            hint="Hard limit on how many buys can execute in a single trading day. It does not cap how many signals a cycle generates. Lower values slow turnover and reduce fee drag; higher values allow more fills."
-            value={strategyDraft.maxDailyTrades}
-            min={1}
-            max={20}
-            format={(v) => String(v)}
-            disabled={strategyBusy}
-            onChange={(v) => setStrategyDraft({ ...strategyDraft, maxDailyTrades: v })}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, cycleBudgetPct: v })}
           />
           <ParamSlider
             id={minConfId}
@@ -802,7 +788,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={stopLossId}
             label="Stop loss"
-            hint="Enforced each cycle: sell an open position when last price is this far below average cost."
+            hint="Sell an open position when last price is this far below average cost. Checked continuously while the app is open (about every 30s during market hours), not only on trading cycles."
             value={strategyDraft.stopLossPct}
             min={1}
             max={25}
@@ -813,7 +799,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={takeProfitId}
             label="Take profit"
-            hint="Enforced each cycle: sell an open position when last price is this far above average cost."
+            hint="Sell an open position when last price is this far above average cost. Checked continuously while the app is open (about every 30s during market hours), not only on trading cycles."
             value={strategyDraft.takeProfitPct}
             min={2}
             max={40}

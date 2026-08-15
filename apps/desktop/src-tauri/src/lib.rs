@@ -17,6 +17,8 @@ mod net_policy;
 mod ngx;
 mod portfolio;
 mod rate_limit;
+mod risk_exits;
+mod risk_monitor;
 mod runtime_util;
 mod scheduler;
 mod secrets;
@@ -204,7 +206,8 @@ pub fn run() {
             let state = AppState::new(db, worker_path);
             app.manage(state.clone());
 
-            scheduler::start_scheduler(app.handle().clone(), state);
+            scheduler::start_scheduler(app.handle().clone(), state.clone());
+            risk_monitor::start_risk_monitor(app.handle().clone(), state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

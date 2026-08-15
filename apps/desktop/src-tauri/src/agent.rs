@@ -17,7 +17,9 @@ use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
 const AGENT_IPC_TIMEOUT: Duration = Duration::from_secs(90);
-const MAX_TOOL_ROUNDS: u32 = 6;
+/// Max memory tool IPC messages per portfolio_signals request.
+/// One LLM turn can emit multiple tools; keep this above the worker's tool budget.
+const MAX_TOOL_CALLS: u32 = 8;
 
 pub fn parse_ipc_line(line: &str) -> Result<Value> {
     serde_json::from_str(line.trim()).context("parse agent ipc")
@@ -139,7 +141,7 @@ impl AgentBridge {
                     .as_ref()
                     .map(|(_, _s)| get_secret(SECRET_LLM_API_KEY).ok().flatten().unwrap_or_default())
                     .unwrap_or_default();
-                let mut rounds = 0u32;
+                let mut tool_calls = 0u32;
                 loop {
                     let mut response_line = String::new();
                     process
@@ -148,16 +150,20 @@ impl AgentBridge {
                         .context("read agent")?;
                     let response = parse_ipc_line(&response_line)?;
                     if is_tool_message(&response) {
-                        rounds += 1;
-                        if rounds > MAX_TOOL_ROUNDS {
-                            anyhow::bail!("Agent exceeded memory tool round limit");
-                        }
+                        tool_calls += 1;
                         let name = response
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         let args = response.get("arguments").cloned().unwrap_or(json!({}));
-                        let result = if let Some((db, settings)) = tools.as_ref() {
+                        let result = if tool_calls > MAX_TOOL_CALLS {
+                            // Soft-fail so the worker can force a final JSON response instead of
+                            // aborting the whole cycle.
+                            json!({
+                                "ok": false,
+                                "error": "tool budget exhausted — finish without more tools",
+                            })
+                        } else if let Some((db, settings)) = tools.as_ref() {
                             memory::handle_tool(db, settings, &api_key, name, &args)
                                 .unwrap_or_else(|e| json!({ "ok": false, "error": e.to_string() }))
                         } else {

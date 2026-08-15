@@ -21,11 +21,14 @@ pub const MAX_SIGNAL_SELLS: usize = 15;
 pub struct ParamSet {
     pub id: String,
     pub max_position_pct: f64,
+    /// Legacy column; daily BUY caps are no longer enforced.
     pub max_daily_trades: i64,
     pub stop_loss_pct: f64,
     pub min_confidence_to_trade: f64,
     pub max_daily_drawdown_pct: f64,
+    /// Legacy column; BUY sizing uses `cycle_budget_pct` instead.
     pub position_size_pct: f64,
+    pub cycle_budget_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,18 +48,15 @@ impl RiskPolicyService {
         cash_balance: f64,
         positions: &[(String, f64, f64)],
         prices: &std::collections::HashMap<String, f64>,
-        daily_trades: i64,
         daily_drawdown_pct: f64,
         fee_pct: f64,
+        target_notional: Option<f64>,
     ) -> (String, f64) {
         if signal.action == "HOLD" {
             return ("BLOCKED_OTHER".into(), 0.0);
         }
         if signal.confidence < param_set.min_confidence_to_trade {
             return ("BLOCKED_CONFIDENCE".into(), 0.0);
-        }
-        if signal.action == "BUY" && daily_trades >= param_set.max_daily_trades {
-            return ("BLOCKED_DAILY_TRADES".into(), 0.0);
         }
         if signal.action == "BUY" && daily_drawdown_pct >= param_set.max_daily_drawdown_pct {
             return ("BLOCKED_DRAWDOWN".into(), 0.0);
@@ -72,21 +72,18 @@ impl RiskPolicyService {
         let total_equity = cash_balance + market_value;
 
         if signal.action == "BUY" {
-            let mut quantity =
-                Self::position_size(total_equity, current_price, param_set, position_value);
-            quantity = Self::cap_qty_by_cash(quantity, current_price, cash_balance, fee_pct);
-            if quantity < 1.0 {
-                return ("BLOCKED_CASH".into(), 0.0);
-            }
-            let new_exposure = if total_equity > 0.0 {
-                (position_value + quantity * current_price) / total_equity
-            } else {
-                0.0
-            };
-            if new_exposure > param_set.max_position_pct || quantity <= 0.0 {
-                return ("BLOCKED_EXPOSURE".into(), 0.0);
-            }
-            return ("APPROVED".into(), quantity);
+            let notional = target_notional.unwrap_or_else(|| {
+                cash_balance * Self::clamp_cycle_budget_pct(param_set.cycle_budget_pct)
+            });
+            return Self::size_buy_from_notional(
+                notional,
+                current_price,
+                cash_balance,
+                total_equity,
+                position_value,
+                param_set.max_position_pct,
+                fee_pct,
+            );
         }
 
         if signal.action == "SELL" {
@@ -103,19 +100,64 @@ impl RiskPolicyService {
         ("BLOCKED_OTHER".into(), 0.0)
     }
 
-    fn position_size(
-        total_equity: f64,
-        current_price: f64,
-        param_set: &ParamSet,
-        current_position_value: f64,
-    ) -> f64 {
-        if current_price <= 0.0 {
-            return 0.0;
+    pub fn clamp_cycle_budget_pct(pct: f64) -> f64 {
+        pct.clamp(0.05, 0.5)
+    }
+
+    /// Normalize confidences to weights that sum to 1 via √confidence (flatter than raw).
+    /// Equal split if sum is 0.
+    pub fn confidence_weights(confidences: &[f64]) -> Vec<f64> {
+        if confidences.is_empty() {
+            return Vec::new();
         }
-        let target_value = total_equity * param_set.position_size_pct;
-        let max_value = total_equity * param_set.max_position_pct - current_position_value;
-        let alloc_value = target_value.min(max_value.max(0.0));
-        (alloc_value / current_price).floor()
+        let roots: Vec<f64> = confidences.iter().map(|c| c.max(0.0).sqrt()).collect();
+        let sum: f64 = roots.iter().copied().sum();
+        if sum <= 0.0 {
+            let w = 1.0 / confidences.len() as f64;
+            return vec![w; confidences.len()];
+        }
+        roots.iter().map(|r| r / sum).collect()
+    }
+
+    pub fn size_buy_from_notional(
+        target_notional: f64,
+        current_price: f64,
+        cash_balance: f64,
+        total_equity: f64,
+        position_value: f64,
+        max_position_pct: f64,
+        fee_pct: f64,
+    ) -> (String, f64) {
+        if current_price <= 0.0 || target_notional <= 0.0 {
+            return ("BLOCKED_CASH".into(), 0.0);
+        }
+        let mut quantity = (target_notional / current_price).floor();
+        if quantity < 1.0 {
+            return ("BLOCKED_CASH".into(), 0.0);
+        }
+        let max_qty_by_exposure = if total_equity > 0.0 {
+            let max_value = total_equity * max_position_pct - position_value;
+            (max_value.max(0.0) / current_price).floor()
+        } else {
+            0.0
+        };
+        quantity = quantity.min(max_qty_by_exposure);
+        if quantity < 1.0 {
+            return ("BLOCKED_EXPOSURE".into(), 0.0);
+        }
+        quantity = Self::cap_qty_by_cash(quantity, current_price, cash_balance, fee_pct);
+        if quantity < 1.0 {
+            return ("BLOCKED_CASH".into(), 0.0);
+        }
+        let new_exposure = if total_equity > 0.0 {
+            (position_value + quantity * current_price) / total_equity
+        } else {
+            0.0
+        };
+        if new_exposure > max_position_pct {
+            return ("BLOCKED_EXPOSURE".into(), 0.0);
+        }
+        ("APPROVED".into(), quantity)
     }
 
     /// Cap quantity so (price * qty) * (1 + fee_pct) fits in spendable cash.
@@ -129,6 +171,37 @@ impl RiskPolicyService {
         }
         let max_qty = (cash / unit_cost).floor();
         qty.min(max_qty).max(0.0)
+    }
+
+    /// True if cash can buy at least one whole share at `price` after fees.
+    /// Used for pre-LLM capacity gates (not full position sizing).
+    pub fn can_afford_one_share(cash: f64, price: f64, fee_pct: f64) -> bool {
+        if price <= 0.0 || cash <= 0.0 {
+            return false;
+        }
+        let unit_cost = price * (1.0 + fee_pct.max(0.0));
+        unit_cost > 0.0 && cash >= unit_cost
+    }
+
+    /// True if the cycle cash budget can fund at least one whole share at `price`.
+    pub fn can_fund_min_lot(
+        cash: f64,
+        total_equity: f64,
+        price: f64,
+        current_position_value: f64,
+        param_set: &ParamSet,
+        fee_pct: f64,
+    ) -> bool {
+        if cash <= 0.0 || total_equity <= 0.0 || price <= 0.0 {
+            return false;
+        }
+        let budget = cash * Self::clamp_cycle_budget_pct(param_set.cycle_budget_pct);
+        if !Self::can_afford_one_share(budget, price, fee_pct) {
+            return false;
+        }
+        let one_share_exposure = (current_position_value + price) / total_equity;
+        one_share_exposure <= param_set.max_position_pct
+            && Self::cap_qty_by_cash(1.0, price, cash, fee_pct) >= 1.0
     }
 }
 
@@ -198,6 +271,52 @@ impl ExecutionService {
             ));
         }
 
+        let buy_targets = match trading_mode {
+            TradingMode::Sandbox => db.with_conn(|conn| {
+                Self::plan_sandbox_buy_targets(conn, cache, signal_ids)
+            })?,
+            TradingMode::Live => {
+                if let Some(client) = broker {
+                    let wallet = client.get_wallet().await?;
+                    let snap = client.get_portfolio().await?;
+                    let mv = if snap.stock_value > 0.0 {
+                        snap.stock_value
+                    } else {
+                        snap.holdings.iter().map(|h| h.current_value).sum()
+                    };
+                    let equity = wallet.brokerage_balance + mv;
+                    let planned = db.with_conn(|conn| {
+                        let pending_buy = intents::pending_buy_notional(conn)?;
+                        let spendable = (wallet.brokerage_balance - pending_buy).max(0.0);
+                        let daily_drawdown =
+                            live_drawdown_pct(conn, client.id().as_str(), equity).unwrap_or(0.0);
+                        let portfolio: Option<(String, String)> = conn
+                            .query_row(
+                                "SELECT id, strategy_param_set_id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .ok();
+                        let Some((_, strategy_id)) = portfolio else {
+                            return Ok(std::collections::HashMap::new());
+                        };
+                        let param_set = Self::load_param_set(conn, &strategy_id)?;
+                        Self::plan_buy_targets(
+                            conn,
+                            cache,
+                            signal_ids,
+                            &param_set,
+                            spendable,
+                            daily_drawdown,
+                        )
+                    })?;
+                    planned
+                } else {
+                    std::collections::HashMap::new()
+                }
+            }
+        };
+
         for signal_id in signal_ids.iter().take(settings.max_live_actions.max(1) as usize) {
             match Self::process_signal(
                 db,
@@ -209,6 +328,7 @@ impl ExecutionService {
                 allow_bulk_liquidation,
                 cycle_id,
                 &mut cycle_sell_notional,
+                buy_targets.get(signal_id).copied(),
             )
             .await
             {
@@ -230,6 +350,7 @@ impl ExecutionService {
         allow_bulk_liquidation: bool,
         cycle_id: Option<&str>,
         cycle_sell_notional: &mut f64,
+        buy_target_notional: Option<f64>,
     ) -> Result<bool> {
         let loaded = db.with_conn(|conn| {
             let signal: Option<(String, String, f64)> = conn
@@ -269,6 +390,11 @@ impl ExecutionService {
             confidence,
         };
         let fee_pct = settings.simulated_fee_pct.max(0.0);
+
+        // BUY already failed Pass A qualify — risk_policy_result was written in the planner.
+        if action == "BUY" && buy_target_notional.is_none() {
+            return Ok(false);
+        }
 
         if trading_mode == TradingMode::Live {
             let client = broker.ok_or_else(|| anyhow::anyhow!("Live broker session required"))?;
@@ -326,7 +452,6 @@ impl ExecutionService {
                     }
                 }
                 let spendable = (wallet.brokerage_balance - pending_buy).max(0.0);
-                let daily_trades = intents::pending_action_count(conn)?;
                 let daily_drawdown = live_drawdown_pct(conn, client.id().as_str(), current_equity)?;
                 let (result, mut quantity) = RiskPolicyService::evaluate(
                     &input,
@@ -334,9 +459,9 @@ impl ExecutionService {
                     spendable,
                     &positions,
                     &prices,
-                    daily_trades,
                     daily_drawdown,
                     fee_pct,
+                    buy_target_notional,
                 );
                 conn.execute(
                     "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
@@ -489,13 +614,6 @@ impl ExecutionService {
                 symbols.push(symbol.clone());
             }
             let prices = Self::get_prices(conn, cache, &symbols)?;
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let daily_trades: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sandbox_trades
-                 WHERE portfolio_id = ?1 AND date(executed_at) = ?2 AND side = 'BUY'",
-                rusqlite::params![portfolio.0, today],
-                |row| row.get(0),
-            )?;
             let daily_drawdown: f64 = conn
                 .query_row(
                     "SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = ?1 ORDER BY snapshot_date DESC LIMIT 1",
@@ -509,9 +627,9 @@ impl ExecutionService {
                 portfolio.1,
                 &positions,
                 &prices,
-                daily_trades,
                 daily_drawdown,
                 fee_pct,
+                buy_target_notional,
             );
             conn.execute(
                 "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
@@ -630,9 +748,110 @@ impl ExecutionService {
         }
     }
 
+    fn plan_sandbox_buy_targets(
+        conn: &Connection,
+        cache: &PriceCache,
+        signal_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        let portfolio: (String, f64, String) = conn.query_row(
+            "SELECT id, cash_balance, strategy_param_set_id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let param_set = Self::load_param_set(conn, &portfolio.2)?;
+        let daily_drawdown: f64 = conn
+            .query_row(
+                "SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = ?1 ORDER BY snapshot_date DESC LIMIT 1",
+                [&portfolio.0],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        Self::plan_buy_targets(
+            conn,
+            cache,
+            signal_ids,
+            &param_set,
+            portfolio.1,
+            daily_drawdown,
+        )
+    }
+
+    /// Pass A qualify + Pass B confidence-weighted cycle budget → target notional per BUY signal id.
+    fn plan_buy_targets(
+        conn: &Connection,
+        cache: &PriceCache,
+        signal_ids: &[String],
+        param_set: &ParamSet,
+        cash: f64,
+        daily_drawdown: f64,
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        let mut qualified: Vec<(String, f64)> = Vec::new();
+
+        for signal_id in signal_ids {
+            let signal: Option<(String, String, f64)> = conn
+                .query_row(
+                    "SELECT symbol, action, confidence FROM signals WHERE id = ?1",
+                    [signal_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .ok();
+            let Some((symbol, action, confidence)) = signal else {
+                continue;
+            };
+            if action != "BUY" {
+                continue;
+            }
+            if !is_valid_ticker(&symbol) {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_SYMBOL' WHERE id = ?1",
+                    [signal_id],
+                )?;
+                continue;
+            }
+            if confidence < param_set.min_confidence_to_trade {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_CONFIDENCE' WHERE id = ?1",
+                    [signal_id],
+                )?;
+                continue;
+            }
+            if daily_drawdown >= param_set.max_daily_drawdown_pct {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_DRAWDOWN' WHERE id = ?1",
+                    [signal_id],
+                )?;
+                continue;
+            }
+            let price = Self::get_prices(conn, cache, &[symbol.clone()])?
+                .get(&symbol)
+                .copied()
+                .unwrap_or(0.0);
+            if price <= 0.0 {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_OTHER' WHERE id = ?1",
+                    [signal_id],
+                )?;
+                continue;
+            }
+            qualified.push((signal_id.clone(), confidence));
+        }
+
+        let budget = cash * RiskPolicyService::clamp_cycle_budget_pct(param_set.cycle_budget_pct);
+        let weights = RiskPolicyService::confidence_weights(
+            &qualified.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+        );
+        let mut out = std::collections::HashMap::new();
+        for ((signal_id, _), weight) in qualified.into_iter().zip(weights.into_iter()) {
+            out.insert(signal_id, budget * weight);
+        }
+        Ok(out)
+    }
+
     fn load_param_set(conn: &Connection, id: &str) -> Result<ParamSet> {
         conn.query_row(
-            "SELECT id, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct FROM strategy_param_sets WHERE id = ?1",
+            "SELECT id, max_position_pct, max_daily_trades, stop_loss_pct, min_confidence_to_trade,
+                    max_daily_drawdown_pct, position_size_pct, cycle_budget_pct
+             FROM strategy_param_sets WHERE id = ?1",
             [id],
             |row| {
                 Ok(ParamSet {
@@ -643,6 +862,7 @@ impl ExecutionService {
                     min_confidence_to_trade: row.get(4)?,
                     max_daily_drawdown_pct: row.get(5)?,
                     position_size_pct: row.get(6)?,
+                    cycle_budget_pct: row.get(7)?,
                 })
             },
         )
@@ -754,6 +974,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn can_fund_min_lot_requires_whole_share() {
+        let param_set = test_param_set();
+        assert!(RiskPolicyService::can_fund_min_lot(
+            10_000.0, 10_000.0, 50.0, 0.0, &param_set, 0.0015
+        ));
+        assert!(!RiskPolicyService::can_afford_one_share(40.0, 50.0, 0.0015));
+        assert!(!RiskPolicyService::can_fund_min_lot(
+            40.0, 10_000.0, 50.0, 0.0, &param_set, 0.0015
+        ));
+        assert!(!RiskPolicyService::can_fund_min_lot(
+            0.0, 10_000.0, 50.0, 0.0, &param_set, 0.0015
+        ));
+        // Cycle budget (20%) must cover one share after fees on a pricey name
+        assert!(!RiskPolicyService::can_fund_min_lot(
+            2_100_000.0, 10_000_000.0, 2_000_000.0, 0.0, &param_set, 0.0015
+        ));
+        assert!(RiskPolicyService::can_fund_min_lot(
+            10_100_000.0, 10_100_000.0, 2_000_000.0, 0.0, &param_set, 0.0015
+        ));
+    }
+
+    #[test]
     fn rejects_stale_broker_quote() {
         assert!(quote_within_deviation(100.0, 104.0));
         assert!(!quote_within_deviation(100.0, 106.0));
@@ -769,11 +1011,94 @@ mod tests {
             min_confidence_to_trade: 0.5,
             max_daily_drawdown_pct: 0.05,
             position_size_pct: 0.05,
+            cycle_budget_pct: 0.20,
         }
     }
 
     #[test]
-    fn daily_trade_cap_blocks_buy_not_sell() {
+    fn confidence_weights_split_flatter_than_raw_ratio() {
+        let weights = RiskPolicyService::confidence_weights(&[0.9, 0.45]);
+        assert_eq!(weights.len(), 2);
+        let ratio = weights[0] / weights[1];
+        // √0.9 / √0.45 = √2 ≈ 1.414, not raw 2:1
+        assert!((ratio - std::f64::consts::SQRT_2).abs() < 1e-9);
+        assert!(ratio < 2.0);
+    }
+
+    #[test]
+    fn confidence_weights_equal_when_zero_sum() {
+        let weights = RiskPolicyService::confidence_weights(&[0.0, 0.0]);
+        assert_eq!(weights, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn cycle_budget_allocates_by_confidence_before_share_rounding() {
+        let param_set = test_param_set();
+        let cash = 1_000_000.0;
+        let budget = cash * param_set.cycle_budget_pct;
+        let weights = RiskPolicyService::confidence_weights(&[0.9, 0.45]);
+        let n0 = budget * weights[0];
+        let n1 = budget * weights[1];
+        assert!((n0 / n1 - std::f64::consts::SQRT_2).abs() < 1e-9);
+        assert!((n0 + n1 - budget).abs() < 1e-6);
+
+        let price = 50.0;
+        let (r0, q0) = RiskPolicyService::size_buy_from_notional(
+            n0, price, cash, cash, 0.0, param_set.max_position_pct, 0.0,
+        );
+        let (r1, q1) = RiskPolicyService::size_buy_from_notional(
+            n1, price, cash, cash, 0.0, param_set.max_position_pct, 0.0,
+        );
+        assert_eq!(r0, "APPROVED");
+        assert_eq!(r1, "APPROVED");
+        assert!(q0 > q1);
+        assert!((q0 as f64 / q1 as f64 - std::f64::consts::SQRT_2).abs() < 0.05);
+    }
+
+    #[test]
+    fn cycle_budget_pct_caps_total_notional() {
+        let param_set = test_param_set();
+        let cash = 100_000.0;
+        let budget = cash * RiskPolicyService::clamp_cycle_budget_pct(param_set.cycle_budget_pct);
+        assert!((budget - 20_000.0).abs() < 1e-9);
+        let (result, qty) = RiskPolicyService::size_buy_from_notional(
+            budget, 50.0, cash, cash, 0.0, param_set.max_position_pct, 0.0,
+        );
+        assert_eq!(result, "APPROVED");
+        assert_eq!(qty, 400.0); // 20000/50
+        assert!(qty * 50.0 <= budget + 1e-9);
+    }
+
+    #[test]
+    fn max_position_still_blocks_oversized_buy() {
+        let param_set = test_param_set();
+        // Already at max exposure
+        let equity = 100_000.0;
+        let position_value = 25_000.0;
+        let (result, qty) = RiskPolicyService::size_buy_from_notional(
+            20_000.0,
+            50.0,
+            75_000.0,
+            equity,
+            position_value,
+            param_set.max_position_pct,
+            0.0,
+        );
+        assert_eq!(result, "BLOCKED_EXPOSURE");
+        assert_eq!(qty, 0.0);
+    }
+
+    #[test]
+    fn whole_share_floor_blocks_tiny_notional() {
+        let (result, qty) = RiskPolicyService::size_buy_from_notional(
+            40.0, 50.0, 1_000_000.0, 1_000_000.0, 0.0, 0.25, 0.0,
+        );
+        assert_eq!(result, "BLOCKED_CASH");
+        assert_eq!(qty, 0.0);
+    }
+
+    #[test]
+    fn drawdown_blocks_buy_not_sell() {
         let param_set = test_param_set();
         let prices = std::collections::HashMap::from([("GTCO".into(), 50.0)]);
         let positions = vec![("GTCO".into(), 100.0, 40.0)];
@@ -795,9 +1120,9 @@ mod tests {
             1_000_000.0,
             &positions,
             &prices,
-            param_set.max_daily_trades,
-            0.0,
+            param_set.max_daily_drawdown_pct,
             0.01,
+            Some(50_000.0),
         );
         let (sell_result, sell_qty) = RiskPolicyService::evaluate(
             &sell,
@@ -805,11 +1130,11 @@ mod tests {
             1_000_000.0,
             &positions,
             &prices,
-            param_set.max_daily_trades,
-            0.0,
+            param_set.max_daily_drawdown_pct,
             0.01,
+            None,
         );
-        assert_eq!(buy_result, "BLOCKED_DAILY_TRADES");
+        assert_eq!(buy_result, "BLOCKED_DRAWDOWN");
         assert_eq!(sell_result, "APPROVED");
         assert_eq!(sell_qty, 100.0);
     }

@@ -53,6 +53,12 @@ impl Database {
             .context("run bamboo cache migration")?;
         conn.execute_batch(include_str!("../../migrations/008_agent_memories.sql"))
             .context("run agent_memories migration")?;
+        Self::add_column_if_missing(
+            conn,
+            "strategy_param_sets",
+            "cycle_budget_pct",
+            "REAL NOT NULL DEFAULT 0.20",
+        )?;
         Self::add_column_if_missing(conn, "broker_orders", "external_order_ref", "TEXT")?;
         Self::add_column_if_missing(conn, "order_intents", "external_order_ref", "TEXT")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])

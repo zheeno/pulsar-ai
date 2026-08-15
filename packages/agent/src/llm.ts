@@ -10,7 +10,9 @@ import { createChatModel } from './model-factory';
 import { buildSignalPrompt } from './prompt/v1.0.0';
 import { buildPortfolioSignalPrompt } from './prompt/v2.4.0';
 
-const MAX_TOOL_ROUNDS = 6;
+const MAX_TOOL_ROUNDS = 3;
+/** Prompt allows 1 search + 2 upserts; hard-cap total invocations across rounds. */
+const MAX_TOOL_CALLS = 3;
 
 export type ToolCaller = (
   name: string,
@@ -57,6 +59,20 @@ function memoryTools(callTool: ToolCaller): any[] {
   ];
 }
 
+async function forceSignalsJson(
+  config: LlmConfig,
+  messages: BaseMessage[],
+): Promise<string> {
+  messages.push(
+    new HumanMessage(
+      'Tool budget exhausted. Do not call tools. Return the JSON signals object now.',
+    ),
+  );
+  const finalModel = createChatModel(config);
+  const finalResponse = await finalModel.invoke(messages);
+  return contentToText(finalResponse.content);
+}
+
 async function invokeWithRetry(
   config: LlmConfig,
   prompt: string,
@@ -72,24 +88,59 @@ async function invokeWithRetry(
         const tools = memoryTools(callTool);
         const bound = createChatModel(config).bindTools(tools);
         const messages: BaseMessage[] = [new HumanMessage(prompt)];
+        let toolCallsUsed = 0;
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
           const response = await bound.invoke(messages);
           const toolCalls = response.tool_calls as
             | { name: string; args?: Record<string, unknown>; id?: string }[]
             | undefined;
           if (toolCalls && toolCalls.length > 0) {
-            if (round === MAX_TOOL_ROUNDS) {
-              throw new Error('Agent exceeded memory tool round limit');
+            const budgetLeft = MAX_TOOL_CALLS - toolCallsUsed;
+            if (budgetLeft <= 0 || round === MAX_TOOL_ROUNDS) {
+              messages.push(response as BaseMessage);
+              for (const tc of toolCalls) {
+                messages.push(
+                  new ToolMessage({
+                    content: JSON.stringify({
+                      ok: false,
+                      error: 'tool budget exhausted — finish without more tools',
+                    }),
+                    tool_call_id: tc.id || tc.name,
+                  }),
+                );
+              }
+              rawResponse = await forceSignalsJson(config, messages);
+              const parsed = parseJson(rawResponse);
+              const validated = validate(parsed);
+              return { output: validated, prompt, rawResponse, modelName };
             }
             messages.push(response as BaseMessage);
-            for (const tc of toolCalls) {
+            for (const tc of toolCalls.slice(0, budgetLeft)) {
               const result = await callTool(tc.name, tc.args ?? {});
+              toolCallsUsed += 1;
               messages.push(
                 new ToolMessage({
                   content: JSON.stringify(result),
                   tool_call_id: tc.id || tc.name,
                 }),
               );
+            }
+            for (const tc of toolCalls.slice(budgetLeft)) {
+              messages.push(
+                new ToolMessage({
+                  content: JSON.stringify({
+                    ok: false,
+                    error: 'tool budget exhausted — finish without more tools',
+                  }),
+                  tool_call_id: tc.id || tc.name,
+                }),
+              );
+            }
+            if (toolCallsUsed >= MAX_TOOL_CALLS || toolCalls.length > budgetLeft) {
+              rawResponse = await forceSignalsJson(config, messages);
+              const parsed = parseJson(rawResponse);
+              const validated = validate(parsed);
+              return { output: validated, prompt, rawResponse, modelName };
             }
             continue;
           }

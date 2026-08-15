@@ -1533,7 +1533,8 @@ pub fn get_strategy(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
         .with_conn(|conn| {
             Ok(conn.query_row(
                 "SELECT id, name, max_position_pct, max_daily_trades, stop_loss_pct, take_profit_pct,
-                        min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct, is_active
+                        min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct,
+                        cycle_budget_pct, is_active
                  FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
                 [],
                 |row| {
@@ -1547,7 +1548,8 @@ pub fn get_strategy(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
                         "min_confidence_to_trade": row.get::<_, f64>(6)?,
                         "max_daily_drawdown_pct": row.get::<_, f64>(7)?,
                         "position_size_pct": row.get::<_, f64>(8)?,
-                        "is_active": row.get::<_, i64>(9)? == 1,
+                        "cycle_budget_pct": row.get::<_, f64>(9)?,
+                        "is_active": row.get::<_, i64>(10)? == 1,
                     }))
                 },
             )?)
@@ -1559,12 +1561,11 @@ pub fn get_strategy(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
 #[serde(rename_all = "camelCase")]
 pub struct StrategyUpdate {
     pub max_position_pct: f64,
-    pub max_daily_trades: i64,
     pub stop_loss_pct: f64,
     pub take_profit_pct: Option<f64>,
     pub min_confidence_to_trade: f64,
     pub max_daily_drawdown_pct: f64,
-    pub position_size_pct: f64,
+    pub cycle_budget_pct: f64,
 }
 
 fn validate_ratio(name: &str, value: f64) -> Result<(), String> {
@@ -1583,12 +1584,11 @@ pub fn update_strategy(
     validate_ratio("stopLossPct", strategy.stop_loss_pct)?;
     validate_ratio("minConfidenceToTrade", strategy.min_confidence_to_trade)?;
     validate_ratio("maxDailyDrawdownPct", strategy.max_daily_drawdown_pct)?;
-    validate_ratio("positionSizePct", strategy.position_size_pct)?;
+    if !(0.05..=0.5).contains(&strategy.cycle_budget_pct) {
+        return Err("cycleBudgetPct must be between 0.05 and 0.5".into());
+    }
     if let Some(tp) = strategy.take_profit_pct {
         validate_ratio("takeProfitPct", tp)?;
-    }
-    if strategy.max_daily_trades < 1 {
-        return Err("maxDailyTrades must be at least 1".into());
     }
 
     state
@@ -1597,22 +1597,20 @@ pub fn update_strategy(
             let updated = conn.execute(
                 "UPDATE strategy_param_sets SET
                     max_position_pct = ?1,
-                    max_daily_trades = ?2,
-                    stop_loss_pct = ?3,
-                    take_profit_pct = ?4,
-                    min_confidence_to_trade = ?5,
-                    max_daily_drawdown_pct = ?6,
-                    position_size_pct = ?7,
+                    stop_loss_pct = ?2,
+                    take_profit_pct = ?3,
+                    min_confidence_to_trade = ?4,
+                    max_daily_drawdown_pct = ?5,
+                    cycle_budget_pct = ?6,
                     allowed_symbols = NULL
                  WHERE is_active = 1",
                 rusqlite::params![
                     strategy.max_position_pct,
-                    strategy.max_daily_trades,
                     strategy.stop_loss_pct,
                     strategy.take_profit_pct,
                     strategy.min_confidence_to_trade,
                     strategy.max_daily_drawdown_pct,
-                    strategy.position_size_pct,
+                    strategy.cycle_budget_pct,
                 ],
             )?;
             if updated == 0 {

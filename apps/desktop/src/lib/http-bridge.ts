@@ -115,6 +115,7 @@ function defaultStore(): MockStore {
       min_confidence_to_trade: 0.65,
       max_daily_drawdown_pct: 0.03,
       position_size_pct: 0.05,
+      cycle_budget_pct: 0.2,
       is_active: true,
     },
     memories: [],
@@ -464,12 +465,11 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       const payload = (args || {}) as {
         strategy?: {
           maxPositionPct?: number;
-          maxDailyTrades?: number;
           stopLossPct?: number;
           takeProfitPct?: number | null;
           minConfidenceToTrade?: number;
           maxDailyDrawdownPct?: number;
-          positionSizePct?: number;
+          cycleBudgetPct?: number;
         };
       };
       const s = payload.strategy || {};
@@ -477,12 +477,11 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       store.strategy = {
         ...store.strategy,
         max_position_pct: s.maxPositionPct ?? store.strategy.max_position_pct,
-        max_daily_trades: s.maxDailyTrades ?? store.strategy.max_daily_trades,
         stop_loss_pct: s.stopLossPct ?? store.strategy.stop_loss_pct,
         take_profit_pct: s.takeProfitPct ?? store.strategy.take_profit_pct ?? 0.1,
         min_confidence_to_trade: s.minConfidenceToTrade ?? store.strategy.min_confidence_to_trade,
         max_daily_drawdown_pct: s.maxDailyDrawdownPct ?? store.strategy.max_daily_drawdown_pct,
-        position_size_pct: s.positionSizePct ?? store.strategy.position_size_pct,
+        cycle_budget_pct: s.cycleBudgetPct ?? store.strategy.cycle_budget_pct ?? 0.2,
       };
       delete store.strategy.allowed_symbols;
       saveStore(store);

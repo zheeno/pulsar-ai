@@ -43,13 +43,14 @@ export const StrategyParamSetSchema = z.object({
   id: z.string().uuid().optional(),
   name: z.string().min(1),
   max_position_pct: z.number().min(0).max(1),
-  max_daily_trades: z.number().int().positive(),
+  max_daily_trades: z.number().int().positive().optional(), // deprecated: unused
   stop_loss_pct: z.number().min(0).max(1),
   take_profit_pct: z.number().min(0).max(1).nullable().optional(),
   min_confidence_to_trade: z.number().min(0).max(1),
   max_daily_drawdown_pct: z.number().min(0).max(1),
   allowed_symbols: z.array(z.string()).nullable().optional(), // deprecated: unused; universe is all active instruments
   position_size_pct: z.number().min(0).max(1).default(0.05),
+  cycle_budget_pct: z.number().min(0.05).max(0.5).default(0.2),
   is_active: z.boolean().optional(),
 });
 export type StrategyParamSet = z.infer<typeof StrategyParamSetSchema>;
