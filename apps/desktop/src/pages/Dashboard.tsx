@@ -10,7 +10,7 @@ import {
 } from 'recharts';
 import { IconShieldAlert, IconShieldCheck, IconSpinner } from '../components/Icons';
 import { api, type PortfolioData } from '../lib/api';
-import { formatMoney } from '../lib/format';
+import { cryptoBaseAsset, formatCryptoQty, formatMoney } from '../lib/format';
 import { useCycle } from '../lib/cycle';
 import { useToast } from '../lib/toast';
 import { useSession } from '../lib/session';
@@ -657,20 +657,33 @@ export default function DashboardPage() {
               <tr>
                 <th>Symbol</th>
                 <th>Qty</th>
-                <th>Avg cost</th>
-                <th>Current</th>
-                <th>Value</th>
+                <th>{isCrypto ? 'Avg cost (USDT)' : 'Avg cost'}</th>
+                <th>{isCrypto ? 'Current (USDT)' : 'Current'}</th>
+                <th>{isCrypto ? 'Value (USDT)' : 'Value'}</th>
               </tr>
             </thead>
             <tbody>
               {data.positions.map((p) => (
                 <tr key={p.symbol}>
                   <td className="mono">
-                    <Link className="symbol-link" to={`/symbol/${encodeURIComponent(p.symbol)}`}>
-                      {p.symbol}
+                    <Link
+                      className="symbol-link"
+                      to={`/symbol/${encodeURIComponent(p.symbol)}`}
+                      title={p.symbol}
+                    >
+                      {isCrypto ? cryptoBaseAsset(p.symbol) : p.symbol}
+                      {isCrypto ? (
+                        <span className="muted" style={{ marginLeft: 6, fontWeight: 400 }}>
+                          /USDT
+                        </span>
+                      ) : null}
                     </Link>
                   </td>
-                  <td className="mono">{Number(p.quantity).toLocaleString()}</td>
+                  <td className="mono">
+                    {isCrypto
+                      ? formatCryptoQty(Number(p.quantity), p.symbol)
+                      : Number(p.quantity).toLocaleString()}
+                  </td>
                   <td className="mono">{money(Number(p.avg_cost))}</td>
                   <td className="mono">{money(Number(p.current_price))}</td>
                   <td className="mono">{money(Number(p.market_value))}</td>

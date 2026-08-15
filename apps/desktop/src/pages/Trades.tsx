@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { IconTrades } from '../components/Icons';
 import { api } from '../lib/api';
-import { formatMoney } from '../lib/format';
+import { cryptoBaseAsset, formatCryptoQty, formatMoney } from '../lib/format';
 import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
 
@@ -76,7 +76,7 @@ export default function TradesPage() {
                 <th>Symbol</th>
                 <th>Side</th>
                 <th>Qty</th>
-                <th>Fill price</th>
+                <th>{isCrypto ? 'Fill (USDT)' : 'Fill price'}</th>
                 <th>Fee</th>
                 <th>Venue</th>
                 <th>Cash after</th>
@@ -87,12 +87,25 @@ export default function TradesPage() {
               {trades.map((t) => (
                 <tr key={t.id}>
                   <td className="mono">
-                    <Link className="symbol-link" to={`/symbol/${encodeURIComponent(t.symbol)}`}>
-                      {t.symbol}
+                    <Link
+                      className="symbol-link"
+                      to={`/symbol/${encodeURIComponent(t.symbol)}`}
+                      title={t.symbol}
+                    >
+                      {isCrypto ? cryptoBaseAsset(t.symbol) : t.symbol}
+                      {isCrypto ? (
+                        <span className="muted" style={{ marginLeft: 6, fontWeight: 400 }}>
+                          /USDT
+                        </span>
+                      ) : null}
                     </Link>
                   </td>
                   <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
-                  <td className="mono">{Number(t.quantity).toLocaleString(undefined, { maximumFractionDigits: isCrypto ? 8 : 0 })}</td>
+                  <td className="mono">
+                    {isCrypto
+                      ? formatCryptoQty(Number(t.quantity), t.symbol)
+                      : Number(t.quantity).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                  </td>
                   <td className="mono">{money(Number(t.fill_price))}</td>
                   <td className="mono">{money(Number(t.simulated_fee))}</td>
                   <td>

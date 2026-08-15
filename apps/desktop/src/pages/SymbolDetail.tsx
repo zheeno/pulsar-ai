@@ -11,7 +11,7 @@ import {
 } from 'recharts';
 import { IconSpinner } from '../components/Icons';
 import { api } from '../lib/api';
-import { formatMoney } from '../lib/format';
+import { cryptoBaseAsset, formatCryptoQty, formatMoney } from '../lib/format';
 import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
 
@@ -73,6 +73,7 @@ export default function SymbolDetailPage() {
   const isCrypto = activeModule === 'crypto';
   const money = (n: number | null | undefined) => formatMoney(n, isCrypto ? 'crypto' : 'stocks');
   const symbol = (rawSymbol || '').toUpperCase();
+  const displayBase = isCrypto ? cryptoBaseAsset(symbol) : symbol;
   const [data, setData] = useState<SymbolDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [pulseRefreshing, setPulseRefreshing] = useState(false);
@@ -143,9 +144,19 @@ export default function SymbolDetailPage() {
             <span aria-hidden> / </span>
             <Link to="/trades" className="symbol-link">Trades</Link>
             <span aria-hidden> / </span>
-            <span className="mono">{symbol}</span>
+            <span className="mono" title={symbol}>
+              {displayBase}
+              {isCrypto ? <span className="muted">/USDT</span> : null}
+            </span>
           </p>
-          <h1 className="mono" style={{ marginBottom: 4 }}>{symbol}</h1>
+          <h1 className="mono" style={{ marginBottom: 4 }} title={symbol}>
+            {displayBase}
+            {isCrypto ? (
+              <span className="muted" style={{ fontSize: '0.65em', fontWeight: 500, marginLeft: 8 }}>
+                /USDT
+              </span>
+            ) : null}
+          </h1>
           <p style={{ margin: 0 }}>
             {data?.name || (loading ? '…' : 'Unknown instrument')}
             {data?.sector ? <span className="muted"> · {data.sector}</span> : null}
@@ -206,11 +217,13 @@ export default function SymbolDetailPage() {
                   <div className="stat-card">
                     <div className="stat-card__label">Position qty</div>
                     <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
-                      {Number(data.position.quantity).toLocaleString()}
+                      {isCrypto
+                        ? formatCryptoQty(data.position.quantity, symbol)
+                        : Number(data.position.quantity).toLocaleString()}
                     </div>
                   </div>
                   <div className="stat-card">
-                    <div className="stat-card__label">Avg cost</div>
+                    <div className="stat-card__label">{isCrypto ? 'Avg cost (USDT)' : 'Avg cost'}</div>
                     <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
                       {money(data.position.avgCost)}
                     </div>
@@ -302,7 +315,7 @@ export default function SymbolDetailPage() {
                     <th>When</th>
                     <th>Side</th>
                     <th>Qty</th>
-                    <th>Fill</th>
+                    <th>{isCrypto ? 'Fill (USDT)' : 'Fill'}</th>
                     <th>Fee</th>
                   </tr>
                 </thead>
@@ -311,7 +324,11 @@ export default function SymbolDetailPage() {
                     <tr key={t.id}>
                       <td className="muted" style={{ fontSize: 12 }}>{t.executedAt}</td>
                       <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
-                      <td className="mono">{Number(t.quantity).toLocaleString()}</td>
+                      <td className="mono">
+                        {isCrypto
+                          ? formatCryptoQty(t.quantity, symbol)
+                          : Number(t.quantity).toLocaleString()}
+                      </td>
                       <td className="mono">{money(t.fillPrice)}</td>
                       <td className="mono">{money(t.simulatedFee)}</td>
                     </tr>
