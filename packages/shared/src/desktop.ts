@@ -39,6 +39,20 @@ export const AppSettingsSchema = z.object({
 });
 export type AppSettings = z.infer<typeof AppSettingsSchema>;
 
+export const AgentToolCallSchema = z.object({
+  type: z.literal('tool'),
+  name: z.enum(['memory_search', 'memory_upsert']),
+  arguments: z.record(z.unknown()),
+});
+export type AgentToolCall = z.infer<typeof AgentToolCallSchema>;
+
+export const AgentToolResultSchema = z.object({
+  type: z.literal('tool_result'),
+  name: z.string(),
+  result: z.unknown(),
+});
+export type AgentToolResult = z.infer<typeof AgentToolResultSchema>;
+
 export const AgentRequestSchema = z.discriminatedUnion('op', [
   z.object({ id: z.string(), op: z.literal('ping') }),
   z.object({

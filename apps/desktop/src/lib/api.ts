@@ -24,16 +24,12 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     };
   }
 
-  if (command === 'start_backtest') {
-    return {
-      strategy_param_set_id: args.strategyParamSetId,
-      start_date: args.startDate,
-      end_date: args.endDate,
-    };
+  if (command === 'memory_delete') {
+    return { id: args.id };
   }
 
-  if (command === 'get_backtest') {
-    return { run_id: args.runId };
+  if (command === 'memory_search') {
+    return { query: args.query, symbol: args.symbol, k: args.k };
   }
 
   return args;

@@ -38,10 +38,10 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
-    "resources": [
-      "resources/agent-worker.cjs",
-      "resources/app.env"
-    ],
+    "resources": {
+      "resources/agent-worker.cjs": "agent-worker.cjs",
+      "resources/app.env": "app.env"
+    },
     "externalBin": [],
     "category": "Finance",
     "shortDescription": "Local NGX trading assistant",

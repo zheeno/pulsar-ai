@@ -57,13 +57,12 @@ export function IconStrategy(p: IconProps) {
   );
 }
 
-export function IconBacktest(p: IconProps) {
+export function IconMemory(p: IconProps) {
   return (
     <svg {...base(p)}>
-      <path d="M4 19h16" />
-      <path d="M6 16V9" />
-      <path d="M12 16V5" />
-      <path d="M18 16v-4" />
+      <path d="M9 3h6v4H9z" />
+      <path d="M7 7h10v14H7z" />
+      <path d="M10 11h4M10 15h4" />
     </svg>
   );
 }
