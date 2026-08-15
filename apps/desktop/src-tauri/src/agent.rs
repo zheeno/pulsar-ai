@@ -264,6 +264,8 @@ fn resolve_node_bin_windows() -> PathBuf {
     PathBuf::from("node.exe")
 }
 
+const EMBEDDED_WORKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent-worker.cjs"));
+
 fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
     verify_bundled_worker(path)?;
     let node = resolve_node_bin();
@@ -298,7 +300,10 @@ fn verify_bundled_worker(path: &Path) -> Result<()> {
         return Err(anyhow!("Release build is missing AGENT_WORKER_SHA256"));
     }
     let bytes = std::fs::read(path).with_context(|| {
-        format!("read bundled agent worker ({})", path.display())
+        format!(
+            "read bundled agent worker ({}) — packaged builds must not use the developer machine path",
+            path.display()
+        )
     })?;
     let digest = Sha256::digest(&bytes);
     let actual = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -329,11 +334,46 @@ pub fn bundled_resource_candidates(resource_dir: Option<&Path>, filename: &str) 
     out
 }
 
-/// Prefer bundled resource worker in packaged apps; fall back to repo path in dev.
-pub fn resolve_worker_path(resource_dir: Option<&Path>, extras: &[PathBuf]) -> PathBuf {
+fn exe_resource_candidates(filename: &str) -> Vec<PathBuf> {
+    match std::env::current_exe() {
+        Ok(exe) => exe
+            .parent()
+            .map(|dir| bundled_resource_candidates(Some(dir), filename))
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn install_embedded_worker(app_data: &Path) -> Result<PathBuf> {
+    if EMBEDDED_WORKER.is_empty() || EMBEDDED_WORKER.starts_with(b"// agent worker not bundled") {
+        anyhow::bail!("This build does not include the agent worker");
+    }
+    std::fs::create_dir_all(app_data).context("create app data dir for agent worker")?;
+    let dest = app_data.join("agent-worker.cjs");
+    let stale = match std::fs::read(&dest) {
+        Ok(existing) => Sha256::digest(&existing) != Sha256::digest(EMBEDDED_WORKER),
+        Err(_) => true,
+    };
+    if stale {
+        std::fs::write(&dest, EMBEDDED_WORKER).context("write embedded agent worker")?;
+    }
+    Ok(dest)
+}
+
+/// Prefer an on-disk bundled worker; in release, extract the worker compiled into the exe
+/// so the app never depends on the machine that built the installer.
+pub fn resolve_worker_path(
+    resource_dir: Option<&Path>,
+    extras: &[PathBuf],
+    app_data: Option<&Path>,
+) -> PathBuf {
     if cfg!(debug_assertions) {
         if let Ok(path) = std::env::var("NGX_AGENT_WORKER") {
             return PathBuf::from(path);
+        }
+    } else if let Some(dir) = app_data {
+        if let Ok(installed) = install_embedded_worker(dir) {
+            return installed;
         }
     }
 
@@ -343,20 +383,26 @@ pub fn resolve_worker_path(resource_dir: Option<&Path>, extras: &[PathBuf]) -> P
         }
     }
 
-    for candidate in bundled_resource_candidates(resource_dir, "agent-worker.cjs") {
+    for candidate in bundled_resource_candidates(resource_dir, "agent-worker.cjs")
+        .into_iter()
+        .chain(exe_resource_candidates("agent-worker.cjs"))
+    {
         if candidate.is_file() {
             return candidate;
         }
     }
 
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let packaged = manifest.join("resources").join("agent-worker.cjs");
-    if packaged.is_file() {
-        return packaged;
+    if cfg!(debug_assertions) {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let packaged = manifest.join("resources").join("agent-worker.cjs");
+        if packaged.is_file() {
+            return packaged;
+        }
+        let dist = manifest.join("../../../packages/agent/dist/worker.js");
+        return dist.canonicalize().unwrap_or(dist);
     }
 
-    let dist = manifest.join("../../../packages/agent/dist/worker.js");
-    dist.canonicalize().unwrap_or(dist)
+    PathBuf::from("agent-worker.cjs")
 }
 
 #[cfg(test)]
@@ -383,5 +429,17 @@ mod tests {
         assert!(rendered.iter().any(|p| p.ends_with("/resources/agent-worker.cjs")));
         assert!(rendered.iter().any(|p| p.contains("/_up_/resources/agent-worker.cjs")));
         assert!(rendered.iter().any(|p| p.ends_with("/agent-worker.cjs") && !p.contains("/_up_/")));
+    }
+
+    #[test]
+    fn release_fallback_is_not_cargo_manifest() {
+        if !cfg!(debug_assertions) {
+            let path = resolve_worker_path(None, &[], None);
+            let s = path.to_string_lossy().replace('\\', "/");
+            assert!(
+                !s.contains("src-tauri/../../../packages/agent"),
+                "packaged app used build-machine path: {s}"
+            );
+        }
     }
 }

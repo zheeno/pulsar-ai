@@ -189,12 +189,13 @@ pub fn run() {
             // Compile-time Pulse config from repo .env fills gaps and beats placeholder app.env.
             apply_compiled_pulse_env();
 
-            let worker_path = crate::agent::resolve_worker_path(resource_dir.as_deref(), &worker_extras);
-            tracing::info!(worker = %worker_path.display(), exists = worker_path.is_file(), "agent worker path");
-
             let app_data = app.path().app_data_dir().expect("app data dir");
             crate::secrets::init(&app_data);
             crate::secrets::preload();
+
+            let worker_path =
+                crate::agent::resolve_worker_path(resource_dir.as_deref(), &worker_extras, Some(&app_data));
+            tracing::info!(worker = %worker_path.display(), exists = worker_path.is_file(), "agent worker path");
             let db = Database::open(&app_data).expect("open database");
             let settings = db.with_conn(get_settings).unwrap_or_default();
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
