@@ -24,7 +24,7 @@ const links = [
 
 export default function Nav() {
   const location = useLocation();
-  const { logout } = useSession();
+  const { logout, activeModule } = useSession();
   const { running: cycleRunning } = useCycle();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -57,6 +57,9 @@ export default function Nav() {
           alt="Pulsar AI"
           className="nav-rail__brand-logo nav-rail__brand-logo--mark"
         />
+        <div className="nav-rail__link-label muted" style={{ fontSize: 11, marginTop: 6 }}>
+          {activeModule === 'crypto' ? 'Crypto' : 'Stocks'}
+        </div>
       </div>
       <nav className="nav-rail__links" aria-label="Main">
         {links.map(({ href, label, Icon }) => {

@@ -10,6 +10,8 @@ const DEFAULT_LLM_HOSTS: &[&str] = &[
     "api.openrouter.ai",
 ];
 
+const PUBLIC_FEED_HOSTS: &[&str] = &["api.binance.com", "data.binance.com"];
+
 pub fn validate_llm_base_url(raw: &str, allow_custom_host: bool) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -41,6 +43,31 @@ pub fn validate_llm_base_url(raw: &str, allow_custom_host: bool) -> Result<Strin
 pub fn is_default_provider_host(host: &str) -> bool {
     let h = host.trim_start_matches("www.").to_ascii_lowercase();
     DEFAULT_LLM_HOSTS.iter().any(|allowed| h == *allowed || h.ends_with(&format!(".{allowed}")))
+}
+
+pub fn validate_public_feed_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let url = Url::parse(trimmed).map_err(|_| anyhow!("Feed URL is not a valid URL"))?;
+    if url.scheme() != "https" {
+        return Err(anyhow!("Feed URL must use HTTPS"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("Feed URL is missing a host"))?
+        .to_ascii_lowercase();
+    if host.parse::<IpAddr>().is_ok() {
+        return Err(anyhow!("Feed URL must not be a raw IP address"));
+    }
+    if !is_public_feed_host(&host) {
+        return Err(anyhow!("Host '{host}' is not on the public market-data allowlist"));
+    }
+    reject_private_resolved(&host, url.port().unwrap_or(443))?;
+    Ok(url.to_string())
+}
+
+pub fn is_public_feed_host(host: &str) -> bool {
+    let h = host.trim_start_matches("www.").to_ascii_lowercase();
+    PUBLIC_FEED_HOSTS.iter().any(|allowed| h == *allowed || h.ends_with(&format!(".{allowed}")))
 }
 
 fn reject_private_resolved(host: &str, port: u16) -> Result<()> {
@@ -94,5 +121,7 @@ mod tests {
         assert!(is_default_provider_host("api.openai.com"));
         assert!(is_default_provider_host("openrouter.ai"));
         assert!(!is_default_provider_host("evil.example"));
+        assert!(is_public_feed_host("api.binance.com"));
+        assert!(!is_public_feed_host("evil.example"));
     }
 }

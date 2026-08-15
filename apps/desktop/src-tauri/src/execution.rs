@@ -48,6 +48,7 @@ impl RiskPolicyService {
         daily_trades: i64,
         daily_drawdown_pct: f64,
         fee_pct: f64,
+        whole_lots: bool,
     ) -> (String, f64) {
         if signal.action == "HOLD" {
             return ("BLOCKED_OTHER".into(), 0.0);
@@ -73,9 +74,10 @@ impl RiskPolicyService {
 
         if signal.action == "BUY" {
             let mut quantity =
-                Self::position_size(total_equity, current_price, param_set, position_value);
-            quantity = Self::cap_qty_by_cash(quantity, current_price, cash_balance, fee_pct);
-            if quantity < 1.0 {
+                Self::position_size(total_equity, current_price, param_set, position_value, whole_lots);
+            quantity = Self::cap_qty_by_cash(quantity, current_price, cash_balance, fee_pct, whole_lots);
+            let min_qty = if whole_lots { 1.0 } else { 1e-8 };
+            if quantity < min_qty {
                 return ("BLOCKED_CASH".into(), 0.0);
             }
             let new_exposure = if total_equity > 0.0 {
@@ -108,6 +110,7 @@ impl RiskPolicyService {
         current_price: f64,
         param_set: &ParamSet,
         current_position_value: f64,
+        whole_lots: bool,
     ) -> f64 {
         if current_price <= 0.0 {
             return 0.0;
@@ -115,11 +118,11 @@ impl RiskPolicyService {
         let target_value = total_equity * param_set.position_size_pct;
         let max_value = total_equity * param_set.max_position_pct - current_position_value;
         let alloc_value = target_value.min(max_value.max(0.0));
-        (alloc_value / current_price).floor()
+        round_qty(alloc_value / current_price, whole_lots)
     }
 
     /// Cap quantity so (price * qty) * (1 + fee_pct) fits in spendable cash.
-    pub fn cap_qty_by_cash(qty: f64, price: f64, cash: f64, fee_pct: f64) -> f64 {
+    pub fn cap_qty_by_cash(qty: f64, price: f64, cash: f64, fee_pct: f64, whole_lots: bool) -> f64 {
         if price <= 0.0 || qty <= 0.0 || cash <= 0.0 {
             return 0.0;
         }
@@ -127,8 +130,19 @@ impl RiskPolicyService {
         if unit_cost <= 0.0 {
             return 0.0;
         }
-        let max_qty = (cash / unit_cost).floor();
+        let max_qty = round_qty(cash / unit_cost, whole_lots);
         qty.min(max_qty).max(0.0)
+    }
+}
+
+fn round_qty(qty: f64, whole_lots: bool) -> f64 {
+    if qty <= 0.0 {
+        return 0.0;
+    }
+    if whole_lots {
+        qty.floor()
+    } else {
+        (qty * 100_000_000.0).floor() / 100_000_000.0
     }
 }
 
@@ -249,9 +263,10 @@ impl ExecutionService {
                 )?;
                 return Ok(None);
             }
+            let sandbox_name = crate::market::MarketModule::from_settings(settings).sandbox_portfolio_name();
             let portfolio: (String, f64, String) = conn.query_row(
-                "SELECT id, cash_balance, strategy_param_set_id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
-                [],
+                "SELECT id, cash_balance, strategy_param_set_id FROM sandbox_portfolios WHERE name = ?1 LIMIT 1",
+                [sandbox_name],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
             let param_set = Self::load_param_set(conn, &portfolio.2)?;
@@ -269,6 +284,11 @@ impl ExecutionService {
             confidence,
         };
         let fee_pct = settings.simulated_fee_pct.max(0.0);
+        let module = crate::market::MarketModule::from_settings(settings);
+        if !module.allows_live_broker() && trading_mode == TradingMode::Live {
+            return Ok(false);
+        }
+        let whole_lots = module.whole_share_lots();
 
         if trading_mode == TradingMode::Live {
             let client = broker.ok_or_else(|| anyhow::anyhow!("Live broker session required"))?;
@@ -337,6 +357,7 @@ impl ExecutionService {
                     daily_trades,
                     daily_drawdown,
                     fee_pct,
+                    true,
                 );
                 conn.execute(
                     "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
@@ -512,6 +533,7 @@ impl ExecutionService {
                 daily_trades,
                 daily_drawdown,
                 fee_pct,
+                whole_lots,
             );
             conn.execute(
                 "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
@@ -798,6 +820,7 @@ mod tests {
             param_set.max_daily_trades,
             0.0,
             0.01,
+            true,
         );
         let (sell_result, sell_qty) = RiskPolicyService::evaluate(
             &sell,
@@ -808,10 +831,38 @@ mod tests {
             param_set.max_daily_trades,
             0.0,
             0.01,
+            true,
         );
         assert_eq!(buy_result, "BLOCKED_DAILY_TRADES");
         assert_eq!(sell_result, "APPROVED");
         assert_eq!(sell_qty, 100.0);
+    }
+
+    #[test]
+    fn crypto_buy_allows_fractional_qty() {
+        let mut param_set = test_param_set();
+        param_set.max_daily_trades = 5;
+        let prices = std::collections::HashMap::from([("BTCUSDT".into(), 64_000.0)]);
+        let positions: Vec<(String, f64, f64)> = vec![];
+        let buy = SignalInput {
+            id: "b".into(),
+            symbol: "BTCUSDT".into(),
+            action: "BUY".into(),
+            confidence: 0.8,
+        };
+        let (result, qty) = RiskPolicyService::evaluate(
+            &buy,
+            &param_set,
+            10_000.0,
+            &positions,
+            &prices,
+            0,
+            0.0,
+            0.001,
+            false,
+        );
+        assert_eq!(result, "APPROVED");
+        assert!(qty > 0.0 && qty < 1.0, "expected fractional BTC lot, got {qty}");
     }
 }
 

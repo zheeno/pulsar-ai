@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { IconSpinner } from '../components/Icons';
 import pulsarLogoFull from '../assets/pulsar-logo-full.svg';
 import { api, type AppSettings } from '../lib/api';
+import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
 
 type Props = {
@@ -19,6 +20,7 @@ type PulseAuthReport = {
 export default function OnboardingWizard({ onComplete }: Props) {
   const navigate = useNavigate();
   const toast = useToast();
+  const { setActiveModule } = useSession();
   const emailId = useId();
   const passwordId = useId();
   const providerId = useId();
@@ -26,6 +28,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
   const keyId = useId();
   const [step, setStep] = useState(0);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [chosenModule, setChosenModule] = useState<'stocks' | 'crypto'>('stocks');
   const [pulsePassword, setPulsePassword] = useState('');
   const [llmApiKey, setLlmApiKey] = useState('');
   const [busy, setBusy] = useState(false);
@@ -36,6 +39,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
     api<AppSettings>('settings_get')
       .then((s) => {
         setSettings(s);
+        setChosenModule(s.activeModule === 'crypto' ? 'crypto' : 'stocks');
         if (s.onboardingComplete) {
           onComplete?.();
           navigate('/', { replace: true });
@@ -47,6 +51,29 @@ export default function OnboardingWizard({ onComplete }: Props) {
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount once
   }, [navigate, onComplete]);
+
+  async function chooseModule() {
+    if (!settings) return;
+    setBusy(true);
+    try {
+      await api('settings_set', {
+        settings: {
+          ...settings,
+          activeModule: chosenModule,
+          pulseConfigured: false,
+          llmConfigured: false,
+          onboardingComplete: false,
+        },
+      });
+      setSettings({ ...settings, activeModule: chosenModule });
+      setActiveModule(chosenModule);
+      setStep(1);
+    } catch (e) {
+      toast.error(String(e), 'Module');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function signInPulse() {
     if (!settings) return;
@@ -84,7 +111,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
 
       setPulseOk(true);
       toast.success('Pulse session verified. Next: add and test your LLM key.', 'Pulse');
-      setStep(1);
+      setStep(2);
     } catch (e) {
       setPulseOk(false);
       toast.error(String(e), 'Pulse login failed');
@@ -96,7 +123,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
   async function finishWithLlm() {
     if (!settings || !pulseOk) {
       toast.warning('Sign in with NGX Pulse first.', 'Setup');
-      setStep(0);
+      setStep(1);
       return;
     }
     if (!llmApiKey.trim()) {
@@ -160,15 +187,55 @@ export default function OnboardingWizard({ onComplete }: Props) {
           Protect your trading workspace
         </h1>
         <p className="muted" style={{ marginTop: 0, lineHeight: 1.45 }}>
-          Sign in with NGX Pulse, then verify an LLM key. Access unlocks only after both succeed.
+          Choose Stocks or Crypto, then sign in with NGX Pulse and verify an LLM key. Access unlocks only after Pulse and LLM succeed. The module only changes which market the sandbox trades.
         </p>
 
         <div className="steps" aria-label="Setup steps">
-          <div className={`step-pill${step === 0 ? ' is-active' : ''}${pulseOk ? ' is-done' : ''}`}>1 · Pulse</div>
-          <div className={`step-pill${step === 1 ? ' is-active' : ''}`}>2 · LLM</div>
+          <div className={`step-pill${step === 0 ? ' is-active' : ''}${step > 0 ? ' is-done' : ''}`}>1 · Market</div>
+          <div className={`step-pill${step === 1 ? ' is-active' : ''}${pulseOk ? ' is-done' : ''}`}>2 · Pulse</div>
+          <div className={`step-pill${step === 2 ? ' is-active' : ''}`}>3 · LLM</div>
         </div>
 
         {step === 0 && (
+          <div>
+            <h2 style={{ margin: '0 0 8px', fontSize: '1.1rem' }}>Trading workspace</h2>
+            <p className="muted" style={{ fontSize: 13, marginTop: 0, lineHeight: 1.45 }}>
+              NGX Pulse is required for both. Crypto runs as a 24/7 sandbox with public spot quotes — no live crypto broker in this version.
+            </p>
+            <div className="broker-grid" role="radiogroup" aria-label="Market module" style={{ marginBottom: 16 }}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={chosenModule === 'stocks'}
+                className={`broker-card${chosenModule === 'stocks' ? ' is-selected' : ''}`}
+                disabled={busy}
+                onClick={() => setChosenModule('stocks')}
+              >
+                <span className="broker-card__name">Stocks</span>
+                <span className="broker-card__meta">NGX sandbox (NGN)</span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={chosenModule === 'crypto'}
+                className={`broker-card${chosenModule === 'crypto' ? ' is-selected' : ''}`}
+                disabled={busy}
+                onClick={() => setChosenModule('crypto')}
+              >
+                <span className="broker-card__name">Crypto</span>
+                <span className="broker-card__meta">USDT sandbox, 24/7</span>
+              </button>
+            </div>
+            <div className="btn-row">
+              <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void chooseModule()}>
+                {busy && <IconSpinner />}
+                Continue
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === 1 && (
           <div>
             <h2 style={{ margin: '0 0 8px', fontSize: '1.1rem' }}>NGX Pulse account</h2>
             <p className="muted" style={{ fontSize: 13, marginTop: 0, lineHeight: 1.45 }}>
@@ -194,6 +261,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
               onChange={(e) => setPulsePassword(e.target.value)}
             />
             <div className="btn-row">
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setStep(0)}>Back</button>
               <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void signInPulse()}>
                 {busy && <IconSpinner />}
                 {busy ? 'Signing in…' : 'Sign in'}
@@ -202,7 +270,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
           </div>
         )}
 
-        {step === 1 && (
+        {step === 2 && (
           <div>
             <h2 style={{ margin: '0 0 8px', fontSize: '1.1rem' }}>LLM provider</h2>
             <p className="muted" style={{ fontSize: 13, marginTop: 0, lineHeight: 1.45 }}>
@@ -239,7 +307,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
               onChange={(e) => setLlmApiKey(e.target.value)}
             />
             <div className="btn-row">
-              <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setStep(0)}>Back</button>
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setStep(1)}>Back</button>
               <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void finishWithLlm()}>
                 {busy && <IconSpinner />}
                 {busy ? 'Verifying…' : 'Verify & enter app'}

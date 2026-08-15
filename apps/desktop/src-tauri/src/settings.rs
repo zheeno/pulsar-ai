@@ -41,8 +41,12 @@ pub struct AppSettings {
     pub max_live_notional: f64,
     /// Max live actions per cycle (backend cap).
     pub max_live_actions: u32,
-    /// When true, store encrypted raw LLM transcripts in the OS keychain-backed blob.
+    /// Keep full LLM prompt/response in SQLite (privacy toggle).
+    #[serde(default)]
     pub retain_raw_llm_logs: bool,
+    /// Stocks (NGX) or crypto sandbox. Default stocks.
+    #[serde(default = "default_active_module")]
+    pub active_module: String,
 }
 
 impl Default for AppSettings {
@@ -73,6 +77,7 @@ impl Default for AppSettings {
             max_live_notional: 500_000.0,
             max_live_actions: 10,
             retain_raw_llm_logs: false,
+            active_module: "stocks".into(),
         }
     }
 }
@@ -123,6 +128,9 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
                 settings.max_live_actions = value.parse::<u32>().unwrap_or(10).clamp(1, 40)
             }
             "retain_raw_llm_logs" => settings.retain_raw_llm_logs = value == "true",
+            "active_module" => {
+                settings.active_module = crate::market::normalize_module(&value)
+            }
             _ => {}
         }
     }
@@ -256,7 +264,13 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
             "false"
         },
     )?;
+    let module = crate::market::normalize_module(&settings.active_module);
+    set_setting(conn, "active_module", &module)?;
     Ok(())
+}
+
+fn default_active_module() -> String {
+    "stocks".into()
 }
 
 fn default_selected_broker() -> String {

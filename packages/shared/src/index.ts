@@ -12,10 +12,18 @@ export type LlmSignalOutput = z.infer<typeof LlmSignalOutputSchema>;
 
 export const TICKER_PATTERN = /^[A-Z0-9.-]{1,16}$/;
 
+/** Normalize LLM tickers: trim, upper-case, drop slash separators (BTC/USDT → BTCUSDT). */
+export function normalizeTicker(raw: string): string {
+  return raw.trim().toUpperCase().replace(/\//g, '');
+}
+
 export const LlmPortfolioSignalOutputSchema = z.object({
   signals: z.array(
     z.object({
-      symbol: z.string().regex(TICKER_PATTERN),
+      symbol: z
+        .string()
+        .transform(normalizeTicker)
+        .pipe(z.string().regex(TICKER_PATTERN)),
       action: SignalActionSchema,
       confidence: z.number().min(0).max(1),
       rationale: z.string().min(1).max(2000),
@@ -66,6 +74,7 @@ export const NGX_TIMEZONE = 'Africa/Lagos';
 
 export const PROMPT_VERSION = 'v1.0.0';
 export const PORTFOLIO_PROMPT_VERSION = 'v2.4.0';
+export const CRYPTO_PORTFOLIO_PROMPT_VERSION = 'v2.5.0-crypto';
 
 export * from './types';
 export * from './desktop';

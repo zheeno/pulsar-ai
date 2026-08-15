@@ -149,9 +149,10 @@ impl IngestionService {
 
     fn upsert_stock(conn: &Connection, cache: &PriceCache, stock: &NgxStock, trade_date: &str) -> Result<()> {
         conn.execute(
-            "INSERT INTO instruments (symbol, name, sector, is_active)
-             VALUES (?1, ?2, ?3, 1)
-             ON CONFLICT(symbol) DO UPDATE SET name = COALESCE(excluded.name, instruments.name)",
+            "INSERT INTO instruments (symbol, name, sector, is_active, module)
+             VALUES (?1, ?2, ?3, 1, 'stocks')
+             ON CONFLICT(symbol) DO UPDATE SET name = COALESCE(excluded.name, instruments.name)
+             WHERE IFNULL(instruments.module, 'stocks') = 'stocks'",
             rusqlite::params![
                 stock.symbol,
                 stock.name.as_deref().unwrap_or(&stock.symbol),
@@ -185,8 +186,8 @@ impl IngestionService {
 
     pub fn upsert_last_quote(conn: &Connection, cache: &PriceCache, quote: &LatestQuote) -> Result<()> {
         conn.execute(
-            "INSERT INTO instruments (symbol, name, sector, is_active)
-             VALUES (?1, ?1, 'Unknown', 1)
+            "INSERT INTO instruments (symbol, name, sector, is_active, module)
+             VALUES (?1, ?1, 'Unknown', 1, 'stocks')
              ON CONFLICT(symbol) DO NOTHING",
             [&quote.symbol],
         )?;

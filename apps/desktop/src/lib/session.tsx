@@ -2,6 +2,8 @@ import { createContext, useContext } from 'react';
 
 type SessionApi = {
   logout: () => Promise<void>;
+  activeModule: string;
+  setActiveModule: (module: string) => void;
 };
 
 export const SessionContext = createContext<SessionApi | null>(null);

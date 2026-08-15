@@ -5,6 +5,7 @@ mod broker;
 mod cache;
 mod calendar;
 mod commands;
+mod crypto;
 mod cycle_auth;
 mod db;
 mod execution;
@@ -12,6 +13,7 @@ mod http_client;
 mod indicators;
 mod ingest;
 mod intents;
+mod market;
 mod memory;
 mod net_policy;
 mod ngx;
@@ -200,6 +202,8 @@ pub fn run() {
             let settings = db.with_conn(get_settings).unwrap_or_default();
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
                 .expect("seed database");
+            db.with_conn(SeedService::ensure_crypto_sandbox)
+                .expect("seed crypto sandbox");
 
             let state = AppState::new(db, worker_path);
             app.manage(state.clone());

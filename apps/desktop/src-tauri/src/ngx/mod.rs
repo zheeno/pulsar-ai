@@ -1147,6 +1147,7 @@ mod tests {
 
     #[test]
     fn rejects_malicious_tickers() {
+        assert!(is_valid_ticker("BTCUSDT"));
         assert!(is_valid_ticker("GTCO"));
         assert!(is_valid_ticker("MTN-N"));
         assert!(!is_valid_ticker("GTCO\nDROP"));

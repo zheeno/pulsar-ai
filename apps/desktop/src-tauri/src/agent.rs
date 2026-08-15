@@ -17,7 +17,7 @@ use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
 const AGENT_IPC_TIMEOUT: Duration = Duration::from_secs(90);
-const MAX_TOOL_ROUNDS: u32 = 6;
+const MAX_TOOL_CALLS: u32 = 16;
 
 pub fn parse_ipc_line(line: &str) -> Result<Value> {
     serde_json::from_str(line.trim()).context("parse agent ipc")
@@ -149,7 +149,7 @@ impl AgentBridge {
                     let response = parse_ipc_line(&response_line)?;
                     if is_tool_message(&response) {
                         rounds += 1;
-                        if rounds > MAX_TOOL_ROUNDS {
+                        if rounds > MAX_TOOL_CALLS {
                             anyhow::bail!("Agent exceeded memory tool round limit");
                         }
                         let name = response

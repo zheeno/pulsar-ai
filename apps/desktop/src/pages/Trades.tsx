@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { IconTrades } from '../components/Icons';
 import { api } from '../lib/api';
-import { formatNaira } from '../lib/format';
+import { formatMoney } from '../lib/format';
+import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
 
 interface Trade {
@@ -21,18 +22,22 @@ interface Trade {
 
 export default function TradesPage() {
   const toast = useToast();
+  const { activeModule } = useSession();
   const [trades, setTrades] = useState<Trade[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const isCrypto = activeModule === 'crypto';
+  const money = (n: number | null | undefined) => formatMoney(n, isCrypto ? 'crypto' : 'stocks');
 
   useEffect(() => {
+    setLoaded(false);
     api<Trade[]>('list_trades', { limit: 50 })
       .then((data) => {
         setTrades(data);
       })
       .catch((e) => toast.error(String(e), 'Could not load trades'))
       .finally(() => setLoaded(true));
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load once on mount
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reload when module changes
+  }, [activeModule]);
 
   const hasLive = trades.some((t) => t.venue === 'wealth');
 
@@ -42,7 +47,9 @@ export default function TradesPage() {
         <div>
           <h1>Trades</h1>
           <p>
-            {hasLive
+            {isCrypto
+              ? 'Simulated USDT fills from the crypto sandbox. Live crypto brokers are not available yet.'
+              : hasLive
               ? 'Sandbox fills and Coronation Wealth live orders.'
               : 'Simulated fills from the sandbox execution engine. Connect Wealth in Settings for live orders.'}
           </p>
@@ -85,9 +92,9 @@ export default function TradesPage() {
                     </Link>
                   </td>
                   <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
-                  <td className="mono">{Number(t.quantity).toLocaleString()}</td>
-                  <td className="mono">{formatNaira(Number(t.fill_price))}</td>
-                  <td className="mono">{formatNaira(Number(t.simulated_fee))}</td>
+                  <td className="mono">{Number(t.quantity).toLocaleString(undefined, { maximumFractionDigits: isCrypto ? 8 : 0 })}</td>
+                  <td className="mono">{money(Number(t.fill_price))}</td>
+                  <td className="mono">{money(Number(t.simulated_fee))}</td>
                   <td>
                     <span className={`status-pill ${t.venue === 'wealth' ? 'status-pill--ok' : 'status-pill--muted'}`}>
                       {t.venue === 'wealth' ? 'Live' : 'Sandbox'}
@@ -96,7 +103,7 @@ export default function TradesPage() {
                   </td>
                   <td className="mono">
                     {t.resulting_cash_balance != null
-                      ? formatNaira(Number(t.resulting_cash_balance))
+                      ? money(Number(t.resulting_cash_balance))
                       : '—'}
                   </td>
                   <td className="muted" style={{ fontSize: 12 }}>{t.executed_at}</td>

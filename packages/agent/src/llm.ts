@@ -9,8 +9,11 @@ import { z } from 'zod';
 import { createChatModel } from './model-factory';
 import { buildSignalPrompt } from './prompt/v1.0.0';
 import { buildPortfolioSignalPrompt } from './prompt/v2.4.0';
+import { buildCryptoPortfolioSignalPrompt } from './prompt/v2.5.0-crypto';
 
 const MAX_TOOL_ROUNDS = 6;
+/** Soft cap on tool invocations across all rounds (search/upsert thrash). */
+const MAX_TOOL_CALLS = 12;
 
 export type ToolCaller = (
   name: string,
@@ -72,15 +75,42 @@ async function invokeWithRetry(
         const tools = memoryTools(callTool);
         const bound = createChatModel(config).bindTools(tools);
         const messages: BaseMessage[] = [new HumanMessage(prompt)];
+        let toolCallsTotal = 0;
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
           const response = await bound.invoke(messages);
           const toolCalls = response.tool_calls as
             | { name: string; args?: Record<string, unknown>; id?: string }[]
             | undefined;
           if (toolCalls && toolCalls.length > 0) {
-            if (round === MAX_TOOL_ROUNDS) {
-              throw new Error('Agent exceeded memory tool round limit');
+            const wouldExceed =
+              round === MAX_TOOL_ROUNDS || toolCallsTotal + toolCalls.length > MAX_TOOL_CALLS;
+            if (wouldExceed) {
+              // Stop thrashing: require a final JSON answer with no more tools.
+              messages.push(response as BaseMessage);
+              for (const tc of toolCalls) {
+                messages.push(
+                  new ToolMessage({
+                    content: JSON.stringify({
+                      ok: false,
+                      error: 'tool budget exhausted — finish without more tools',
+                    }),
+                    tool_call_id: tc.id || tc.name,
+                  }),
+                );
+              }
+              messages.push(
+                new HumanMessage(
+                  'Tool budget exhausted. Do not call tools. Return the JSON signals object now.',
+                ),
+              );
+              const finalModel = createChatModel(config);
+              const finalResponse = await finalModel.invoke(messages);
+              rawResponse = contentToText(finalResponse.content);
+              const parsed = parseJson(rawResponse);
+              const validated = validate(parsed);
+              return { output: validated, prompt, rawResponse, modelName };
             }
+            toolCallsTotal += toolCalls.length;
             messages.push(response as BaseMessage);
             for (const tc of toolCalls) {
               const result = await callTool(tc.name, tc.args ?? {});
@@ -119,7 +149,10 @@ export async function generatePortfolioSignals(
   llm: LlmConfig,
   callTool?: ToolCaller,
 ) {
-  const prompt = buildPortfolioSignalPrompt(context);
+  const module = String(context.marketModule ?? context.tradingVenue ?? '').toLowerCase();
+  const prompt = module === 'crypto'
+    ? buildCryptoPortfolioSignalPrompt(context)
+    : buildPortfolioSignalPrompt(context);
   return invokeWithRetry(
     llm,
     prompt,

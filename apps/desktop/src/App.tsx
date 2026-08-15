@@ -27,6 +27,7 @@ function AppRoutes() {
   const [splashDone, setSplashDone] = useState(false);
   const [needsOnboarding, setNeedsOnboarding] = useState(true);
   const [bootMessage, setBootMessage] = useState('Igniting Pulsar…');
+  const [activeModule, setActiveModule] = useState('stocks');
 
   useEffect(() => {
     let cancelled = false;
@@ -35,6 +36,7 @@ function AppRoutes() {
       try {
         const s = await api<AppSettings>('settings_get');
         if (cancelled) return;
+        setActiveModule(s.activeModule === 'crypto' ? 'crypto' : 'stocks');
 
         if (!s.onboardingComplete) {
           setNeedsOnboarding(true);
@@ -86,7 +88,10 @@ function AppRoutes() {
     navigate('/onboarding', { replace: true });
   }, [navigate]);
 
-  const session = useMemo(() => ({ logout }), [logout]);
+  const session = useMemo(
+    () => ({ logout, activeModule, setActiveModule }),
+    [logout, activeModule],
+  );
   const finishSplash = useCallback(() => setSplashDone(true), []);
 
   if (!splashDone) {

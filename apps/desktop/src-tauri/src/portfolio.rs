@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::PriceCache;
@@ -54,7 +54,12 @@ impl PortfolioService {
         }
 
         let total_equity = p.3 + market_value;
-        let pnl_today = match EquityCurveService::pnl_today(conn, "sandbox")? {
+        let venue = if p.1 == "default-crypto-sandbox" {
+            "crypto-sandbox"
+        } else {
+            "sandbox"
+        };
+        let pnl_today = match EquityCurveService::pnl_today(conn, venue)? {
             Some(v) => v,
             None => {
                 let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -84,9 +89,13 @@ impl PortfolioService {
     }
 
     pub fn get_default_portfolio_id(conn: &Connection) -> Result<Option<String>> {
+        Self::get_sandbox_portfolio_id(conn, "default-sandbox")
+    }
+
+    pub fn get_sandbox_portfolio_id(conn: &Connection, name: &str) -> Result<Option<String>> {
         conn.query_row(
-            "SELECT id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
-            [],
+            "SELECT id FROM sandbox_portfolios WHERE name = ?1 LIMIT 1",
+            [name],
             |row| row.get(0),
         )
         .optional()
@@ -123,8 +132,6 @@ impl PortfolioService {
         .unwrap_or(0.0)
     }
 }
-
-use rusqlite::OptionalExtension;
 
 pub struct EquityCurveService;
 
@@ -310,7 +317,28 @@ impl DailySnapshotService {
             ],
         )?;
 
-        EquityCurveService::insert_point(conn, "sandbox", total_equity, cash_balance, market_value)?;
+        EquityCurveService::insert_point(
+            conn,
+            equity_venue_for_portfolio(conn, portfolio_id)?,
+            total_equity,
+            cash_balance,
+            market_value,
+        )?;
         Ok(())
     }
+}
+
+fn equity_venue_for_portfolio(conn: &Connection, portfolio_id: &str) -> Result<&'static str> {
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM sandbox_portfolios WHERE id = ?1",
+            [portfolio_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    Ok(if name == "default-crypto-sandbox" {
+        "crypto-sandbox"
+    } else {
+        "sandbox"
+    })
 }

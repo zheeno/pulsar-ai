@@ -10,9 +10,10 @@ import {
 } from 'recharts';
 import { IconShieldAlert, IconShieldCheck, IconSpinner } from '../components/Icons';
 import { api, type PortfolioData } from '../lib/api';
-import { formatNaira } from '../lib/format';
+import { formatMoney } from '../lib/format';
 import { useCycle } from '../lib/cycle';
 import { useToast } from '../lib/toast';
+import { useSession } from '../lib/session';
 import { Link } from 'react-router-dom';
 
 type RawPortfolio = PortfolioData & {
@@ -47,6 +48,7 @@ type MarketStatus = {
   pulseIsOpen?: boolean | null;
   appEnv: string;
   marketHoursEnforced: boolean;
+  activeModule?: string;
 };
 
 function normalizePortfolio(raw: RawPortfolio): PortfolioData {
@@ -69,10 +71,12 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
     tradingVerified: raw.tradingVerified ?? raw.wealthStatus?.tradingVerified,
     wealthStatus: raw.wealthStatus ?? null,
     wealthError: raw.wealthError ?? null,
+    activeModule: (raw as { activeModule?: string }).activeModule,
   };
 }
 
 function marketPhaseLabel(phase: string): string {
+  if (phase === 'crypto_24_7') return 'Crypto 24/7';
   if (phase === 'open') return 'NGX Open';
   if (phase === 'post_close') return 'Post-close';
   return 'NGX Closed';
@@ -124,6 +128,7 @@ function formatQuoteClock(iso?: string | null): string {
 export default function DashboardPage() {
   const toast = useToast();
   const { running: cycleRunning } = useCycle();
+  const { activeModule } = useSession();
   const [data, setData] = useState<PortfolioData | null>(null);
   const [performance, setPerformance] = useState<EquityPoint[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -133,19 +138,22 @@ export default function DashboardPage() {
   const [cycleBusy, setCycleBusy] = useState(false);
 
   useEffect(() => {
+    setData(null);
+    setPerformance([]);
+    setLoading(true);
     void loadData();
     const interval = setInterval(() => void loadData(), 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [activeModule]);
 
   useEffect(() => {
     if (loading && !data) return;
     const phase = market?.phase ?? 'closed';
     const bypass = market != null && market.marketHoursEnforced === false;
-    const poll = bypass || phase === 'open' || phase === 'post_close';
+    const poll = bypass || phase === 'open' || phase === 'post_close' || phase === 'crypto_24_7';
     if (!poll) return;
 
-    const intervalMs = bypass || phase === 'open' ? 60_000 : 300_000;
+    const intervalMs = bypass || phase === 'open' || phase === 'crypto_24_7' ? 60_000 : 300_000;
     let cancelled = false;
     let inFlight = false;
 
@@ -162,11 +170,41 @@ export default function DashboardPage() {
           quotesAsOf?: string;
           stale?: boolean;
           tradingMode?: string;
-          portfolio?: { cash_balance?: number };
+          activeModule?: string;
+          portfolio?: { id?: string; cash_balance?: number };
         }>('portfolio_quotes');
         if (cancelled) return;
         setData((prev) => {
           if (!prev) return prev;
+          const quoteModule = q.activeModule || activeModule;
+          const prevModule = prev.activeModule || activeModule;
+          const quoteId = q.portfolio?.id;
+          const prevId = prev.portfolio?.id;
+          // Module or book changed — never merge stocks marks into crypto (or vice versa).
+          if (
+            (quoteModule && prevModule && quoteModule !== prevModule)
+            || (quoteId && prevId && quoteId !== prevId)
+          ) {
+            const cash = Number(q.portfolio?.cash_balance ?? 0);
+            const market_value = Number(q.market_value ?? 0);
+            return {
+              ...prev,
+              activeModule: quoteModule,
+              tradingMode: q.tradingMode || 'sandbox',
+              positions: q.positions ?? [],
+              market_value,
+              total_equity: Number(q.total_equity ?? cash + market_value),
+              pnl_today: Number(q.pnl_today ?? 0),
+              unrealized_pnl: Number(q.unrealized_pnl ?? 0),
+              quotesAsOf: q.quotesAsOf ?? null,
+              stale: Boolean(q.stale),
+              portfolio: {
+                ...prev.portfolio,
+                id: quoteId || prev.portfolio.id,
+                cash_balance: cash,
+              },
+            };
+          }
           const stale = Boolean(q.stale);
           const quoteLots = (q.positions ?? []).some((p) => Number(p.quantity) > 0);
           const keep = (next: number | undefined, current: number, rejectZero = false) => {
@@ -233,6 +271,7 @@ export default function DashboardPage() {
             unrealized_pnl: keep(q.unrealized_pnl, prev.unrealized_pnl ?? 0),
             quotesAsOf: q.quotesAsOf ?? prev.quotesAsOf,
             stale,
+            activeModule: quoteModule || prev.activeModule,
             portfolio: {
               ...prev.portfolio,
               cash_balance: cash,
@@ -257,7 +296,7 @@ export default function DashboardPage() {
       window.clearInterval(id);
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, [loading, market?.phase, market?.marketHoursEnforced]);
+  }, [loading, market?.phase, market?.marketHoursEnforced, activeModule]);
 
   async function loadData() {
     try {
@@ -275,7 +314,11 @@ export default function DashboardPage() {
           return prev;
         }
         if (portfolio.tradingMode === 'live') return portfolio;
-        if (!prev?.quotesAsOf) return portfolio;
+        const moduleChanged =
+          (portfolio.activeModule && prev?.activeModule && portfolio.activeModule !== prev.activeModule)
+          || (portfolio.portfolio?.id && prev?.portfolio?.id && portfolio.portfolio.id !== prev.portfolio.id);
+        if (moduleChanged || !prev?.quotesAsOf) return portfolio;
+        // Same sandbox book: keep fresher quote-tick marks, refresh cash from portfolio.
         const cash = Number(portfolio.portfolio?.cash_balance ?? prev.portfolio?.cash_balance);
         return {
           ...portfolio,
@@ -290,12 +333,18 @@ export default function DashboardPage() {
           unrealized_pnl: prev.unrealized_pnl,
           quotesAsOf: prev.quotesAsOf,
           stale: prev.stale,
+          activeModule: portfolio.activeModule || prev.activeModule,
         };
       });
       setUsage(usageData);
       setMarket(marketData);
       setError(null);
-      const venue = portfolio.tradingMode === 'live' ? (portfolio.brokerId || 'wealth') : 'sandbox';
+      const module = portfolio.activeModule || activeModule;
+      const venue = portfolio.tradingMode === 'live'
+        ? (portfolio.brokerId || 'wealth')
+        : module === 'crypto'
+          ? 'crypto-sandbox'
+          : 'sandbox';
       const perf = await api<EquityPoint[]>(
         'portfolio_performance',
         { venue, id: portfolio.portfolio?.id },
@@ -375,12 +424,15 @@ export default function DashboardPage() {
       };
     }
     if (usage?.authMode === 'session' && data) {
-      const live = data.tradingMode === 'live';
+      const module = data.activeModule || activeModule;
+      const live = data.tradingMode === 'live' && module !== 'crypto';
       const broker = data.brokerName || 'broker';
       return {
         level: 'ok' as const,
         title: 'Systems healthy',
-        sub: live
+        sub: module === 'crypto'
+          ? 'NGX Pulse session is active. Crypto workspace is sandbox-only: public USDT quotes and simulated fills (no live broker).'
+          : live
           ? (data.tradingVerified
             ? `NGX Pulse is active. Home shows your ${broker} brokerage cash and holdings; cycles can place live market orders.`
             : (data.wealthStatus?.message
@@ -405,10 +457,13 @@ export default function DashboardPage() {
       sub: 'Waiting for Pulse usage and portfolio data. Open Settings if this persists.',
       live: false,
     };
-  }, [error, loading, data, usage]);
+  }, [error, loading, data, usage, activeModule]);
+
+  const isCrypto = (data?.activeModule || activeModule || market?.activeModule) === 'crypto';
+  const money = (n: number | null | undefined) => formatMoney(n, isCrypto ? 'crypto' : 'stocks');
 
   const marketChipClass =
-    market?.phase === 'open'
+    market?.phase === 'open' || market?.phase === 'crypto_24_7'
       ? 'status-pill--ok'
       : market?.phase === 'post_close'
         ? 'status-pill--warn'
@@ -428,7 +483,7 @@ export default function DashboardPage() {
               <>
                 <span className="status-hero__meta-sep" aria-hidden>·</span>
                 <span className={`status-pill ${marketChipClass}`} style={{ padding: '2px 8px', fontSize: '0.72rem' }}>
-                  {market.phase === 'open' && <span className="live-dot" aria-hidden />}
+                  {market.phase === 'open' || market.phase === 'crypto_24_7' ? <span className="live-dot" aria-hidden /> : null}
                   {marketPhaseLabel(market.phase)}
                 </span>
               </>
@@ -446,10 +501,10 @@ export default function DashboardPage() {
               <>
                 <span className="status-hero__meta-sep" aria-hidden>·</span>
                 <span
-                  className={`status-pill ${data.tradingMode === 'live' ? 'status-pill--ok' : 'status-pill--muted'}`}
+                  className={`status-pill ${data.tradingMode === 'live' && !isCrypto ? 'status-pill--ok' : 'status-pill--muted'}`}
                   style={{ padding: '2px 8px', fontSize: '0.72rem' }}
                 >
-                  {data.tradingMode === 'live'
+                  {data.tradingMode === 'live' && !isCrypto
                     ? (data.tradingVerified === false ? (data.brokerName || 'Broker') : 'Live trader')
                     : 'Sandbox'}
                 </span>
@@ -464,7 +519,7 @@ export default function DashboardPage() {
               {market.pulseStatus ? ` · Pulse: ${market.pulseStatus}` : ''}
               {!market.marketHoursEnforced ? ' · Hours bypassed (dev)' : ''}
               {data?.quotesAsOf
-                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : data.tradingMode === 'live' ? ` · ${data.brokerName || 'Broker'}` : ' · Pulse'}`
+                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : data.tradingMode === 'live' && !isCrypto ? ` · ${data.brokerName || 'Broker'}` : isCrypto ? ' · Public feed' : ' · Pulse'}`
                 : ''}
             </p>
           ) : null}
@@ -490,17 +545,17 @@ export default function DashboardPage() {
         <div className="stat-grid">
           <div className="stat-card">
             <div className="stat-card__label">Total equity</div>
-            <div className="stat-card__value">{formatNaira(data.total_equity)}</div>
+            <div className="stat-card__value">{money(data.total_equity)}</div>
           </div>
           <div className="stat-card">
             <div className="stat-card__label">
               {data.tradingMode === 'live' ? 'Brokerage cash' : 'Cash'}
             </div>
-            <div className="stat-card__value">{formatNaira(Number(data.portfolio?.cash_balance))}</div>
+            <div className="stat-card__value">{money(Number(data.portfolio?.cash_balance))}</div>
           </div>
           <div className="stat-card">
             <div className="stat-card__label">Market value</div>
-            <div className="stat-card__value">{formatNaira(data.market_value)}</div>
+            <div className="stat-card__value">{money(data.market_value)}</div>
           </div>
           <div className="stat-card">
             <div className="stat-card__label">Today&apos;s P&amp;L</div>
@@ -508,12 +563,12 @@ export default function DashboardPage() {
               className="stat-card__value"
               style={{ color: data.pnl_today >= 0 ? 'var(--status-ok)' : 'var(--status-bad)' }}
             >
-              {formatNaira(data.pnl_today)}
+              {money(data.pnl_today)}
             </div>
             <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
               Unrealized vs cost{' '}
               <span style={{ color: (data.unrealized_pnl ?? 0) >= 0 ? 'var(--status-ok)' : 'var(--status-bad)' }}>
-                {formatNaira(data.unrealized_pnl ?? 0)}
+                {money(data.unrealized_pnl ?? 0)}
               </span>
             </div>
           </div>
@@ -544,8 +599,12 @@ export default function DashboardPage() {
               <YAxis
                 stroke="var(--text-muted)"
                 fontSize={11}
-                tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
-                width={48}
+                tickFormatter={(v) =>
+                  isCrypto
+                    ? Number(v).toLocaleString('en-US', { maximumFractionDigits: 0 })
+                    : `${(v / 1e6).toFixed(1)}M`
+                }
+                width={isCrypto ? 64 : 48}
               />
               <Tooltip
                 content={({ active, payload, label }) => {
@@ -564,7 +623,7 @@ export default function DashboardPage() {
                       <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>
                         {formatCurveTooltipTime(String(label ?? ''))}
                       </div>
-                      <div>{formatNaira(equity)}</div>
+                      <div>{money(equity)}</div>
                     </div>
                   );
                 }}
@@ -612,9 +671,9 @@ export default function DashboardPage() {
                     </Link>
                   </td>
                   <td className="mono">{Number(p.quantity).toLocaleString()}</td>
-                  <td className="mono">{formatNaira(Number(p.avg_cost))}</td>
-                  <td className="mono">{formatNaira(Number(p.current_price))}</td>
-                  <td className="mono">{formatNaira(Number(p.market_value))}</td>
+                  <td className="mono">{money(Number(p.avg_cost))}</td>
+                  <td className="mono">{money(Number(p.current_price))}</td>
+                  <td className="mono">{money(Number(p.market_value))}</td>
                 </tr>
               ))}
             </tbody>

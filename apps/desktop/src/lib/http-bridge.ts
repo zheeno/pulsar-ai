@@ -6,6 +6,7 @@
 const SETTINGS_KEY = 'pulsar.browser.settings';
 const SECRETS_KEY = 'pulsar.browser.secrets';
 const STORE_KEY = 'pulsar.browser.store';
+const CRYPTO_STORE_KEY = 'pulsar.browser.store.crypto';
 
 try {
   localStorage.removeItem(SECRETS_KEY);
@@ -67,6 +68,7 @@ function defaultSettings(): Settings {
     maxLiveNotional: 500_000,
     maxLiveActions: 10,
     retainRawLlmLogs: false,
+    activeModule: 'stocks',
   };
 }
 
@@ -121,6 +123,48 @@ function defaultStore(): MockStore {
   };
 }
 
+function defaultCryptoStore(): MockStore {
+  const strategyId = 'mock-strategy-1';
+  const portfolioId = 'mock-crypto-portfolio-1';
+  return {
+    portfolio: {
+      id: portfolioId,
+      name: 'default-crypto-sandbox',
+      starting_capital: 10_000,
+      cash_balance: 6_800,
+      strategy_param_set_id: strategyId,
+    },
+    positions: [
+      { symbol: 'BTCUSDT', quantity: 0.04, avg_cost: 62000, current_price: 64000, market_value: 2560 },
+      { symbol: 'ETHUSDT', quantity: 0.4, avg_cost: 3200, current_price: 3400, market_value: 1360 },
+    ],
+    signals: [
+      {
+        id: 'sig-crypto-1',
+        symbol: 'BTCUSDT',
+        generated_at: new Date().toISOString(),
+        action: 'HOLD',
+        confidence: 0.6,
+        rationale: 'Mock crypto signal — browser mode',
+        model_name: 'mock-llm',
+        executed: false,
+        risk_policy_result: 'BLOCKED_CONFIDENCE',
+      },
+    ],
+    trades: [],
+    performance: [
+      { recorded_at: '2026-08-01T00:00:00Z', snapshot_date: '2026-08-01', total_equity: 10_000, pnl_daily: 0 },
+      { recorded_at: '2026-08-10T00:00:00Z', snapshot_date: '2026-08-10', total_equity: 10_720, pnl_daily: 80 },
+    ],
+    strategy: defaultStore().strategy,
+    memories: [],
+  };
+}
+
+function isCryptoModule(): boolean {
+  return String(loadSettings().activeModule || 'stocks') === 'crypto';
+}
+
 function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -139,6 +183,7 @@ function selectedBrokerId(): string {
 }
 
 function mockLiveConnected(): boolean {
+  if (isCryptoModule()) return false;
   const s = loadSettings();
   const id = selectedBrokerId();
   if (id === 'bamboo') return Boolean(s.bambooConnected);
@@ -166,16 +211,19 @@ function saveSecrets(_partial: Record<string, string | undefined>) {
 }
 
 function loadStore(): MockStore {
+  const key = isCryptoModule() ? CRYPTO_STORE_KEY : STORE_KEY;
+  const fallback = isCryptoModule() ? defaultCryptoStore : defaultStore;
   try {
-    const raw = localStorage.getItem(STORE_KEY);
-    return raw ? { ...defaultStore(), ...JSON.parse(raw) } : defaultStore();
+    const raw = localStorage.getItem(key);
+    return raw ? { ...fallback(), ...JSON.parse(raw) } : fallback();
   } catch {
-    return defaultStore();
+    return fallback();
   }
 }
 
 function saveStore(store: MockStore) {
-  localStorage.setItem(STORE_KEY, JSON.stringify(store));
+  const key = isCryptoModule() ? CRYPTO_STORE_KEY : STORE_KEY;
+  localStorage.setItem(key, JSON.stringify(store));
 }
 
 export async function httpInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -197,6 +245,16 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       const next = { ...current, ...(payload.settings || {}) };
       // Match Rust: only complete_onboarding may flip this to true.
       next.onboardingComplete = current.onboardingComplete;
+      const nextModule = String(next.activeModule || 'stocks') === 'crypto' ? 'crypto' : 'stocks';
+      const prevModule = String(current.activeModule || 'stocks') === 'crypto' ? 'crypto' : 'stocks';
+      next.activeModule = nextModule;
+      if (nextModule !== prevModule) {
+        next.autoCycleEnabled = false;
+      }
+      if (nextModule === 'crypto') {
+        next.liveTradingEnabled = false;
+        next.scheduledLiveAuthorized = false;
+      }
       saveSettingsLocal(next);
       if (payload.pulsePassword || payload.pulseApiKey || payload.llmApiKey) {
         throw new Error('Credentials cannot be stored in browser mock mode — use the Tauri desktop app');
@@ -279,7 +337,8 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         total_equity: store.portfolio.cash_balance + market_value,
         market_value,
         pnl_today: store.performance.at(-1)?.pnl_daily ?? 0,
-        tradingMode: live ? 'live' : 'sandbox',
+        tradingMode: live && !isCryptoModule() ? 'live' : 'sandbox',
+        activeModule: isCryptoModule() ? 'crypto' : 'stocks',
         ...mockBrokerMeta(),
       } as T;
     }
@@ -307,13 +366,14 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         quotedSymbols: positions.map((p) => p.symbol),
         stale: false,
         tradingMode: mockLiveConnected() ? 'live' : 'sandbox',
+        activeModule: isCryptoModule() ? 'crypto' : 'stocks',
         ...mockBrokerMeta(),
         portfolio: { id: store.portfolio.id, cash_balance: store.portfolio.cash_balance },
       } as T;
     }
 
     case 'portfolio_performance': {
-      const venue = String(args?.venue || 'sandbox');
+      const venue = String(args?.venue || (isCryptoModule() ? 'crypto-sandbox' : 'sandbox'));
       if (venue === 'wealth') {
         return [] as T;
       }
@@ -324,6 +384,22 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       return { daily: 0, limit: null, remaining: null, authMode: 'mock' } as T;
 
     case 'market_status': {
+      if (isCryptoModule()) {
+        const now = new Date();
+        return {
+          isOpen: true,
+          isPostClose: false,
+          isTradingDay: true,
+          phase: 'crypto_24_7',
+          todayWat: now.toISOString().slice(0, 10),
+          nowWat: `${String((now.getUTCHours() + 1) % 24).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')} WAT`,
+          pulseStatus: 'session',
+          pulseIsOpen: true,
+          appEnv: 'dev',
+          marketHoursEnforced: false,
+          activeModule: 'crypto',
+        } as T;
+      }
       const now = new Date();
       const watHour = (now.getUTCHours() + 1) % 24;
       const isOpen = watHour >= 9 && watHour < 16;
@@ -340,6 +416,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         pulseIsOpen: isOpen,
         appEnv: 'dev',
         marketHoursEnforced: false,
+        activeModule: 'stocks',
       } as T;
     }
 
@@ -419,11 +496,13 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       const id = `sig-${Date.now()}`;
       store.signals.unshift({
         id,
-        symbol: 'ZENITHBANK',
+        symbol: isCryptoModule() ? 'BTCUSDT' : 'ZENITHBANK',
         generated_at: new Date().toISOString(),
         action: 'HOLD',
         confidence: 0.55,
-        rationale: 'Browser mock cycle — no live ingest/LLM',
+        rationale: isCryptoModule()
+          ? 'Browser mock crypto cycle — public quotes only, no Pulse ingest'
+          : 'Browser mock cycle — no live ingest/LLM',
         model_name: 'mock-llm',
         executed: false,
         risk_policy_result: 'BLOCKED_CONFIDENCE',

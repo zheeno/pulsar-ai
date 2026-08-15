@@ -215,7 +215,7 @@ function ParamSlider({
 }
 
 export default function SettingsPage() {
-  const { logout } = useSession();
+  const { logout, activeModule, setActiveModule } = useSession();
   const toast = useToast();
   const providerId = useId();
   const modelId = useId();
@@ -268,6 +268,8 @@ export default function SettingsPage() {
   const [dataDir, setDataDir] = useState<string | null>(null);
   const [resetConfirm, setResetConfirm] = useState('');
   const [resetBusy, setResetBusy] = useState(false);
+  const [moduleConfirm, setModuleConfirm] = useState<'stocks' | 'crypto' | null>(null);
+  const [moduleBusy, setModuleBusy] = useState(false);
 
   async function refresh() {
     const [s, llm, strategy] = await Promise.all([
@@ -276,6 +278,7 @@ export default function SettingsPage() {
       api<StrategyRecord>('get_strategy'),
     ]);
     setSettings(s);
+    setActiveModule(s.activeModule === 'crypto' ? 'crypto' : 'stocks');
     setLlmStatus(llm);
     setStrategyDraft(draftFromStrategy(strategy));
     setAutoCycleEnabled(!!s.autoCycleEnabled);
@@ -510,6 +513,49 @@ export default function SettingsPage() {
     }
   }
 
+  async function switchModule(next: 'stocks' | 'crypto') {
+    if (!settings) return;
+    const current = activeModule === 'crypto' || settings.activeModule === 'crypto' ? 'crypto' : 'stocks';
+    if (next === current) {
+      setModuleConfirm(null);
+      return;
+    }
+    if (moduleConfirm !== next) {
+      setModuleConfirm(next);
+      return;
+    }
+    setModuleBusy(true);
+    try {
+      const payload = {
+        ...settings,
+        activeModule: next,
+        autoCycleEnabled: false,
+        liveTradingEnabled: next === 'crypto' ? false : settings.liveTradingEnabled,
+        scheduledLiveAuthorized: next === 'crypto' ? false : settings.scheduledLiveAuthorized,
+      };
+      await api('settings_set', { settings: payload });
+      setSettings(payload);
+      setActiveModule(next);
+      setAutoCycleEnabled(false);
+      if (next === 'crypto') {
+        setLiveTradingEnabled(false);
+        setScheduledLiveAuthorized(false);
+      }
+      setModuleConfirm(null);
+      toast.success(next === 'crypto' ? 'Crypto sandbox active.' : 'Stocks workspace active.', 'Module');
+      try {
+        await refresh();
+      } catch {
+        /* local state already applied */
+      }
+    } catch (e) {
+      toast.error(String(e), 'Could not switch module');
+      setModuleConfirm(null);
+    } finally {
+      setModuleBusy(false);
+    }
+  }
+
   if (!settings || !llmStatus || !profile || !strategyDraft) {
     return (
       <div className="page">
@@ -524,6 +570,7 @@ export default function SettingsPage() {
   const displayName = profile.displayName || profile.email || 'NGX account';
   const authLabel = AUTH_LABELS[profile.authMode] || profile.authMode;
   const sessionLive = profile.ok && profile.authMode === 'session';
+  const isCrypto = activeModule === 'crypto' || settings.activeModule === 'crypto';
 
   return (
     <div className="page">
@@ -533,6 +580,65 @@ export default function SettingsPage() {
           <p>Profile, strategy risk parameters, and LLM credentials.</p>
         </div>
       </header>
+
+      <section className="panel" aria-labelledby="module-heading" style={{ marginBottom: 20 }}>
+        <h2 id="module-heading">Market module</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Stocks uses NGX Pulse quotes and the NGN sandbox. Crypto uses public USDT spot quotes and a separate sandbox book. Pulse login stays required for both. Switching stops auto-cycle.
+        </p>
+        <div className="broker-grid" role="radiogroup" aria-labelledby="module-heading">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={!isCrypto}
+            className={`broker-card${!isCrypto ? ' is-selected' : ''}`}
+            disabled={moduleBusy}
+            onClick={() => void switchModule('stocks')}
+          >
+            <span className="broker-card__name">Stocks</span>
+            <span className="broker-card__meta">NGX · NGN sandbox</span>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={isCrypto}
+            className={`broker-card${isCrypto ? ' is-selected' : ''}`}
+            disabled={moduleBusy}
+            onClick={() => void switchModule('crypto')}
+          >
+            <span className="broker-card__name">Crypto</span>
+            <span className="broker-card__meta">USDT · sandbox only · 24/7</span>
+          </button>
+        </div>
+        {moduleConfirm ? (
+          <div className="banner banner-warn" style={{ marginTop: 16 }} role="status">
+            <p style={{ margin: '0 0 12px', fontSize: 13, lineHeight: 1.45 }}>
+              {moduleConfirm === 'crypto'
+                ? 'Switch to Crypto? Auto-cycle will stop. Crypto is sandbox-only with public USDT quotes — live brokers are disabled.'
+                : 'Switch to Stocks? Auto-cycle will stop. The NGX stocks sandbox (and any connected live broker) will be used.'}
+            </p>
+            <div className="btn-row" style={{ margin: 0 }}>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={moduleBusy}
+                onClick={() => setModuleConfirm(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={moduleBusy}
+                onClick={() => void switchModule(moduleConfirm)}
+              >
+                {moduleBusy ? <IconSpinner /> : null}
+                {moduleBusy ? 'Switching…' : `Confirm ${moduleConfirm === 'crypto' ? 'Crypto' : 'Stocks'}`}
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </section>
 
       <section className="profile-card" aria-labelledby="profile-heading">
         <div className="profile-card__hero">
@@ -621,6 +727,8 @@ export default function SettingsPage() {
         </div>
       </section>
 
+      {!isCrypto ? (
+      <>
       <section className="panel" aria-labelledby="broker-heading" style={{ marginTop: 20 }}>
         <h2 id="broker-heading">Live broker</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
@@ -734,11 +842,22 @@ export default function SettingsPage() {
         </div>
       </section>
       ) : null}
+      </>
+      ) : (
+      <section className="panel" aria-labelledby="broker-heading" style={{ marginTop: 20 }}>
+        <h2 id="broker-heading">Live broker</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Crypto is sandbox-only. Public USDT quotes feed signals and simulated fills. Live crypto brokers are not available in this version.
+        </p>
+      </section>
+      )}
 
       <section className="panel" aria-labelledby="strategy-heading">
         <h2 id="strategy-heading">Strategy</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
-          {wealth?.tradingMode === 'live'
+          {isCrypto
+            ? 'Risk and sizing for the crypto USDT sandbox. The universe is the curated USDT spot list.'
+            : wealth?.tradingMode === 'live'
             ? `Risk and sizing for live ${selectedBroker === 'bamboo' ? 'Bamboo' : 'Wealth'} orders. The trading universe is all active NGX instruments from Pulse.`
             : 'Risk and sizing for the sandbox. The trading universe is all active NGX instruments from Pulse.'}
         </p>
@@ -834,7 +953,8 @@ export default function SettingsPage() {
       <section className="panel" aria-labelledby="automation-heading">
         <h2 id="automation-heading">Automation</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
-          Control whether Pulsar runs ingest → signals → execution cycles on a timer during NGX market hours.
+          Control whether Pulsar runs ingest → signals → execution cycles on a timer
+          {isCrypto ? ' (crypto is 24/7).' : ' during NGX market hours.'}
         </p>
 
         <div className="toggle-row">
@@ -857,6 +977,8 @@ export default function SettingsPage() {
           </button>
         </div>
 
+        {!isCrypto ? (
+        <>
         <div className="toggle-row">
           <div className="toggle-row__copy">
             <label className="toggle-row__label">Enable live trading</label>
@@ -894,6 +1016,8 @@ export default function SettingsPage() {
             <span className="toggle__thumb" />
           </button>
         </div>
+        </>
+        ) : null}
 
         <div className="param-slider-grid" style={{ marginTop: 20 }}>
           <ParamSlider

@@ -34,6 +34,29 @@ const BASE_PRICES: &[(&str, f64)] = &[
     ("FLOURMILL", 42.0), ("PRESCO", 280.0), ("OKOMUOIL", 350.0), ("NASCON", 18.0), ("INTBREW", 5.0),
 ];
 
+pub const CRYPTO_USDT_STARTING: f64 = 10_000.0;
+
+pub const CRYPTO_UNIVERSE: &[(&str, &str)] = &[
+    ("BTCUSDT", "Bitcoin"),
+    ("ETHUSDT", "Ethereum"),
+    ("SOLUSDT", "Solana"),
+    ("BNBUSDT", "BNB"),
+    ("XRPUSDT", "XRP"),
+    ("DOGEUSDT", "Dogecoin"),
+    ("ADAUSDT", "Cardano"),
+    ("AVAXUSDT", "Avalanche"),
+    ("LINKUSDT", "Chainlink"),
+    ("DOTUSDT", "Polkadot"),
+    ("POLUSDT", "Polygon"),
+    ("LTCUSDT", "Litecoin"),
+    ("ATOMUSDT", "Cosmos"),
+    ("UNIUSDT", "Uniswap"),
+    ("NEARUSDT", "NEAR"),
+    ("FILUSDT", "Filecoin"),
+    ("ARBUSDT", "Arbitrum"),
+    ("OPUSDT", "Optimism"),
+];
+
 impl SeedService {
     pub fn seed_if_empty(conn: &Connection, starting_capital: f64) -> Result<()> {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM instruments", [], |row| row.get(0))?;
@@ -46,7 +69,7 @@ impl SeedService {
     pub fn seed_all(conn: &Connection, starting_capital: f64) -> Result<()> {
         for (symbol, name, sector) in CURATED {
             conn.execute(
-                "INSERT OR IGNORE INTO instruments (symbol, name, sector, is_active) VALUES (?1, ?2, ?3, 1)",
+                "INSERT INTO instruments (symbol, name, sector, is_active, module) VALUES (?1, ?2, ?3, 1, 'stocks')",
                 rusqlite::params![symbol, name, sector],
             )?;
         }
@@ -78,6 +101,41 @@ impl SeedService {
             rusqlite::params![portfolio_id, starting_capital, param_id],
         )?;
 
+        Ok(())
+    }
+
+    pub fn ensure_crypto_sandbox(conn: &Connection) -> Result<()> {
+        for (symbol, name) in CRYPTO_UNIVERSE {
+            conn.execute(
+                "INSERT INTO instruments (symbol, name, sector, is_active, module)
+                 VALUES (?1, ?2, 'Crypto', 1, 'crypto')
+                 ON CONFLICT(symbol) DO UPDATE SET
+                   name = excluded.name,
+                   sector = 'Crypto',
+                   module = 'crypto'",
+                rusqlite::params![symbol, name],
+            )?;
+        }
+
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sandbox_portfolios WHERE name = 'default-crypto-sandbox'",
+            [],
+            |r| r.get(0),
+        )?;
+        if exists > 0 {
+            return Ok(());
+        }
+        let param_id: String = conn.query_row(
+            "SELECT id FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let portfolio_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO sandbox_portfolios (id, name, starting_capital, cash_balance, strategy_param_set_id)
+             VALUES (?1, 'default-crypto-sandbox', ?2, ?2, ?3)",
+            rusqlite::params![portfolio_id, CRYPTO_USDT_STARTING, param_id],
+        )?;
         Ok(())
     }
 }

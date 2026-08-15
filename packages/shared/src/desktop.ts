@@ -36,6 +36,7 @@ export const AppSettingsSchema = z.object({
   maxLiveNotional: z.number().min(1000).max(50_000_000).default(500_000),
   maxLiveActions: z.number().int().min(1).max(40).default(10),
   retainRawLlmLogs: z.boolean().default(false),
+  activeModule: z.enum(['stocks', 'crypto']).default('stocks'),
 });
 export type AppSettings = z.infer<typeof AppSettingsSchema>;
 

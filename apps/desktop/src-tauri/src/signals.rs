@@ -10,7 +10,16 @@ use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
 const PORTFOLIO_PROMPT_VERSION: &str = "v2.4.0";
+const CRYPTO_PORTFOLIO_PROMPT_VERSION: &str = "v2.5.0-crypto";
 const PROMPT_VERSION: &str = "v1.0.0";
+
+fn portfolio_prompt_version(module: crate::market::MarketModule) -> &'static str {
+    if module == crate::market::MarketModule::Crypto {
+        CRYPTO_PORTFOLIO_PROMPT_VERSION
+    } else {
+        PORTFOLIO_PROMPT_VERSION
+    }
+}
 /// LLM may return this many BUY/SELL ideas per cycle. Executed BUYs still use max_daily_trades.
 const LLM_SIGNAL_CAP: usize = 40;
 
@@ -40,6 +49,34 @@ impl HeldLot {
 pub struct PortfolioGeneration {
     pub signal_ids: Vec<String>,
     pub universe_size: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Map an LLM ticker onto the universe set (exact, compact, or base→USDT for crypto).
+fn resolve_universe_symbol(raw: &str, valid: &std::collections::HashSet<String>) -> Option<String> {
+    let s = raw.trim().to_uppercase();
+    if s.is_empty() {
+        return None;
+    }
+    if valid.contains(&s) {
+        return Some(s);
+    }
+    // BTC/USDT, BTC-USDT, BTC_USDT → BTCUSDT
+    let alnum: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if !alnum.is_empty() && valid.contains(&alnum) {
+        return Some(alnum.clone());
+    }
+    // BTC → BTCUSDT when the pair is in universe
+    for base in [&alnum, &s] {
+        if base.is_empty() || base.ends_with("USDT") {
+            continue;
+        }
+        let pair = format!("{base}USDT");
+        if valid.contains(&pair) {
+            return Some(pair);
+        }
+    }
+    None
 }
 
 pub struct SignalGenerationService;
@@ -58,6 +95,10 @@ impl SignalGenerationService {
         let settings_fee = settings.simulated_fee_pct;
         let venue = trading_venue.to_string();
         let pid = portfolio_id.map(|s| s.to_string());
+        let module = crate::market::MarketModule::from_settings(settings);
+        let sandbox_name = module.sandbox_portfolio_name().to_string();
+        let module_key = module.as_str().to_string();
+        let prompt_ver = portfolio_prompt_version(module);
         let prep = db.with_conn(|conn| -> Result<Option<_>> {
         let param_set = Self::get_active_param_set(conn, pid.as_deref())?;
         let Some(param_set) = param_set else {
@@ -67,31 +108,36 @@ impl SignalGenerationService {
         let lots = if venue != "sandbox" {
             live_holdings_owned.clone().unwrap_or_default()
         } else {
-            Self::sandbox_lots(conn, pid.as_deref())?
+            Self::sandbox_lots(conn, pid.as_deref(), &sandbox_name)?
         };
         let held_symbols: std::collections::HashSet<String> =
             lots.iter().map(|l| l.symbol.to_uppercase()).collect();
 
-        let universe_rows = Self::build_universe(conn, &held_symbols)?;
+        let universe_rows = Self::build_universe(conn, &held_symbols, &module_key)?;
         if universe_rows.is_empty() {
             return Ok(None);
         }
 
-        let market_context = Self::get_market_context(conn)?;
+        // NGX ASI belongs to stocks only — do not inject into crypto prompts.
+        let market_context = if module_key == "crypto" {
+            None
+        } else {
+            Self::get_market_context(conn)?
+        };
 
         let mut memory_symbols = held_symbols.clone();
-        for sym in Self::recent_active_symbols(conn, 30)? {
+        for sym in Self::recent_active_symbols(conn, 30, &module_key)? {
             memory_symbols.insert(sym);
             if memory_symbols.len() >= 40 {
                 break;
             }
         }
-        let symbol_memory = Self::build_symbol_memory(conn, pid.as_deref(), &memory_symbols)?;
+        let symbol_memory = Self::build_symbol_memory(conn, pid.as_deref(), &memory_symbols, &sandbox_name)?;
 
         let cash = cash_balance.unwrap_or_else(|| {
             conn.query_row(
-                "SELECT cash_balance FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
-                [],
+                "SELECT cash_balance FROM sandbox_portfolios WHERE name = ?1 LIMIT 1",
+                [&sandbox_name],
                 |row| row.get::<_, f64>(0),
             )
             .unwrap_or(0.0)
@@ -188,7 +234,7 @@ impl SignalGenerationService {
                     "",
                     "",
                     model_name,
-                    PORTFOLIO_PROMPT_VERSION,
+                    prompt_ver,
                     false,
                 )? {
                     signal_ids.push(id);
@@ -214,6 +260,7 @@ impl SignalGenerationService {
             "cashBalance": cash,
             "brokerageBalance": if venue != "sandbox" { Some(cash) } else { None::<f64> },
             "tradingVenue": venue,
+            "marketModule": module_key,
             "estimatedFeePct": settings_fee,
         });
         Ok(Some((context, valid_symbols, held_symbols, seen, signal_ids, universe_size)))
@@ -222,6 +269,7 @@ impl SignalGenerationService {
             return Ok(PortfolioGeneration {
                 signal_ids: vec![],
                 universe_size: 0,
+                warnings: vec!["No priced instruments in the active universe.".into()],
             });
         };
 
@@ -243,6 +291,12 @@ impl SignalGenerationService {
         let retrieved = memory::search_memories(db, settings, &api_key, &mem_query, None, Some(8))
             .await
             .unwrap_or_default();
+        let crypto = module_key == "crypto";
+        // Drop cross-module memory hits (e.g. NGX lessons bleeding into crypto cycles).
+        let retrieved: Vec<_> = retrieved
+            .into_iter()
+            .filter(|m| memory_fits_module(m.symbol.as_deref(), &valid_symbols, crypto))
+            .collect();
         if let Some(obj) = context.as_object_mut() {
             obj.insert("retrievedMemories".into(), json!(retrieved));
         }
@@ -260,16 +314,30 @@ impl SignalGenerationService {
         let raw_response = result.get("rawResponse").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let model_name = result.get("modelName").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
+        let mut gen_warnings: Vec<String> = Vec::new();
         db.with_conn(|conn| {
         if let Some(arr) = signals.as_array() {
+            if arr.is_empty() {
+                gen_warnings.push("LLM returned an empty signals array.".into());
+            }
             let mut buys = 0usize;
             let mut sells = 0usize;
+            let mut dropped = 0usize;
+            let mut drop_samples: Vec<String> = Vec::new();
             for pick in arr.iter().take(crate::execution::MAX_SIGNAL_TOTAL) {
-                let symbol = pick.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                if symbol.is_empty() || seen.contains(symbol) || !valid_symbols.contains(symbol) {
+                let raw_symbol = pick.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(symbol) = resolve_universe_symbol(raw_symbol, &valid_symbols) else {
+                    dropped += 1;
+                    if drop_samples.len() < 5 && !raw_symbol.is_empty() {
+                        drop_samples.push(raw_symbol.to_string());
+                    }
+                    continue;
+                };
+                if seen.contains(&symbol) {
                     continue;
                 }
-                if !crate::ngx::is_valid_ticker(symbol) {
+                if !crate::ngx::is_valid_ticker(&symbol) {
+                    dropped += 1;
                     continue;
                 }
                 let action = pick.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -277,28 +345,42 @@ impl SignalGenerationService {
                     if buys >= crate::execution::MAX_SIGNAL_BUYS { continue; }
                     buys += 1;
                 } else if action == "SELL" {
-                    if !llm_sell_is_held(symbol, &held_symbols) {
+                    if !llm_sell_is_held(&symbol, &held_symbols) {
                         continue;
                     }
                     if sells >= crate::execution::MAX_SIGNAL_SELLS { continue; }
                     sells += 1;
+                } else if action == "HOLD" {
+                    continue;
                 }
-                seen.insert(symbol.to_string());
+                seen.insert(symbol.clone());
 
                 let signal_id = Self::persist_signal(
                     conn,
                     pick,
-                    symbol,
+                    &symbol,
                     &prompt,
                     &raw_response,
                     &model_name,
-                    PORTFOLIO_PROMPT_VERSION,
+                    prompt_ver,
                     settings.retain_raw_llm_logs,
                 )?;
                 if let Some(id) = signal_id {
                     signal_ids.push(id);
                 }
             }
+            if dropped > 0 {
+                let sample = if drop_samples.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (e.g. {})", drop_samples.join(", "))
+                };
+                gen_warnings.push(format!(
+                    "Dropped {dropped} LLM signal(s) whose tickers were not in the universe{sample}."
+                ));
+            }
+        } else {
+            gen_warnings.push("LLM response had no signals array.".into());
         }
         Ok(())
         })?;
@@ -306,6 +388,7 @@ impl SignalGenerationService {
         Ok(PortfolioGeneration {
             signal_ids,
             universe_size,
+            warnings: gen_warnings,
         })
     }
 
@@ -333,7 +416,8 @@ impl SignalGenerationService {
 
         let mut mem_set = std::collections::HashSet::new();
         mem_set.insert(symbol.to_string());
-        let symbol_memory = Self::build_symbol_memory(conn, None, &mem_set)?;
+        let sandbox_name = crate::market::MarketModule::from_settings(settings).sandbox_portfolio_name();
+        let symbol_memory = Self::build_symbol_memory(conn, None, &mem_set, sandbox_name)?;
 
         let context = json!({
             "symbol": symbol,
@@ -430,16 +514,17 @@ impl SignalGenerationService {
     fn build_universe(
         conn: &Connection,
         held_symbols: &std::collections::HashSet<String>,
+        module: &str,
     ) -> Result<Vec<UniverseRow>> {
         let sql = "SELECT i.symbol, i.sector, ph.price, ph.change_percent, ph.volume
              FROM instruments i
              LEFT JOIN price_history ph ON ph.symbol = i.symbol AND ph.trade_date = (
                SELECT MAX(trade_date) FROM price_history WHERE symbol = i.symbol
              )
-             WHERE i.is_active = 1";
+             WHERE i.is_active = 1 AND IFNULL(i.module, 'stocks') = ?1";
 
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([module], |row| {
             Ok(UniverseRow {
                 symbol: row.get::<_, String>(0)?,
                 sector: row.get::<_, Option<String>>(1)?,
@@ -485,13 +570,17 @@ impl SignalGenerationService {
         out
     }
 
-    fn sandbox_lots(conn: &Connection, portfolio_id: Option<&str>) -> Result<Vec<HeldLot>> {
+    fn sandbox_lots(
+        conn: &Connection,
+        portfolio_id: Option<&str>,
+        sandbox_name: &str,
+    ) -> Result<Vec<HeldLot>> {
         let pid = if let Some(id) = portfolio_id {
             id.to_string()
         } else {
             conn.query_row(
-                "SELECT id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
-                [],
+                "SELECT id FROM sandbox_portfolios WHERE name = ?1 LIMIT 1",
+                [sandbox_name],
                 |row| row.get(0),
             )?
         };
@@ -520,18 +609,29 @@ impl SignalGenerationService {
         .filter(|p: &f64| *p > 0.0)
     }
 
-    fn recent_active_symbols(conn: &Connection, days: i64) -> Result<Vec<String>> {
+    fn recent_active_symbols(conn: &Connection, days: i64, module: &str) -> Result<Vec<String>> {
         let cutoff = format!("-{days} days");
         let mut set = std::collections::HashSet::new();
+        // Scope to the active module so crypto cycles do not inherit NGX signal history.
         let mut stmt = conn.prepare(
-            "SELECT symbol FROM signals WHERE generated_at >= datetime('now', ?1)
+            "SELECT s.symbol FROM signals s
+             JOIN instruments i ON i.symbol = s.symbol
+             WHERE s.generated_at >= datetime('now', ?1)
+               AND IFNULL(i.module, 'stocks') = ?2
              UNION
-             SELECT symbol FROM sandbox_trades WHERE executed_at >= datetime('now', ?1)
+             SELECT t.symbol FROM sandbox_trades t
+             JOIN instruments i ON i.symbol = t.symbol
+             WHERE t.executed_at >= datetime('now', ?1)
+               AND IFNULL(i.module, 'stocks') = ?2
              UNION
-             SELECT symbol FROM broker_orders WHERE created_at >= datetime('now', ?1)
+             SELECT o.symbol FROM broker_orders o
+             JOIN instruments i ON i.symbol = o.symbol
+             WHERE o.created_at >= datetime('now', ?1)
+               AND IFNULL(i.module, 'stocks') = ?2
+               AND ?2 = 'stocks'
              LIMIT 40",
         )?;
-        for row in stmt.query_map([&cutoff], |row| row.get::<_, String>(0))? {
+        for row in stmt.query_map(rusqlite::params![cutoff, module], |row| row.get::<_, String>(0))? {
             set.insert(row?);
         }
         Ok(set.into_iter().collect())
@@ -541,12 +641,13 @@ impl SignalGenerationService {
         conn: &Connection,
         portfolio_id: Option<&str>,
         symbols: &std::collections::HashSet<String>,
+        sandbox_name: &str,
     ) -> Result<serde_json::Map<String, Value>> {
         let mut memory = serde_json::Map::new();
         let pid = portfolio_id.map(|s| s.to_string()).or_else(|| {
             conn.query_row(
-                "SELECT id FROM sandbox_portfolios WHERE name = 'default-sandbox' LIMIT 1",
-                [],
+                "SELECT id FROM sandbox_portfolios WHERE name = ?1 LIMIT 1",
+                [sandbox_name],
                 |row| row.get(0),
             )
             .ok()
@@ -772,20 +873,36 @@ pub async fn run_cycle(
     cycle_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let mut warnings: Vec<String> = Vec::new();
-    let ingested = match crate::ingest::IngestionService::ingest_stocks(db, client, cache, calendar, true)
-        .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("Pulse stock ingest failed: {e}"));
-            0
+    let module = crate::market::MarketModule::from_settings(settings);
+    let ingested = if module == crate::market::MarketModule::Crypto {
+        match crate::crypto::ingest_crypto(db, cache).await {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("Crypto ingest failed: {e}"));
+                0
+            }
+        }
+    } else {
+        match crate::ingest::IngestionService::ingest_stocks(db, client, cache, calendar, true).await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("Pulse stock ingest failed: {e}"));
+                0
+            }
         }
     };
-    if let Err(e) = crate::ingest::IngestionService::ingest_market(db, client, calendar, true).await {
-        warnings.push(format!("Pulse market ingest failed: {e}"));
+    if module == crate::market::MarketModule::Stocks {
+        if let Err(e) = crate::ingest::IngestionService::ingest_market(db, client, calendar, true).await {
+            warnings.push(format!("Pulse market ingest failed: {e}"));
+        }
     }
-    let trading_mode = if let Some(session) = broker {
-        session.resolve_trading_mode(settings).await
+    let trading_mode = if module.allows_live_broker() {
+        if let Some(session) = broker {
+            session.resolve_trading_mode(settings).await
+        } else {
+            crate::wealth::TradingMode::Sandbox
+        }
     } else {
         crate::wealth::TradingMode::Sandbox
     };
@@ -840,8 +957,12 @@ pub async fn run_cycle(
     )
     .await?;
     let signal_ids = generated.signal_ids;
+    warnings.extend(generated.warnings);
 
-    if generated.universe_size > 0 && generated.universe_size <= 20 {
+    if module == crate::market::MarketModule::Stocks
+        && generated.universe_size > 0
+        && generated.universe_size <= 20
+    {
         warnings.push(format!(
             "Universe is only {} names (seed size). Pulse ingest may be incomplete.",
             generated.universe_size
@@ -884,7 +1005,19 @@ pub async fn run_cycle(
     warnings.extend(exec_warnings);
 
     if trading_mode == crate::wealth::TradingMode::Sandbox {
-        db.with_conn(|conn| crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None))?;
+        let sandbox_id = db.with_conn(|conn| {
+            crate::portfolio::PortfolioService::get_sandbox_portfolio_id(
+                conn,
+                module.sandbox_portfolio_name(),
+            )
+        })?;
+        db.with_conn(|conn| {
+            crate::portfolio::DailySnapshotService::create_snapshot(
+                conn,
+                cache,
+                sandbox_id.as_deref(),
+            )
+        })?;
     } else if execute {
         if let Some(session) = broker {
             if let Ok(book) = session.refresh_book(db).await {
@@ -951,6 +1084,25 @@ fn llm_sell_is_held(symbol: &str, held: &std::collections::HashSet<String>) -> b
     held.contains(&symbol.to_uppercase())
 }
 
+fn memory_fits_module(
+    symbol: Option<&str>,
+    valid_symbols: &std::collections::HashSet<String>,
+    crypto: bool,
+) -> bool {
+    let Some(sym) = symbol.map(|s| s.to_uppercase()) else {
+        // Freeform notes: keep for stocks; drop for crypto to avoid NGX narrative bleed.
+        return !crypto;
+    };
+    if valid_symbols.contains(&sym) {
+        return true;
+    }
+    if crypto {
+        sym.ends_with("USDT")
+    } else {
+        !sym.ends_with("USDT")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,6 +1127,35 @@ mod tests {
     fn llm_sell_held_ignores_case() {
         assert!(llm_sell_is_held("gtco", &held(&["GTCO"])));
         assert!(llm_sell_is_held("Gtco", &held(&["gtco"])));
+    }
+
+    #[test]
+    fn resolve_symbol_exact_and_base_to_usdt() {
+        let valid: HashSet<String> = ["BTCUSDT", "ETHUSDT", "GTCO"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            resolve_universe_symbol("BTCUSDT", &valid).as_deref(),
+            Some("BTCUSDT")
+        );
+        assert_eq!(
+            resolve_universe_symbol("btc", &valid).as_deref(),
+            Some("BTCUSDT")
+        );
+        assert_eq!(
+            resolve_universe_symbol("BTC/USDT", &valid).as_deref(),
+            Some("BTCUSDT")
+        );
+        assert_eq!(
+            resolve_universe_symbol("eth-usdt", &valid).as_deref(),
+            Some("ETHUSDT")
+        );
+        assert_eq!(
+            resolve_universe_symbol("GTCO", &valid).as_deref(),
+            Some("GTCO")
+        );
+        assert_eq!(resolve_universe_symbol("DOGE", &valid), None);
     }
 
     #[test]

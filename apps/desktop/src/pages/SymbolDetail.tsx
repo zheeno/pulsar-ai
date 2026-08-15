@@ -11,7 +11,8 @@ import {
 } from 'recharts';
 import { IconSpinner } from '../components/Icons';
 import { api } from '../lib/api';
-import { formatNaira } from '../lib/format';
+import { formatMoney } from '../lib/format';
+import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
 
 type PricePoint = {
@@ -68,6 +69,9 @@ type SymbolDetailPulse = {
 export default function SymbolDetailPage() {
   const { symbol: rawSymbol } = useParams();
   const toast = useToast();
+  const { activeModule } = useSession();
+  const isCrypto = activeModule === 'crypto';
+  const money = (n: number | null | undefined) => formatMoney(n, isCrypto ? 'crypto' : 'stocks');
   const symbol = (rawSymbol || '').toUpperCase();
   const [data, setData] = useState<SymbolDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -154,7 +158,7 @@ export default function SymbolDetailPage() {
         </div>
         {!loading && price != null ? (
           <div style={{ textAlign: 'right' }}>
-            <div className="stat-card__value" style={{ fontSize: '1.5rem' }}>{formatNaira(price)}</div>
+            <div className="stat-card__value" style={{ fontSize: '1.5rem' }}>{money(price)}</div>
             {change != null ? (
               <div className={change >= 0 ? 'text-ok' : 'text-bad'} style={{ fontWeight: 600 }}>
                 {change >= 0 ? '+' : ''}{change.toFixed(2)}%
@@ -193,7 +197,7 @@ export default function SymbolDetailPage() {
                 <div className="stat-card">
                   <div className="stat-card__label">Market cap</div>
                   <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
-                    {formatNaira(data.pulseQuote.marketCap)}
+                    {money(data.pulseQuote.marketCap)}
                   </div>
                 </div>
               )}
@@ -208,7 +212,7 @@ export default function SymbolDetailPage() {
                   <div className="stat-card">
                     <div className="stat-card__label">Avg cost</div>
                     <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
-                      {formatNaira(data.position.avgCost)}
+                      {money(data.position.avgCost)}
                     </div>
                   </div>
                 </>
@@ -308,8 +312,8 @@ export default function SymbolDetailPage() {
                       <td className="muted" style={{ fontSize: 12 }}>{t.executedAt}</td>
                       <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
                       <td className="mono">{Number(t.quantity).toLocaleString()}</td>
-                      <td className="mono">{formatNaira(t.fillPrice)}</td>
-                      <td className="mono">{formatNaira(t.simulatedFee)}</td>
+                      <td className="mono">{money(t.fillPrice)}</td>
+                      <td className="mono">{money(t.simulatedFee)}</td>
                     </tr>
                   ))}
                 </tbody>

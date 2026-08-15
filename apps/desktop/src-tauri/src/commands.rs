@@ -66,6 +66,41 @@ pub fn settings_set(payload: SettingsUpdate, state: State<'_, Arc<AppState>>) ->
     let mut settings = payload.settings;
     let current = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
     settings.onboarding_complete = current.onboarding_complete;
+    // Fill required numerics if the UI omitted them (partial payload / older clients).
+    if settings.max_live_notional < 1_000.0 {
+        settings.max_live_notional = current.max_live_notional;
+    }
+    if settings.max_live_actions < 1 {
+        settings.max_live_actions = current.max_live_actions;
+    }
+    if settings.default_starting_capital < 1_000.0 {
+        settings.default_starting_capital = current.default_starting_capital;
+    }
+    if settings.pulse_base_url.trim().is_empty() {
+        settings.pulse_base_url = current.pulse_base_url.clone();
+    }
+    if settings.llm_provider.trim().is_empty() {
+        settings.llm_provider = current.llm_provider.clone();
+    }
+    if settings.llm_model.trim().is_empty() {
+        settings.llm_model = current.llm_model.clone();
+    }
+    let current_module = crate::market::MarketModule::from_settings(&current);
+    let next_module = crate::market::MarketModule::parse(&settings.active_module);
+    settings.active_module = next_module.as_str().to_string();
+    if current_module != next_module {
+        if state.is_cycle_running() {
+            return Err("Wait for the current cycle to finish before switching modules.".into());
+        }
+        settings.auto_cycle_enabled = false;
+        if next_module == crate::market::MarketModule::Crypto {
+            let _ = state.db.with_conn(crate::seed::SeedService::ensure_crypto_sandbox);
+        }
+    }
+    if next_module == crate::market::MarketModule::Crypto {
+        settings.live_trading_enabled = false;
+        settings.scheduled_live_authorized = false;
+    }
 
     let new_url = settings.llm_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let old_url = current.llm_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -211,9 +246,11 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let module = crate::market::MarketModule::from_settings(&settings);
+        let name = module.sandbox_portfolio_name();
         let id = state
             .db
-            .with_conn(PortfolioService::get_default_portfolio_id)
+            .with_conn(|conn| PortfolioService::get_sandbox_portfolio_id(conn, name))
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "No default portfolio".to_string())?;
         let summary = state
@@ -225,6 +262,7 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
         let mut value = serde_json::to_value(&summary).map_err(|e| e.to_string())?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
+            obj.insert("activeModule".into(), serde_json::json!(module.as_str()));
             obj.insert(
                 "brokerId".into(),
                 serde_json::json!(crate::broker::BrokerId::parse(&settings.selected_broker).as_str()),
@@ -233,6 +271,10 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
                 "brokerName".into(),
                 serde_json::json!(crate::broker::BrokerId::parse(&settings.selected_broker).short_name()),
             );
+        }
+
+        if !module.allows_live_broker() {
+            return Ok(value);
         }
 
         let Some(session) = crate::broker::open_live_broker(&settings) else {
@@ -296,9 +338,11 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let module = crate::market::MarketModule::from_settings(&settings);
+        let name = module.sandbox_portfolio_name();
         let id = state
             .db
-            .with_conn(PortfolioService::get_default_portfolio_id)
+            .with_conn(|conn| PortfolioService::get_sandbox_portfolio_id(conn, name))
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "No default portfolio".to_string())?;
 
@@ -335,32 +379,34 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
         let mut wealth_synced_at: Option<String> = None;
         let mut live_broker = crate::broker::BrokerId::parse(&settings.selected_broker);
 
-        if let Some(session) = crate::broker::open_live_broker(&settings) {
-            live_broker = session.id();
-            let book = match block_on_local(session.refresh_book(&state.db)) {
-                Ok(b) => Some(b),
-                Err(_) => session.load_book(&state.db).ok().flatten(),
-            };
-            if let Some(book) = book {
-                trading_mode = "live";
-                cash = book.brokerage_balance;
-                live_pnl_fallback = Some(wealth_pnl_today(&state, live_broker.as_str(), book.profit));
-                wealth_synced_at = Some(book.synced_at.clone());
-                lots = book
-                    .holdings
-                    .iter()
-                    .filter(|h| h.quantity > 0.0)
-                    .map(|h| {
-                        (
-                            format!("wealth-{}", h.stock_id),
-                            h.symbol.clone(),
-                            h.quantity,
-                            h.buy_price.unwrap_or(h.price),
-                            h.price,
-                            h.current_value,
-                        )
-                    })
-                    .collect();
+        if module.allows_live_broker() {
+            if let Some(session) = crate::broker::open_live_broker(&settings) {
+                live_broker = session.id();
+                let book = match block_on_local(session.refresh_book(&state.db)) {
+                    Ok(b) => Some(b),
+                    Err(_) => session.load_book(&state.db).ok().flatten(),
+                };
+                if let Some(book) = book {
+                    trading_mode = "live";
+                    cash = book.brokerage_balance;
+                    live_pnl_fallback = Some(wealth_pnl_today(&state, live_broker.as_str(), book.profit));
+                    wealth_synced_at = Some(book.synced_at.clone());
+                    lots = book
+                        .holdings
+                        .iter()
+                        .filter(|h| h.quantity > 0.0)
+                        .map(|h| {
+                            (
+                                format!("wealth-{}", h.stock_id),
+                                h.symbol.clone(),
+                                h.quantity,
+                                h.buy_price.unwrap_or(h.price),
+                                h.price,
+                                h.current_value,
+                            )
+                        })
+                        .collect();
+                }
             }
         }
 
@@ -402,6 +448,7 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
                 "quotedSymbols": Vec::<String>::new(),
                 "stale": collapsed,
                 "tradingMode": trading_mode,
+                "activeModule": module.as_str(),
                 "brokerId": live_broker.as_str(),
                 "brokerName": live_broker.short_name(),
                 "portfolio": {
@@ -418,23 +465,27 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
             }
         }
 
-        let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
-        let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
-        let pulse = NgxPulseClient::from_settings(&settings, password, api_key);
-        let quotes = block_on_local(async { pulse.get_latest_quotes(&symbols).await })
-            .unwrap_or_else(|_| vec![]);
-        let quotes_empty = quotes.is_empty();
-        let quoted_symbols: Vec<String> = quotes.iter().map(|q| q.symbol.clone()).collect();
-
-        let _ = state.db.with_conn(|conn| {
-            for q in &quotes {
-                let _ = crate::ingest::IngestionService::upsert_last_quote(conn, &state.cache, q);
-            }
-            Ok::<_, anyhow::Error>(())
-        });
-
         let quote_map: std::collections::HashMap<String, crate::ngx::LatestQuote> =
-            quotes.into_iter().map(|q| (q.symbol.clone(), q)).collect();
+            if module == crate::market::MarketModule::Crypto {
+                // Crypto uses public-feed cache / price_history — never Pulse stock quotes.
+                std::collections::HashMap::new()
+            } else {
+                let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
+                let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
+                let pulse = NgxPulseClient::from_settings(&settings, password, api_key);
+                let quotes = block_on_local(async { pulse.get_latest_quotes(&symbols).await })
+                    .unwrap_or_else(|_| vec![]);
+                let _ = state.db.with_conn(|conn| {
+                    for q in &quotes {
+                        let _ = crate::ingest::IngestionService::upsert_last_quote(conn, &state.cache, q);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+                quotes.into_iter().map(|q| (q.symbol.clone(), q)).collect()
+            };
+
+        let quotes_empty = quote_map.is_empty();
+        let quoted_symbols: Vec<String> = quote_map.keys().cloned().collect();
 
         let mut market_value = 0.0;
         let mut pnl_today = 0.0;
@@ -501,7 +552,23 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
             }));
         }
 
-        let stale = quotes_empty && !symbols.is_empty() && missing_pulse == lots.len();
+        // Crypto marks from local cache are fresh enough; stocks without Pulse may be stale.
+        let stale = if module == crate::market::MarketModule::Crypto {
+            !symbols.is_empty() && market_value <= 0.0 && missing_pulse == lots.len()
+        } else {
+            quotes_empty && !symbols.is_empty() && missing_pulse == lots.len()
+        };
+
+        if let Some(curve_pnl) = state
+            .db
+            .with_conn(|conn| {
+                crate::portfolio::EquityCurveService::pnl_today(conn, module.equity_curve_venue())
+            })
+            .ok()
+            .flatten()
+        {
+            pnl_today = curve_pnl;
+        }
 
         Ok(serde_json::json!({
             "positions": positions,
@@ -513,6 +580,7 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
             "quotedSymbols": quoted_symbols,
             "stale": stale,
             "tradingMode": trading_mode,
+            "activeModule": module.as_str(),
             "portfolio": {
                 "id": id,
                 "cash_balance": cash,
@@ -786,8 +854,14 @@ pub fn portfolio_performance(
     venue: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let venue = venue.unwrap_or_else(|| "sandbox".into());
-    if venue == "wealth" || venue == "sandbox" || venue == "bamboo" {
+    let venue = venue.unwrap_or_else(|| {
+        state
+            .db
+            .with_conn(get_settings)
+            .map(|s| crate::market::MarketModule::from_settings(&s).equity_curve_venue().to_string())
+            .unwrap_or_else(|_| "sandbox".into())
+    });
+    if venue == "wealth" || venue == "sandbox" || venue == "bamboo" || venue == "crypto-sandbox" {
         return state
             .db
             .with_conn(|conn| crate::portfolio::EquityCurveService::get_curve(conn, &venue))
@@ -836,13 +910,32 @@ pub struct MarketStatusResponse {
     pub pulse_is_open: Option<bool>,
     pub app_env: String,
     pub market_hours_enforced: bool,
+    pub active_module: String,
 }
 
 #[tauri::command]
 pub async fn market_status(state: State<'_, Arc<AppState>>) -> Result<MarketStatusResponse, String> {
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let module = crate::market::MarketModule::from_settings(&settings);
         let calendar = TradingCalendar::default();
+        if module == crate::market::MarketModule::Crypto {
+            return Ok(MarketStatusResponse {
+                is_open: true,
+                is_post_close: false,
+                is_trading_day: true,
+                phase: "crypto_24_7".into(),
+                today_wat: calendar.today_wat(),
+                now_wat: calendar.now_wat().format("%H:%M WAT").to_string(),
+                pulse_status: Some("session".into()),
+                pulse_is_open: Some(true),
+                app_env: crate::runtime_util::app_env().into(),
+                market_hours_enforced: false,
+                active_module: module.as_str().into(),
+            });
+        }
+
         let is_open = calendar.is_market_open();
         let is_post_close = calendar.is_post_close_window();
         let is_trading_day = calendar.is_trading_day(None);
@@ -854,7 +947,6 @@ pub async fn market_status(state: State<'_, Arc<AppState>>) -> Result<MarketStat
             "closed"
         };
 
-        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
         let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
@@ -877,6 +969,7 @@ pub async fn market_status(state: State<'_, Arc<AppState>>) -> Result<MarketStat
             pulse_is_open,
             app_env: crate::runtime_util::app_env().into(),
             market_hours_enforced: crate::runtime_util::enforce_market_hours(),
+            active_module: module.as_str().into(),
         })
     })
     .await
@@ -913,12 +1006,17 @@ pub async fn cycle_run(
         if !settings.onboarding_complete {
             return Err("Complete onboarding before running a cycle.".into());
         }
+        let module = crate::market::MarketModule::from_settings(&settings);
         let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
         let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
-        let broker = crate::broker::open_live_broker(&settings);
+        let broker = if module.allows_live_broker() {
+            crate::broker::open_live_broker(&settings)
+        } else {
+            None
+        };
         let calendar = TradingCalendar::default();
-        if !crate::runtime_util::market_activity_allowed(&calendar) {
+        if !crate::runtime_util::market_activity_allowed_for(&calendar, module) {
             let payload = serde_json::json!({
                 "ok": false,
                 "source": "manual",
@@ -1078,18 +1176,24 @@ pub async fn cycle_ingest(state: State<'_, Arc<AppState>>) -> Result<serde_json:
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
-        let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
-        let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
-        let client = NgxPulseClient::from_settings(&settings, password, api_key);
+        let module = crate::market::MarketModule::from_settings(&settings);
         let calendar = TradingCalendar::default();
-        let count = block_on_local(IngestionService::ingest_stocks(
-            &state.db,
-            &client,
-            &state.cache,
-            &calendar,
-            true,
-        ))
-        .map_err(|e| e.to_string())?;
+        let count = if module == crate::market::MarketModule::Crypto {
+            block_on_local(crate::crypto::ingest_crypto(&state.db, &state.cache))
+                .map_err(|e| e.to_string())?
+        } else {
+            let password = get_secret(SECRET_PULSE_PASSWORD).ok().flatten();
+            let api_key = get_secret(SECRET_PULSE_API_KEY).ok().flatten();
+            let client = NgxPulseClient::from_settings(&settings, password, api_key);
+            block_on_local(IngestionService::ingest_stocks(
+                &state.db,
+                &client,
+                &state.cache,
+                &calendar,
+                true,
+            ))
+            .map_err(|e| e.to_string())?
+        };
         Ok(serde_json::json!({ "count": count }))
     })
     .await
@@ -1101,7 +1205,12 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
-        let broker = crate::broker::open_live_broker(&settings);
+        let module = crate::market::MarketModule::from_settings(&settings);
+        let broker = if module.allows_live_broker() {
+            crate::broker::open_live_broker(&settings)
+        } else {
+            None
+        };
 
         let ids = block_on_local(async {
                     let trading_mode = if let Some(ref session) = broker {
@@ -1156,14 +1265,22 @@ pub async fn generate_signals(state: State<'_, Arc<AppState>>) -> Result<serde_j
 #[tauri::command]
 pub fn list_signals(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(50);
+    let module = state
+        .db
+        .with_conn(get_settings)
+        .map(|s| crate::market::MarketModule::from_settings(&s).as_str().to_string())
+        .unwrap_or_else(|_| "stocks".into());
     state
         .db
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, symbol, generated_at, action, confidence, rationale, model_name, executed, risk_policy_result
-                 FROM signals ORDER BY generated_at DESC LIMIT ?1",
+                "SELECT s.id, s.symbol, s.generated_at, s.action, s.confidence, s.rationale, s.model_name, s.executed, s.risk_policy_result
+                 FROM signals s
+                 LEFT JOIN instruments i ON i.symbol = s.symbol
+                 WHERE IFNULL(i.module, 'stocks') = ?1
+                 ORDER BY s.generated_at DESC LIMIT ?2",
             )?;
-            let rows = stmt.query_map([limit], |row| {
+            let rows = stmt.query_map(rusqlite::params![module, limit], |row| {
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
                     "symbol": row.get::<_, String>(1)?,
@@ -1184,16 +1301,26 @@ pub fn list_signals(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resu
 #[tauri::command]
 pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(50);
+    let module = state
+        .db
+        .with_conn(get_settings)
+        .map(|s| crate::market::MarketModule::from_settings(&s))
+        .unwrap_or(crate::market::MarketModule::Stocks);
+    let include_live = module.allows_live_broker();
     state
         .db
         .with_conn(|conn| {
             let mut out = Vec::new();
 
+            let sandbox_name = module.sandbox_portfolio_name();
             let mut stmt = conn.prepare(
-                "SELECT id, symbol, side, quantity, fill_price, simulated_fee, executed_at, resulting_cash_balance
-                 FROM sandbox_trades ORDER BY executed_at DESC LIMIT ?1",
+                "SELECT t.id, t.symbol, t.side, t.quantity, t.fill_price, t.simulated_fee, t.executed_at, t.resulting_cash_balance
+                 FROM sandbox_trades t
+                 JOIN sandbox_portfolios p ON p.id = t.portfolio_id
+                 WHERE p.name = ?1
+                 ORDER BY t.executed_at DESC LIMIT ?2",
             )?;
-            for row in stmt.query_map([limit], |row| {
+            for row in stmt.query_map(rusqlite::params![sandbox_name, limit], |row| {
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
                     "symbol": row.get::<_, String>(1)?,
@@ -1210,6 +1337,7 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
                 out.push(row?);
             }
 
+            if include_live {
             let mut stmt = conn.prepare(
                 "SELECT id, symbol, side, quantity, fill_price, fee, created_at, status, rejection_reason
                  FROM broker_orders ORDER BY created_at DESC LIMIT ?1",
@@ -1230,6 +1358,7 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
                 }))
             })? {
                 out.push(row?);
+            }
             }
 
             out.sort_by(|a, b| {

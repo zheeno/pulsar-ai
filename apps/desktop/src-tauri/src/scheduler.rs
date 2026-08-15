@@ -45,7 +45,10 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
             }
 
             let calendar = TradingCalendar::default();
-            if !crate::runtime_util::market_activity_allowed(&calendar) {
+            if !crate::runtime_util::market_activity_allowed_for(
+                &calendar,
+                crate::market::MarketModule::from_settings(&settings),
+            ) {
                 continue;
             }
 
@@ -79,23 +82,31 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
 
 fn catch_up_on_launch(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<()> {
     let settings = state.db.with_conn(get_settings)?;
-    let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
-    let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
-    let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
+    let module = crate::market::MarketModule::from_settings(&settings);
     let calendar = TradingCalendar::default();
 
     block_on_local(async {
-        match crate::ingest::IngestionService::ingest_stocks(
-            &state.db,
-            &client,
-            &state.cache,
-            &calendar,
-            false,
-        )
-        .await
-        {
-            Ok(n) => tracing::info!(target: "ngx_pulse", count = n, "launch stock ingest"),
-            Err(e) => tracing::warn!(target: "ngx_pulse", error = %e, "launch stock ingest failed"),
+        if module == crate::market::MarketModule::Crypto {
+            match crate::crypto::ingest_crypto(&state.db, &state.cache).await {
+                Ok(n) => tracing::info!(target: "crypto", count = n, "launch crypto ingest"),
+                Err(e) => tracing::warn!(target: "crypto", error = %e, "launch crypto ingest failed"),
+            }
+        } else {
+            let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
+            let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
+            let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
+            match crate::ingest::IngestionService::ingest_stocks(
+                &state.db,
+                &client,
+                &state.cache,
+                &calendar,
+                false,
+            )
+            .await
+            {
+                Ok(n) => tracing::info!(target: "ngx_pulse", count = n, "launch stock ingest"),
+                Err(e) => tracing::warn!(target: "ngx_pulse", error = %e, "launch stock ingest failed"),
+            }
         }
         Ok::<_, anyhow::Error>(())
     })?;
@@ -123,9 +134,18 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
     let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
     let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
-    let broker = crate::broker::open_live_broker(&settings);
+    let module = crate::market::MarketModule::from_settings(&settings);
+    let broker = if module.allows_live_broker() {
+        crate::broker::open_live_broker(&settings)
+    } else {
+        None
+    };
     let calendar = TradingCalendar::default();
-    let execute = settings.live_trading_enabled && settings.scheduled_live_authorized;
+    let execute = if !module.allows_live_broker() {
+        true
+    } else {
+        settings.live_trading_enabled && settings.scheduled_live_authorized
+    };
 
     match block_on_local(run_cycle(
         &state.db,

@@ -36,8 +36,18 @@ pub fn enforce_market_hours() -> bool {
     !is_dev()
 }
 
-/// Whether trading/cycle activity is allowed right now given calendar + APP_ENV.
+/// Whether trading/cycle activity is allowed right now given calendar + APP_ENV + module.
 pub fn market_activity_allowed(calendar: &crate::calendar::TradingCalendar) -> bool {
+    market_activity_allowed_for(calendar, crate::market::MarketModule::Stocks)
+}
+
+pub fn market_activity_allowed_for(
+    calendar: &crate::calendar::TradingCalendar,
+    module: crate::market::MarketModule,
+) -> bool {
+    if module == crate::market::MarketModule::Crypto {
+        return true;
+    }
     if !enforce_market_hours() {
         return true;
     }

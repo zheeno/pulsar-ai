@@ -68,6 +68,7 @@ export interface AppSettings {
   maxLiveNotional?: number;
   maxLiveActions?: number;
   retainRawLlmLogs?: boolean;
+  activeModule?: 'stocks' | 'crypto' | string;
 }
 
 export interface PortfolioData {
@@ -89,4 +90,5 @@ export interface PortfolioData {
     message?: string;
   } | null;
   wealthError?: string | null;
+  activeModule?: 'stocks' | 'crypto' | string;
 }
