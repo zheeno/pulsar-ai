@@ -5,9 +5,11 @@ use uuid::Uuid;
 
 use crate::agent::AgentBridge;
 use crate::indicators::IndicatorService;
+use crate::memory;
+use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
-const PORTFOLIO_PROMPT_VERSION: &str = "v2.3.1";
+const PORTFOLIO_PROMPT_VERSION: &str = "v2.4.0";
 const PROMPT_VERSION: &str = "v1.0.0";
 /// LLM may return this many BUY/SELL ideas per cycle. Executed BUYs still use max_daily_trades.
 const LLM_SIGNAL_CAP: usize = 40;
@@ -216,14 +218,37 @@ impl SignalGenerationService {
         });
         Ok(Some((context, valid_symbols, held_symbols, seen, signal_ids, universe_size)))
         })?;
-        let Some((context, valid_symbols, held_symbols, mut seen, mut signal_ids, universe_size)) = prep else {
+        let Some((mut context, valid_symbols, held_symbols, mut seen, mut signal_ids, universe_size)) = prep else {
             return Ok(PortfolioGeneration {
                 signal_ids: vec![],
                 universe_size: 0,
             });
         };
 
-        let result = agent.portfolio_signals(settings, context).await?;
+        let api_key = get_secret(SECRET_LLM_API_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let held_q: String = {
+            let mut v: Vec<_> = held_symbols.iter().cloned().collect();
+            v.sort();
+            v.join(" ")
+        };
+        let tsv = context
+            .get("universeTsv")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let movers: String = tsv.lines().take(20).collect::<Vec<_>>().join(" ");
+        let mem_query = format!("holdings {held_q} {movers}");
+        let retrieved = memory::search_memories(db, settings, &api_key, &mem_query, None, Some(8))
+            .await
+            .unwrap_or_default();
+        if let Some(obj) = context.as_object_mut() {
+            obj.insert("retrievedMemories".into(), json!(retrieved));
+        }
+        let _ = memory::backfill_missing_embeddings(db, settings, &api_key).await;
+
+        let result = agent.portfolio_signals(settings, context, db).await?;
         let signals = result
             .get("output")
             .and_then(|o| o.get("signals"))

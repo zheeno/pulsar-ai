@@ -1,9 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::path::PathBuf;
-use std::time::Instant;
-
-use parking_lot::Mutex;
 
 use crate::agent::AgentBridge;
 use crate::cache::PriceCache;
@@ -16,8 +13,6 @@ pub struct AppState {
     pub agent: AgentBridge,
     pub live_intents: LiveIntentStore,
     cycle_running: AtomicBool,
-    backtest_running: AtomicBool,
-    last_backtest_at: Mutex<Option<Instant>>,
 }
 
 impl AppState {
@@ -28,8 +23,6 @@ impl AppState {
             agent: AgentBridge::new(worker_path),
             live_intents: LiveIntentStore::default(),
             cycle_running: AtomicBool::new(false),
-            backtest_running: AtomicBool::new(false),
-            last_backtest_at: Mutex::new(None),
         })
     }
 
@@ -45,21 +38,6 @@ impl AppState {
 
     pub fn is_cycle_running(&self) -> bool {
         self.cycle_running.load(Ordering::SeqCst)
-    }
-
-    pub fn try_begin_backtest(&self) -> bool {
-        self.backtest_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    }
-
-    pub fn end_backtest(&self) {
-        self.backtest_running.store(false, Ordering::SeqCst);
-        *self.last_backtest_at.lock() = Some(Instant::now());
-    }
-
-    pub fn last_backtest_at(&self) -> Option<Instant> {
-        *self.last_backtest_at.lock()
     }
 }
 

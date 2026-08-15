@@ -34,7 +34,14 @@ interface MockStore {
   trades: Record<string, unknown>[];
   performance: { recorded_at: string; snapshot_date: string; total_equity: number; pnl_daily: number }[];
   strategy: Record<string, unknown>;
-  backtests: Record<string, unknown>;
+  memories: {
+    id: string;
+    kind: string;
+    symbol?: string | null;
+    text: string;
+    source: string;
+    createdAt: string;
+  }[];
 }
 
 function defaultSettings(): Settings {
@@ -110,7 +117,7 @@ function defaultStore(): MockStore {
       position_size_pct: 0.05,
       is_active: true,
     },
-    backtests: {},
+    memories: [],
   };
 }
 
@@ -482,28 +489,26 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       return store.strategy as T;
     }
 
-    case 'start_backtest': {
-      const runId = `bt-${Date.now()}`;
-      const store = loadStore();
-      store.backtests[runId] = {
-        id: runId,
-        status: 'completed',
-        results: {
-          final_equity: 10_500_000,
-          total_trades: 12,
-          win_rate: 0.58,
-          note: 'Browser mock backtest',
-        },
-      };
-      saveStore(store);
-      return runId as T;
+    case 'memory_list': {
+      return [...(loadStore().memories || [])].reverse() as T;
     }
 
-    case 'get_backtest': {
-      const runId = String(args?.runId || '');
-      const run = loadStore().backtests[runId];
-      if (!run) throw new Error('Backtest not found');
-      return run as T;
+    case 'memory_search': {
+      const q = String(args?.query || '').toLowerCase();
+      const symbol = args?.symbol ? String(args.symbol).toUpperCase() : '';
+      return (loadStore().memories || []).filter((m) => {
+        if (symbol && (m.symbol || '').toUpperCase() !== symbol) return false;
+        if (!q) return true;
+        return `${m.text} ${m.symbol || ''} ${m.kind}`.toLowerCase().includes(q);
+      }) as T;
+    }
+
+    case 'memory_delete': {
+      const id = String(args?.id || '');
+      const store = loadStore();
+      store.memories = (store.memories || []).filter((m) => m.id !== id);
+      saveStore(store);
+      return { ok: true } as T;
     }
 
     case 'export_database':

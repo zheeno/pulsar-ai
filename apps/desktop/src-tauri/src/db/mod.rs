@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
+#[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
     pub path: PathBuf,
@@ -50,6 +51,8 @@ impl Database {
             .context("run wealth_positions migration")?;
         conn.execute_batch(include_str!("../../migrations/007_bamboo.sql"))
             .context("run bamboo cache migration")?;
+        conn.execute_batch(include_str!("../../migrations/008_agent_memories.sql"))
+            .context("run agent_memories migration")?;
         Self::add_column_if_missing(conn, "broker_orders", "external_order_ref", "TEXT")?;
         Self::add_column_if_missing(conn, "order_intents", "external_order_ref", "TEXT")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])

@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::app_state::{AppState, CycleGateGuard};
-use crate::backtest::BacktestService;
 use crate::calendar::TradingCalendar;
 use crate::ingest::IngestionService;
 use crate::ngx::NgxPulseClient;
@@ -1244,6 +1243,63 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn memory_list(
+    limit: Option<i64>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::memory::MemoryRecord>, String> {
+    let limit = limit.unwrap_or(200);
+    state
+        .db
+        .with_conn(|conn| crate::memory::list_memories(conn, limit))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn memory_search(
+    query: String,
+    symbol: Option<String>,
+    k: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::memory::MemoryRecord>, String> {
+    let settings = state
+        .db
+        .with_conn(get_settings)
+        .map_err(|e| e.to_string())?;
+    let api_key = get_secret(SECRET_LLM_API_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let q = query.trim();
+    if q.is_empty() {
+        return state
+            .db
+            .with_conn(|conn| crate::memory::list_memories(conn, k.unwrap_or(40) as i64))
+            .map_err(|e| e.to_string());
+    }
+    crate::memory::search_memories(
+        &state.db,
+        &settings,
+        &api_key,
+        q,
+        symbol.as_deref(),
+        k.map(|n| n as usize),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn memory_delete(id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    if id.trim().is_empty() {
+        return Err("Memory id is required".into());
+    }
+    state
+        .db
+        .with_conn(|conn| crate::memory::delete_memory(conn, id.trim()))
+        .map_err(|e| e.to_string())
+}
+
 /// Fast path: local DB + in-memory price cache only (no NGX Pulse network calls).
 #[tauri::command]
 pub fn symbol_detail(
@@ -1567,77 +1623,6 @@ pub fn update_strategy(
         .map_err(|e| e.to_string())?;
 
     get_strategy(state)
-}
-
-#[tauri::command]
-pub async fn start_backtest(
-    strategy_param_set_id: String,
-    start_date: String,
-    end_date: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<String, String> {
-    let start = chrono::NaiveDate::parse_from_str(&start_date, "%Y-%m-%d")
-        .map_err(|_| "startDate must be YYYY-MM-DD".to_string())?;
-    let end = chrono::NaiveDate::parse_from_str(&end_date, "%Y-%m-%d")
-        .map_err(|_| "endDate must be YYYY-MM-DD".to_string())?;
-    if end < start {
-        return Err("endDate must be on or after startDate".into());
-    }
-    if (end - start).num_days() > 365 {
-        return Err("Backtest range cannot exceed 365 days".into());
-    }
-    if let Some(last) = state.last_backtest_at() {
-        if last.elapsed() < std::time::Duration::from_secs(15) {
-            return Err("Please wait before starting another backtest".into());
-        }
-    }
-    if !state.try_begin_backtest() {
-        return Err("A backtest is already running".into());
-    }
-
-    let run_id = match state
-        .db
-        .with_conn(|conn| BacktestService::start_run(conn, &strategy_param_set_id, &start_date, &end_date))
-    {
-        Ok(id) => id,
-        Err(e) => {
-            state.end_backtest();
-            return Err(e.to_string());
-        }
-    };
-
-    let state_clone = state.inner().clone();
-    let run_id_clone = run_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = tokio::task::spawn_blocking(move || {
-            let settings = state_clone.db.with_conn(get_settings).unwrap_or_default();
-            let result = state_clone.db.with_conn(|conn| {
-                block_on_local(BacktestService::run_async(
-                    conn,
-                    &state_clone.agent,
-                    &settings,
-                    &run_id_clone,
-                    &strategy_param_set_id,
-                    &start_date,
-                    &end_date,
-                ))
-            });
-            state_clone.end_backtest();
-            result
-        })
-        .await;
-    });
-
-    Ok(run_id)
-}
-
-#[tauri::command]
-pub fn get_backtest(run_id: String, state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    state
-        .db
-        .with_conn(|conn| BacktestService::get_run(conn, &run_id))
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Backtest not found".to_string())
 }
 
 #[tauri::command]
