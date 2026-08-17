@@ -38,6 +38,7 @@ type BrokerListItem = {
 type WealthProfile = {
   ok: boolean;
   connected: boolean;
+  hasSession?: boolean;
   email?: string | null;
   tradingProfile?: string | null;
   tradingVerified: boolean;
@@ -251,7 +252,6 @@ export default function SettingsPage() {
   const [autoCycleEnabled, setAutoCycleEnabled] = useState(false);
   const [autoCycleMinutes, setAutoCycleMinutes] = useState(30);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
-  const [scheduledLiveAuthorized, setScheduledLiveAuthorized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [strategyBusy, setStrategyBusy] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
@@ -279,7 +279,6 @@ export default function SettingsPage() {
     setAutoCycleEnabled(!!s.autoCycleEnabled);
     setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
     setLiveTradingEnabled(!!s.liveTradingEnabled);
-    setScheduledLiveAuthorized(!!s.scheduledLiveAuthorized);
     setSelectedBroker(s.selectedBroker || 'wealth');
     try {
       setBrokers(await api<BrokerListItem[]>('broker_list'));
@@ -478,7 +477,6 @@ export default function SettingsPage() {
           autoCycleEnabled,
           autoCycleIntervalMinutes: minutes,
           liveTradingEnabled,
-          scheduledLiveAuthorized,
         },
       });
       setSettings({
@@ -486,7 +484,6 @@ export default function SettingsPage() {
         autoCycleEnabled,
         autoCycleIntervalMinutes: minutes,
         liveTradingEnabled,
-        scheduledLiveAuthorized,
       });
       setAutoCycleMinutes(minutes);
       if (autoCycleEnabled) {
@@ -654,7 +651,7 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      {wealth?.connected ? (
+      {wealth?.connected || brokerIsConnected(selectedBroker, settings) ? (
       <section className="panel" aria-labelledby="wealth-heading" style={{ marginTop: 20 }}>
         <h2 id="wealth-heading">{selectedBroker === 'bamboo' ? 'Bamboo' : 'Coronation Wealth'}</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
@@ -662,12 +659,17 @@ export default function SettingsPage() {
             ? 'Cash and lots come from Bamboo. Approved signals place real NGX market orders when live trading is on.'
             : 'Cash and portfolio come from Wealth. Approved signals place real market orders when live trading is on.'}
         </p>
+        {!wealth?.connected && brokerIsConnected(selectedBroker, settings) ? (
+          <div className="banner banner-warn" style={{ marginBottom: 12 }} role="status">
+            {wealth?.message || 'Broker session expired. Sign in again below to restore live mode.'}
+          </div>
+        ) : null}
         <div className="profile-card__badges" style={{ marginBottom: 12 }}>
-          <span className={`status-pill ${wealth.tradingMode === 'live' ? 'status-pill--ok' : 'status-pill--warn'}`}>
-            <span className={`live-dot ${wealth.tradingMode === 'live' ? '' : 'live-dot--off'}`} aria-hidden />
-            {wealth.tradingMode === 'live' ? 'Live trader' : 'Sandbox (not verified)'}
+          <span className={`status-pill ${wealth?.tradingMode === 'live' ? 'status-pill--ok' : 'status-pill--warn'}`}>
+            <span className={`live-dot ${wealth?.tradingMode === 'live' ? '' : 'live-dot--off'}`} aria-hidden />
+            {wealth?.tradingMode === 'live' ? 'Live trader' : 'Sandbox (not verified)'}
           </span>
-          {wealth.tradingProfile ? (
+          {wealth?.tradingProfile ? (
             <span className="status-pill status-pill--muted">
               Trading profile: {wealth.tradingProfile}
             </span>
@@ -676,25 +678,37 @@ export default function SettingsPage() {
         <dl className="profile-meta">
           <div className="profile-meta__item">
             <dt>Account</dt>
-            <dd>{wealth.displayName || wealth.email || '—'}</dd>
+            <dd>{wealth?.displayName || wealth?.email || settings?.bambooPhone || settings?.wealthEmail || '—'}</dd>
           </div>
           <div className="profile-meta__item">
             <dt>Brokerage balance</dt>
             <dd className="mono">
-              {wealth.brokerageBalance != null ? formatNaira(wealth.brokerageBalance) : '—'}
+              {wealth?.brokerageBalance != null ? formatNaira(wealth.brokerageBalance) : '—'}
             </dd>
           </div>
         </dl>
-        {!wealth.ok && (
+        {wealth && !wealth.ok && wealth.connected && (
           <div className="banner banner-bad" style={{ marginTop: 12 }} role="status">
             {wealth.message}
           </div>
         )}
-        {wealth.ok && !wealth.tradingVerified && (
+        {wealth?.ok && !wealth.tradingVerified && (
           <div className="banner banner-warn" style={{ marginTop: 12 }} role="status">
             {wealth.message}
           </div>
         )}
+        {!wealth?.connected && brokerIsConnected(selectedBroker, settings) ? (
+          <div style={{ marginTop: 16 }}>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={wealthBusy}
+              onClick={() => setBrokerModalOpen(true)}
+            >
+              Reconnect {selectedBroker === 'bamboo' ? 'Bamboo' : 'Wealth'}
+            </button>
+          </div>
+        ) : null}
         <div style={{ marginTop: 16 }}>
           <button
             type="button"
@@ -847,7 +861,8 @@ export default function SettingsPage() {
           <div className="toggle-row__copy">
             <label className="toggle-row__label">Enable live trading</label>
             <p className="toggle-row__hint">
-              Required before any Wealth order is submitted. Manual live cycles still ask for a confirmation token.
+              When on, Pulsar submits real broker orders for scheduled cycles, manual cycles, stop-loss, and
+              take-profit — no per-cycle confirmation. Turn off anytime to generate signals only.
             </p>
           </div>
           <button
@@ -857,25 +872,6 @@ export default function SettingsPage() {
             className={`toggle ${liveTradingEnabled ? 'is-on' : ''}`}
             disabled={cycleBusy}
             onClick={() => setLiveTradingEnabled((v) => !v)}
-          >
-            <span className="toggle__thumb" />
-          </button>
-        </div>
-
-        <div className="toggle-row">
-          <div className="toggle-row__copy">
-            <label className="toggle-row__label">Authorize scheduled live cycles</label>
-            <p className="toggle-row__hint">
-              Recurring live execution for the scheduler. Revoke anytime; the next cycle is blocked immediately.
-            </p>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={scheduledLiveAuthorized}
-            className={`toggle ${scheduledLiveAuthorized ? 'is-on' : ''}`}
-            disabled={cycleBusy || !liveTradingEnabled}
-            onClick={() => setScheduledLiveAuthorized((v) => !v)}
           >
             <span className="toggle__thumb" />
           </button>

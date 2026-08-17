@@ -13,8 +13,9 @@ use serde_json::Value;
 use crate::http_client::http_client;
 use crate::runtime_util::is_dev;
 use crate::secrets::{
-    delete_secret, get_secret, set_secret, SECRET_WEALTH_PASSWORD, SECRET_WEALTH_REFRESH_TOKEN,
-    SECRET_WEALTH_TOKEN, SECRET_WEALTH_TOKEN_EXPIRES,
+    delete_secret, get_secret, load_stored_session, set_secret, SessionRestoreKind,
+    SECRET_WEALTH_PASSWORD, SECRET_WEALTH_REFRESH_TOKEN, SECRET_WEALTH_TOKEN,
+    SECRET_WEALTH_TOKEN_EXPIRES,
 };
 use crate::settings::AppSettings;
 
@@ -200,6 +201,8 @@ pub struct WealthProfileStatus {
     pub base_url: String,
     pub message: String,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub has_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -257,22 +260,32 @@ pub struct WealthClient {
 
 impl WealthClient {
     pub fn from_settings(settings: &AppSettings, password: Option<String>) -> Self {
-        let token = get_secret(SECRET_WEALTH_TOKEN).ok().flatten();
-        let expires = get_secret(SECRET_WEALTH_TOKEN_EXPIRES)
-            .ok()
-            .flatten()
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&Utc));
-
-        let session = match (token, expires) {
-            (Some(access_token), Some(expires_at)) if !access_token.is_empty() => {
-                Some(SessionToken {
-                    access_token,
-                    expires_at,
+        let session = load_stored_session(SECRET_WEALTH_TOKEN, SECRET_WEALTH_TOKEN_EXPIRES).map(
+            |stored| SessionToken {
+                access_token: stored.access_token,
+                expires_at: stored.expires_at,
+            },
+        );
+        tracing::info!(
+            target: "wealth",
+            hydrated = session.is_some(),
+            kind = ?session
+                .as_ref()
+                .map(|s| {
+                    if crate::secrets::token_unexpired(s.expires_at) {
+                        SessionRestoreKind::Valid
+                    } else {
+                        SessionRestoreKind::Expired
+                    }
                 })
-            }
-            _ => None,
-        };
+                .unwrap_or(SessionRestoreKind::Missing),
+            expires_at = session
+                .as_ref()
+                .map(|s| s.expires_at.to_rfc3339())
+                .unwrap_or_default(),
+            connected_flag = settings.wealth_connected,
+            "wealth session hydrate from vault"
+        );
 
         Self {
             http: http_client().expect("http client"),
@@ -293,6 +306,21 @@ impl WealthClient {
                 .ok()
                 .flatten()
                 .is_some_and(|t| !t.is_empty())
+    }
+
+    pub(crate) fn session_restore_kind(&self) -> SessionRestoreKind {
+        if let Some(tok) = self.tokens.lock().unwrap().as_ref() {
+            if crate::secrets::token_unexpired(tok.expires_at) {
+                return SessionRestoreKind::Valid;
+            }
+            return SessionRestoreKind::Expired;
+        }
+        crate::secrets::stored_session_kind(SECRET_WEALTH_TOKEN, SECRET_WEALTH_TOKEN_EXPIRES)
+    }
+
+    /// Restore an expired/missing token using stored credentials when possible.
+    pub async fn ensure_session(&self) -> Result<()> {
+        self.access_token().await.map(|_| ())
     }
 
     pub async fn login(&self, email: &str, password: &str) -> Result<WealthLoginResult> {
@@ -457,14 +485,9 @@ impl WealthClient {
             )
         })?;
 
-        let ttl_mins = extract_ttl_minutes(body).unwrap_or(60);
-        let expires_at = body
-            .get("refresh_token_ttl")
-            .or_else(|| body.get("refresh_ttl"))
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(ttl_mins.max(1)));
+        let expires_at = extract_access_expiry(body)
+            .or_else(|| crate::secrets::jwt_expiry(&token))
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(60));
 
         set_secret(SECRET_WEALTH_TOKEN, &token)?;
         set_secret(SECRET_WEALTH_TOKEN_EXPIRES, &expires_at.to_rfc3339())?;
@@ -489,44 +512,52 @@ impl WealthClient {
             target: "wealth",
             email = %email,
             expires_at = %expires_at.to_rfc3339(),
-            ttl_mins,
             "wealth auth persisted"
         );
         Ok(())
     }
 
-    async fn access_token(&self) -> Result<String> {
+    fn restore_valid_token(&self) -> Option<String> {
         {
             let guard = self.tokens.lock().unwrap();
             if let Some(tok) = guard.as_ref() {
-                if tok.expires_at > Utc::now() + chrono::Duration::seconds(30) {
-                    return Ok(tok.access_token.clone());
+                if crate::secrets::token_unexpired(tok.expires_at) {
+                    return Some(tok.access_token.clone());
                 }
             }
         }
+        if let Some(stored) = load_stored_session(SECRET_WEALTH_TOKEN, SECRET_WEALTH_TOKEN_EXPIRES) {
+            let valid = crate::secrets::token_unexpired(stored.expires_at);
+            *self.tokens.lock().unwrap() = Some(SessionToken {
+                access_token: stored.access_token.clone(),
+                expires_at: stored.expires_at,
+            });
+            if valid {
+                tracing::info!(
+                    target: "wealth",
+                    expires_at = %stored.expires_at.to_rfc3339(),
+                    "wealth access token restored from vault"
+                );
+                return Some(stored.access_token);
+            }
+            tracing::info!(
+                target: "wealth",
+                expires_at = %stored.expires_at.to_rfc3339(),
+                "wealth stored token expired; will refresh or relogin"
+            );
+        }
+        None
+    }
 
-        if let Ok(Some(stored)) = get_secret(SECRET_WEALTH_TOKEN) {
-            if !stored.is_empty() {
-                if self.refresh_token().await.is_ok() {
-                    if let Some(tok) = self.tokens.lock().unwrap().as_ref() {
-                        return Ok(tok.access_token.clone());
-                    }
-                }
-                // Fall through to re-login if refresh fails but we still have a stored token.
-                let expires = get_secret(SECRET_WEALTH_TOKEN_EXPIRES)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|d| d.with_timezone(&Utc));
-                if let Some(exp) = expires {
-                    if exp > Utc::now() {
-                        *self.tokens.lock().unwrap() = Some(SessionToken {
-                            access_token: stored.clone(),
-                            expires_at: exp,
-                        });
-                        return Ok(stored);
-                    }
-                }
+    async fn access_token(&self) -> Result<String> {
+        if let Some(token) = self.restore_valid_token() {
+            return Ok(token);
+        }
+
+        if self.has_session() && self.refresh_token().await.is_ok() {
+            if let Some(tok) = self.tokens.lock().unwrap().as_ref() {
+                tracing::info!(target: "wealth", "wealth token refreshed silently");
+                return Ok(tok.access_token.clone());
             }
         }
 
@@ -536,6 +567,7 @@ impl WealthClient {
                 .clone()
                 .or_else(|| get_secret(SECRET_WEALTH_PASSWORD).ok().flatten()),
         ) {
+            tracing::info!(target: "wealth", email = %email, "wealth silent password relogin");
             let result = self.login(&email, &password).await?;
             if result.ok && !result.needs_2fa {
                 if let Some(tok) = self.tokens.lock().unwrap().as_ref() {
@@ -573,14 +605,22 @@ impl WealthClient {
                     json_keys_preview(&body)
                 )
             })?;
-        let ttl_mins = auth
-            .get("ttl")
-            .or_else(|| body.get("ttl"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(60.0) as i64;
-        let expires_at = Utc::now() + chrono::Duration::minutes(ttl_mins.max(1));
+        let expires_at = extract_access_expiry(&auth)
+            .or_else(|| extract_access_expiry(&body))
+            .or_else(|| crate::secrets::jwt_expiry(&token))
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(60));
         set_secret(SECRET_WEALTH_TOKEN, &token)?;
         set_secret(SECRET_WEALTH_TOKEN_EXPIRES, &expires_at.to_rfc3339())?;
+        if let Some(refresh) = auth
+            .get("refresh_token")
+            .or_else(|| body.get("refresh_token"))
+            .or_else(|| auth.get("refreshToken"))
+            .or_else(|| body.get("refreshToken"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let _ = set_secret(SECRET_WEALTH_REFRESH_TOKEN, refresh);
+        }
         *self.tokens.lock().unwrap() = Some(SessionToken {
             access_token: token,
             expires_at,
@@ -667,6 +707,7 @@ impl WealthClient {
         let base = WealthProfileStatus {
             ok: false,
             connected: settings.wealth_connected && self.has_session(),
+            has_session: self.has_session(),
             email: settings.wealth_email.clone(),
             trading_profile: None,
             trading_verified: false,
@@ -679,8 +720,15 @@ impl WealthClient {
             display_name: None,
         };
 
-        if !settings.wealth_connected || !self.has_session() {
+        if !settings.wealth_connected {
             return base;
+        }
+        if let Err(e) = self.ensure_session().await {
+            return WealthProfileStatus {
+                connected: false,
+                message: format!("Wealth session expired — reconnect in Settings. {e}"),
+                ..base
+            };
         }
 
         match self.get_profile_raw().await {
@@ -754,6 +802,7 @@ impl WealthClient {
                         )
                     },
                     display_name,
+                    has_session: true,
                 }
             }
             Err(e) => {
@@ -771,6 +820,7 @@ impl WealthClient {
                     base_url: self.base_url.clone(),
                     message: format!("Could not load Wealth profile: {e}"),
                     display_name: None,
+                    has_session: true,
                 }
             }
         }
@@ -778,7 +828,7 @@ impl WealthClient {
 
     /// Live order routing requires a verified trading profile.
     pub async fn resolve_trading_mode(&self, settings: &AppSettings) -> TradingMode {
-        if !settings.wealth_connected || !self.has_session() {
+        if !settings.wealth_connected || self.ensure_session().await.is_err() {
             return TradingMode::Sandbox;
         }
         let status = self.profile_status(settings).await;
@@ -1038,6 +1088,33 @@ fn extract_ttl_minutes(body: &Value) -> Option<i64> {
     } else {
         Some(raw as i64)
     }
+}
+
+fn extract_access_expiry(body: &Value) -> Option<DateTime<Utc>> {
+    const KEYS: &[&str] = &[
+        "expires_at",
+        "expiresAt",
+        "expiration_time",
+        "expirationTime",
+        "expiry",
+        "access_token_expires_at",
+    ];
+    for key in KEYS {
+        if let Some(v) = body.get(*key) {
+            if let Some(s) = v.as_str() {
+                if let Some(dt) = crate::secrets::parse_expiry_datetime(s) {
+                    return Some(dt);
+                }
+            }
+            if let Some(n) = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)) {
+                if let Some(dt) = crate::secrets::parse_expiry_datetime(&n.to_string()) {
+                    return Some(dt);
+                }
+            }
+        }
+    }
+    extract_ttl_minutes(body)
+        .map(|mins| Utc::now() + chrono::Duration::minutes(mins.max(1)))
 }
 
 fn find_trading_profile(value: &Value) -> Option<String> {
@@ -1602,5 +1679,162 @@ mod tests {
             }],
         };
         assert_eq!(book.market_value(), 1262.6);
+    }
+
+    fn future_rfc3339() -> String {
+        (Utc::now() + chrono::Duration::hours(2)).to_rfc3339()
+    }
+
+    fn past_rfc3339() -> String {
+        (Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+    }
+
+    #[test]
+    fn hydrate_from_vault_after_restart() {
+        let _g = crate::secrets::vault_test_guard();
+        let dir = std::env::temp_dir().join(format!("pulsar-wealth-hydrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::secrets::init(&dir);
+        crate::secrets::set_secret(SECRET_WEALTH_TOKEN, "live-token").unwrap();
+        crate::secrets::set_secret(SECRET_WEALTH_TOKEN_EXPIRES, &future_rfc3339()).unwrap();
+        crate::secrets::simulate_restart();
+        crate::secrets::preload();
+
+        let mut settings = AppSettings::default();
+        settings.wealth_connected = true;
+        let client = WealthClient::from_settings(&settings, None);
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Valid);
+        assert_eq!(
+            client.tokens.lock().unwrap().as_ref().map(|t| t.access_token.as_str()),
+            Some("live-token")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_token_restores_even_when_connected_flag_true() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[
+            (SECRET_WEALTH_TOKEN, "tok"),
+            (SECRET_WEALTH_TOKEN_EXPIRES, &future_rfc3339()),
+        ]);
+        let mut settings = AppSettings::default();
+        settings.wealth_connected = true;
+        let client = WealthClient::from_settings(&settings, None);
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Valid);
+        assert_eq!(client.restore_valid_token().as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn expired_token_hydrates_and_needs_refresh() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[
+            (SECRET_WEALTH_TOKEN, "old-tok"),
+            (SECRET_WEALTH_TOKEN_EXPIRES, &past_rfc3339()),
+        ]);
+        let mut settings = AppSettings::default();
+        settings.wealth_connected = true;
+        settings.wealth_email = Some("user@example.com".into());
+        let client = WealthClient::from_settings(&settings, Some("pw".into()));
+        assert!(
+            client.has_session(),
+            "expired token must still count as a session so refresh/relogin can run"
+        );
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Expired);
+        assert!(client.restore_valid_token().is_none());
+    }
+
+    #[test]
+    fn missing_vault_does_not_fake_session() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[]);
+        let mut settings = AppSettings::default();
+        settings.wealth_connected = true;
+        settings.wealth_email = Some("user@example.com".into());
+        let client = WealthClient::from_settings(&settings, None);
+        assert!(!client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Missing);
+        assert!(client.restore_valid_token().is_none());
+    }
+
+    #[test]
+    fn unix_expiry_and_clock_skew_parse() {
+        let _g = crate::secrets::vault_test_guard();
+        let exp = Utc::now() + chrono::Duration::hours(1);
+        crate::secrets::seed_vault(&[
+            (SECRET_WEALTH_TOKEN, "unix-tok"),
+            (SECRET_WEALTH_TOKEN_EXPIRES, &exp.timestamp().to_string()),
+        ]);
+        let client = WealthClient::from_settings(&AppSettings::default(), None);
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Valid);
+        assert_eq!(client.restore_valid_token().as_deref(), Some("unix-tok"));
+
+        crate::secrets::seed_vault(&[
+            (SECRET_WEALTH_TOKEN, "skew-tok"),
+            (
+                SECRET_WEALTH_TOKEN_EXPIRES,
+                &(Utc::now() + chrono::Duration::seconds(10)).to_rfc3339(),
+            ),
+        ]);
+        let client = WealthClient::from_settings(&AppSettings::default(), None);
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Expired);
+        assert!(client.restore_valid_token().is_none());
+    }
+
+    #[test]
+    fn token_without_expires_secret_still_has_session() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[(SECRET_WEALTH_TOKEN, "bare-tok")]);
+        let client = WealthClient::from_settings(&AppSettings::default(), None);
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Valid);
+        assert_eq!(client.restore_valid_token().as_deref(), Some("bare-tok"));
+    }
+
+    #[test]
+    fn has_session_matches_restore_valid_token_for_live_token() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[
+            (SECRET_WEALTH_TOKEN, "live"),
+            (SECRET_WEALTH_TOKEN_EXPIRES, &future_rfc3339()),
+        ]);
+        let client = WealthClient::from_settings(&AppSettings::default(), None);
+        assert_eq!(client.has_session(), client.restore_valid_token().is_some());
+    }
+
+    #[test]
+    fn ttl_minutes_stored_expiry_does_not_kill_fresh_jwt() {
+        let _g = crate::secrets::vault_test_guard();
+        let exp = Utc::now().timestamp() + 3600;
+        let payload = serde_json::json!({ "exp": exp, "sub": "1" });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw)
+        };
+        let jwt = format!("eyJhbGciOiJub25lIn0.{b64}.sig");
+        crate::secrets::seed_vault(&[
+            (SECRET_WEALTH_TOKEN, jwt.as_str()),
+            (SECRET_WEALTH_TOKEN_EXPIRES, "60"),
+        ]);
+        let mut settings = AppSettings::default();
+        settings.wealth_connected = true;
+        let client = WealthClient::from_settings(&settings, None);
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Valid);
+        assert!(client.restore_valid_token().is_some());
+    }
+
+    #[test]
+    fn extract_access_expiry_prefers_explicit_timestamp() {
+        let body = json!({
+            "ttl": 1,
+            "expires_at": "2026-08-17T21:00:00Z"
+        });
+        let exp = extract_access_expiry(&body).unwrap();
+        assert_eq!(exp.timestamp(), 1_787_000_400);
     }
 }

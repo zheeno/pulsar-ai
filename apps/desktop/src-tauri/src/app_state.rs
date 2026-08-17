@@ -4,14 +4,12 @@ use std::path::PathBuf;
 
 use crate::agent::AgentBridge;
 use crate::cache::PriceCache;
-use crate::cycle_auth::LiveIntentStore;
 use crate::db::Database;
 
 pub struct AppState {
     pub db: Database,
     pub cache: PriceCache,
     pub agent: AgentBridge,
-    pub live_intents: LiveIntentStore,
     cycle_running: AtomicBool,
 }
 
@@ -21,7 +19,6 @@ impl AppState {
             db,
             cache: PriceCache::new(2400),
             agent: AgentBridge::new(worker_path),
-            live_intents: LiveIntentStore::default(),
             cycle_running: AtomicBool::new(false),
         })
     }

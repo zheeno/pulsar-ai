@@ -110,13 +110,15 @@ pub fn catalog(settings: &AppSettings) -> Vec<BrokerListItem> {
             id: BrokerId::Wealth,
             name: BrokerId::Wealth.display_name().into(),
             available: true,
-            connected: settings.wealth_connected,
+            connected: settings.wealth_connected
+                && crate::secrets::secret_present(crate::secrets::SECRET_WEALTH_TOKEN),
         },
         BrokerListItem {
             id: BrokerId::Bamboo,
             name: BrokerId::Bamboo.display_name().into(),
             available: true,
-            connected: settings.bamboo_connected,
+            connected: settings.bamboo_connected
+                && crate::secrets::secret_present(crate::secrets::SECRET_BAMBOO_TOKEN),
         },
     ]
 }
@@ -380,11 +382,28 @@ mod tests {
 
     #[test]
     fn catalog_marks_bamboo_available() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[(crate::secrets::SECRET_BAMBOO_TOKEN, "live-jwt")]);
         let mut settings = AppSettings::default();
         settings.bamboo_connected = true;
         let list = catalog(&settings);
         let bamboo = list.iter().find(|b| b.id == BrokerId::Bamboo).unwrap();
         assert!(bamboo.available);
         assert!(bamboo.connected);
+    }
+
+    #[test]
+    fn catalog_connected_requires_vault_token() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[]);
+        let mut settings = AppSettings::default();
+        settings.bamboo_connected = true;
+        settings.wealth_connected = true;
+        let list = catalog(&settings);
+        let bamboo = list.iter().find(|b| b.id == BrokerId::Bamboo).unwrap();
+        let wealth = list.iter().find(|b| b.id == BrokerId::Wealth).unwrap();
+        assert!(bamboo.available);
+        assert!(!bamboo.connected);
+        assert!(!wealth.connected);
     }
 }

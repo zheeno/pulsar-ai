@@ -312,27 +312,12 @@ export default function DashboardPage() {
     if (cycleRunning || cycleBusy) return;
     setCycleBusy(true);
     try {
-      const first = await api<{
-        pendingLive?: boolean;
-        confirmationToken?: string;
-        signals?: number;
+      const result = await api<{
         liveDisabled?: boolean;
+        executed?: number;
+        signals?: number;
       }>('cycle_run');
-      if (first?.pendingLive && first.confirmationToken) {
-        const n = first.signals ?? 0;
-        const ok = window.confirm(
-          `Confirm live execution of ${n} signal(s)? This places real Wealth orders.`,
-        );
-        if (ok) {
-          const bulk = window.confirm(
-            'Allow bulk liquidation above 25% of portfolio? Click Cancel to keep the 25% cap.',
-          );
-          await api('cycle_run', {
-            confirmationToken: first.confirmationToken,
-            allowBulkLiquidation: bulk,
-          });
-        }
-      } else if (first?.liveDisabled) {
+      if (result?.liveDisabled) {
         toast.warning('Live trading is off in Settings — signals were generated only.', 'Cycle');
       }
       void loadData();

@@ -1272,7 +1272,6 @@ pub async fn run_cycle(
     client: &crate::ngx::NgxPulseClient,
     calendar: &crate::calendar::TradingCalendar,
     broker: Option<&crate::broker::BrokerSession>,
-    execute: bool,
     allow_bulk_liquidation: bool,
     cycle_id: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -1294,12 +1293,13 @@ pub async fn run_cycle(
     } else {
         crate::wealth::TradingMode::Sandbox
     };
+    let do_execute = settings.should_execute(trading_mode);
 
     let mut live_snap: Option<crate::wealth::WealthPortfolioSnapshot> = None;
     let (cash_for_agent, trading_venue, live_holdings) =
         if trading_mode == crate::wealth::TradingMode::Live {
             if let Some(session) = broker {
-                if execute {
+                if do_execute {
                     let _ = crate::execution::ExecutionService::reconcile_if_possible(db, session).await;
                 }
                 let book = match session.refresh_book(db).await {
@@ -1356,23 +1356,16 @@ pub async fn run_cycle(
 
     let live_market_open = if trading_mode == crate::wealth::TradingMode::Live {
         match broker {
-            Some(session) => match session.market_is_open().await {
-                Ok(open) => open,
-                Err(e) => {
-                    warnings.push(format!("Could not check {} market status: {e}", session.display_name()));
-                    false
-                }
-            },
+            Some(session) => {
+                crate::runtime_util::live_broker_market_open(session, calendar).await
+            }
             None => false,
         }
     } else {
         true
     };
 
-    let do_execute = match trading_mode {
-        crate::wealth::TradingMode::Sandbox => true,
-        crate::wealth::TradingMode::Live => execute && settings.live_trading_enabled,
-    };
+    let skip_result = settings.cycle_skip_result(trading_mode);
 
     let (executed, exec_warnings) = crate::execution::ExecutionService::process_signals(
         db,
@@ -1385,13 +1378,14 @@ pub async fn run_cycle(
         do_execute,
         allow_bulk_liquidation,
         cycle_id,
+        skip_result,
     )
     .await?;
     warnings.extend(exec_warnings);
 
     if trading_mode == crate::wealth::TradingMode::Sandbox {
         db.with_conn(|conn| crate::portfolio::DailySnapshotService::create_snapshot(conn, cache, None))?;
-    } else if execute {
+    } else if do_execute {
         if let Some(session) = broker {
             if let Ok(book) = session.refresh_book(db).await {
                 let _ = db.with_conn(|conn| {

@@ -125,7 +125,6 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
     let client = crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
     let broker = crate::broker::open_live_broker(&settings);
     let calendar = TradingCalendar::default();
-    let execute = settings.live_trading_enabled && settings.scheduled_live_authorized;
 
     match block_on_local(run_cycle(
         &state.db,
@@ -135,7 +134,6 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
         &client,
         &calendar,
         broker.as_ref(),
-        execute,
         false,
         None,
     )) {

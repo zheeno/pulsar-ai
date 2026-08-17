@@ -2,6 +2,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::wealth::TradingMode;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -33,11 +35,9 @@ pub struct AppSettings {
     pub bamboo_phone: Option<String>,
     /// True when a Bamboo session has been established.
     pub bamboo_connected: bool,
-    /// User must opt in before any live order is submitted.
+    /// When true, submit live broker orders (cycles, stop-loss, take-profit). When false, signals only.
     pub live_trading_enabled: bool,
-    /// Recurring authorization for scheduled live cycles.
-    pub scheduled_live_authorized: bool,
-    /// Max notional (NGN) per scheduled/manual live cycle.
+    /// Max notional (NGN) per live cycle order.
     pub max_live_notional: f64,
     /// Max live actions per cycle (backend cap).
     pub max_live_actions: u32,
@@ -69,7 +69,6 @@ impl Default for AppSettings {
             bamboo_phone: None,
             bamboo_connected: false,
             live_trading_enabled: false,
-            scheduled_live_authorized: false,
             max_live_notional: 500_000.0,
             max_live_actions: 10,
             retain_raw_llm_logs: false,
@@ -115,7 +114,12 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
             "bamboo_phone" => settings.bamboo_phone = Some(value),
             "bamboo_connected" => settings.bamboo_connected = value == "true",
             "live_trading_enabled" => settings.live_trading_enabled = value == "true",
-            "scheduled_live_authorized" => settings.scheduled_live_authorized = value == "true",
+            "scheduled_live_authorized" => {
+                // Legacy key: treat as live_trading_enabled if user had scheduled auth on.
+                if value == "true" {
+                    settings.live_trading_enabled = true;
+                }
+            }
             "max_live_notional" => {
                 settings.max_live_notional = value.parse().unwrap_or(500_000.0)
             }
@@ -236,15 +240,6 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
             "false"
         },
     )?;
-    set_setting(
-        conn,
-        "scheduled_live_authorized",
-        if settings.scheduled_live_authorized {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
     set_setting(conn, "max_live_notional", &settings.max_live_notional.to_string())?;
     set_setting(conn, "max_live_actions", &settings.max_live_actions.to_string())?;
     set_setting(
@@ -286,6 +281,65 @@ pub fn validate_numeric_settings(settings: &AppSettings) -> Result<()> {
     Ok(())
 }
 
+impl AppSettings {
+    /// Shared execute gate for manual cycles, scheduled cycles, and risk-monitor exits.
+    ///
+    /// `None` means submit orders. `Some(status)` is persisted and no fill is attempted.
+    /// There is no per-cycle confirmation token.
+    ///
+    /// Live toggle on + `TradingMode::Sandbox` means the broker session is not live
+    /// (restore failed / unverified). Do not invent a live session and do not silently
+    /// fill sandbox positions.
+    pub fn execution_skip(
+        &self,
+        trading_mode: TradingMode,
+        live_market_open: bool,
+    ) -> Option<&'static str> {
+        match trading_mode {
+            TradingMode::Sandbox => {
+                if self.live_trading_enabled {
+                    Some("BLOCKED_BROKER")
+                } else {
+                    None
+                }
+            }
+            TradingMode::Live => {
+                if !self.live_trading_enabled {
+                    Some("BLOCKED_LIVE_DISABLED")
+                } else if !live_market_open {
+                    Some("BLOCKED_MARKET_CLOSED")
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Whether to submit trades (market hours applied separately for live via `execution_skip`).
+    pub fn should_execute(&self, trading_mode: TradingMode) -> bool {
+        self.execution_skip(trading_mode, true).is_none()
+    }
+
+    /// Live protective exits (stop-loss / take-profit) also require an open market.
+    pub fn should_execute_risk_exits(&self, trading_mode: TradingMode, live_market_open: bool) -> bool {
+        self.execution_skip(trading_mode, live_market_open).is_none()
+    }
+
+    /// Status to persist when cycle execution was skipped (assumes market open).
+    pub fn cycle_skip_result(&self, trading_mode: TradingMode) -> Option<&'static str> {
+        self.execution_skip(trading_mode, true)
+    }
+
+    /// Status to persist when risk-monitor exits were skipped (never PENDING_CONFIRM).
+    pub fn risk_exit_skip_result(
+        &self,
+        trading_mode: TradingMode,
+        live_market_open: bool,
+    ) -> Option<&'static str> {
+        self.execution_skip(trading_mode, live_market_open)
+    }
+}
+
 /// Clear user session fields after logout (keeps LLM provider/model preferences and portfolio DB).
 pub fn clear_session_settings(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM settings WHERE key = 'pulse_email'", [])?;
@@ -297,7 +351,6 @@ pub fn clear_session_settings(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM settings WHERE key = 'bamboo_phone'", [])?;
     set_setting(conn, "bamboo_connected", "false")?;
     set_setting(conn, "live_trading_enabled", "false")?;
-    set_setting(conn, "scheduled_live_authorized", "false")?;
     clear_wealth_cache(conn)?;
     clear_bamboo_cache(conn)?;
     Ok(())
@@ -307,7 +360,6 @@ pub fn clear_wealth_settings(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM settings WHERE key = 'wealth_email'", [])?;
     set_setting(conn, "wealth_connected", "false")?;
     set_setting(conn, "live_trading_enabled", "false")?;
-    set_setting(conn, "scheduled_live_authorized", "false")?;
     clear_wealth_cache(conn)?;
     Ok(())
 }
@@ -316,7 +368,6 @@ pub fn clear_bamboo_settings(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM settings WHERE key = 'bamboo_phone'", [])?;
     set_setting(conn, "bamboo_connected", "false")?;
     set_setting(conn, "live_trading_enabled", "false")?;
-    set_setting(conn, "scheduled_live_authorized", "false")?;
     clear_bamboo_cache(conn)?;
     Ok(())
 }
@@ -355,4 +406,97 @@ pub fn mark_onboarding_complete(conn: &Connection) -> Result<()> {
     set_setting(conn, "llm_configured", "true")?;
     set_setting(conn, "onboarding_complete", "true")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wealth::TradingMode;
+
+    fn live_on() -> AppSettings {
+        let mut s = AppSettings::default();
+        s.live_trading_enabled = true;
+        s
+    }
+
+    #[test]
+    fn should_execute_shares_live_trading_enabled_gate() {
+        let mut off = AppSettings::default();
+        off.live_trading_enabled = false;
+        assert!(off.should_execute(TradingMode::Sandbox));
+        assert!(!off.should_execute(TradingMode::Live));
+        assert!(off.should_execute_risk_exits(TradingMode::Sandbox, false));
+        assert!(!off.should_execute_risk_exits(TradingMode::Live, true));
+
+        let on = live_on();
+        assert!(!on.should_execute(TradingMode::Sandbox));
+        assert!(on.should_execute(TradingMode::Live));
+        assert!(on.should_execute_risk_exits(TradingMode::Live, true));
+        assert!(!on.should_execute_risk_exits(TradingMode::Live, false));
+        assert_eq!(
+            on.should_execute(TradingMode::Live),
+            on.should_execute_risk_exits(TradingMode::Live, true)
+        );
+    }
+
+    #[test]
+    fn skip_statuses_are_distinct_and_never_pending_confirm() {
+        let mut off = AppSettings::default();
+        off.live_trading_enabled = false;
+        assert_eq!(
+            off.cycle_skip_result(TradingMode::Live),
+            Some("BLOCKED_LIVE_DISABLED")
+        );
+        assert_eq!(
+            off.risk_exit_skip_result(TradingMode::Live, true),
+            Some("BLOCKED_LIVE_DISABLED")
+        );
+        assert_eq!(
+            off.risk_exit_skip_result(TradingMode::Live, false),
+            Some("BLOCKED_LIVE_DISABLED")
+        );
+        assert_eq!(off.cycle_skip_result(TradingMode::Sandbox), None);
+
+        let on = live_on();
+        assert_eq!(on.cycle_skip_result(TradingMode::Live), None);
+        assert_eq!(on.risk_exit_skip_result(TradingMode::Live, true), None);
+        assert_eq!(
+            on.risk_exit_skip_result(TradingMode::Live, false),
+            Some("BLOCKED_MARKET_CLOSED")
+        );
+        assert_eq!(
+            on.execution_skip(TradingMode::Sandbox, true),
+            Some("BLOCKED_BROKER")
+        );
+        assert_ne!(
+            on.cycle_skip_result(TradingMode::Live),
+            Some("BLOCKED_PENDING_CONFIRM")
+        );
+        assert_ne!(
+            off.cycle_skip_result(TradingMode::Live),
+            Some("BLOCKED_PENDING_CONFIRM")
+        );
+        for status in [
+            off.execution_skip(TradingMode::Live, true),
+            on.execution_skip(TradingMode::Live, false),
+            on.execution_skip(TradingMode::Sandbox, true),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert_ne!(status, "BLOCKED_PENDING_CONFIRM");
+            assert_ne!(status, "BLOCKED_OTHER");
+        }
+    }
+
+    #[test]
+    fn live_on_but_sandbox_mode_does_not_fill_sandbox() {
+        let on = live_on();
+        assert!(!on.should_execute(TradingMode::Sandbox));
+        assert!(!on.should_execute_risk_exits(TradingMode::Sandbox, true));
+        assert_eq!(
+            on.execution_skip(TradingMode::Sandbox, true),
+            Some("BLOCKED_BROKER")
+        );
+    }
 }

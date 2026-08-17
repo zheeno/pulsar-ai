@@ -32,7 +32,6 @@ export const AppSettingsSchema = z.object({
   autoCycleEnabled: z.boolean().default(false),
   autoCycleIntervalMinutes: z.number().int().min(5).max(120).default(30),
   liveTradingEnabled: z.boolean().default(false),
-  scheduledLiveAuthorized: z.boolean().default(false),
   maxLiveNotional: z.number().min(1000).max(50_000_000).default(500_000),
   maxLiveActions: z.number().int().min(1).max(40).default(10),
   retainRawLlmLogs: z.boolean().default(false),

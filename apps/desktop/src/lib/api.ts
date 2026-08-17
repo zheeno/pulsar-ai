@@ -19,7 +19,6 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
 
   if (command === 'cycle_run') {
     return {
-      confirmation_token: args.confirmationToken,
       allow_bulk_liquidation: args.allowBulkLiquidation,
     };
   }
@@ -64,7 +63,6 @@ export interface AppSettings {
   bambooPhone?: string | null;
   bambooConnected?: boolean;
   liveTradingEnabled?: boolean;
-  scheduledLiveAuthorized?: boolean;
   maxLiveNotional?: number;
   maxLiveActions?: number;
   retainRawLlmLogs?: boolean;

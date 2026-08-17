@@ -337,30 +337,33 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
 
         if let Some(session) = crate::broker::open_live_broker(&settings) {
             live_broker = session.id();
-            let book = match block_on_local(session.refresh_book(&state.db)) {
-                Ok(b) => Some(b),
-                Err(_) => session.load_book(&state.db).ok().flatten(),
-            };
-            if let Some(book) = book {
-                trading_mode = "live";
-                cash = book.brokerage_balance;
-                live_pnl_fallback = Some(wealth_pnl_today(&state, live_broker.as_str(), book.profit));
-                wealth_synced_at = Some(book.synced_at.clone());
-                lots = book
-                    .holdings
-                    .iter()
-                    .filter(|h| h.quantity > 0.0)
-                    .map(|h| {
-                        (
-                            format!("wealth-{}", h.stock_id),
-                            h.symbol.clone(),
-                            h.quantity,
-                            h.buy_price.unwrap_or(h.price),
-                            h.price,
-                            h.current_value,
-                        )
-                    })
-                    .collect();
+            let status = block_on_local(session.profile_status(&settings));
+            if status.ok && status.connected {
+                let book = match block_on_local(session.refresh_book(&state.db)) {
+                    Ok(b) => Some(b),
+                    Err(_) => session.load_book(&state.db).ok().flatten(),
+                };
+                if let Some(book) = book {
+                    trading_mode = "live";
+                    cash = book.brokerage_balance;
+                    live_pnl_fallback = Some(wealth_pnl_today(&state, live_broker.as_str(), book.profit));
+                    wealth_synced_at = Some(book.synced_at.clone());
+                    lots = book
+                        .holdings
+                        .iter()
+                        .filter(|h| h.quantity > 0.0)
+                        .map(|h| {
+                            (
+                                format!("wealth-{}", h.stock_id),
+                                h.symbol.clone(),
+                                h.quantity,
+                                h.buy_price.unwrap_or(h.price),
+                                h.price,
+                                h.current_value,
+                            )
+                        })
+                        .collect();
+                }
             }
         }
 
@@ -893,7 +896,6 @@ pub fn cycle_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value
 #[tauri::command]
 pub async fn cycle_run(
     app: AppHandle,
-    confirmation_token: Option<String>,
     allow_bulk_liquidation: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
@@ -943,60 +945,6 @@ pub async fn cycle_run(
             return Err("Connect the selected live broker before live trading.".into());
         }
 
-        let strategy_hash = state
-            .db
-            .with_conn(|conn| {
-                let id: String = conn.query_row(
-                    "SELECT id FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )?;
-                Ok(id)
-            })
-            .unwrap_or_else(|_| "none".into());
-
-        let execute_live = trading_mode == crate::wealth::TradingMode::Live
-            && settings.live_trading_enabled
-            && confirmation_token.is_some();
-        let execute_sandbox = trading_mode != crate::wealth::TradingMode::Live;
-        let execute = execute_sandbox || execute_live;
-
-        if execute_live {
-            if let Some(token) = confirmation_token.as_deref() {
-                let confirm = state
-                    .live_intents
-                    .consume(token, broker.as_ref().map(|s| s.id().as_str()).unwrap_or("wealth"), &strategy_hash, allow_bulk)
-                    .map_err(|e| e.to_string())?;
-                let live_open = broker
-                    .as_ref()
-                    .map(|w| block_on_local(w.market_is_open()).unwrap_or(false))
-                    .unwrap_or(false);
-                let (executed, warnings) = block_on_local(crate::execution::ExecutionService::process_signals(
-                    &state.db,
-                    &state.cache,
-                    &settings,
-                    &confirm.signal_ids,
-                    broker.as_ref(),
-                    crate::wealth::TradingMode::Live,
-                    live_open,
-                    true,
-                    allow_bulk,
-                    Some(&confirm.cycle_id),
-                ))
-                .map_err(|e| e.to_string())?;
-                let payload = serde_json::json!({
-                    "ok": true,
-                    "source": "manual",
-                    "signals": confirm.signal_ids.len(),
-                    "executed": executed,
-                    "warnings": warnings,
-                    "tradingMode": "live",
-                });
-                let _ = app.emit("cycle:complete", payload.clone());
-                return Ok(payload);
-            }
-        }
-
         let cycle_id = uuid::Uuid::new_v4().to_string();
         match block_on_local(run_cycle(
             &state.db,
@@ -1006,7 +954,6 @@ pub async fn cycle_run(
             &client,
             &calendar,
             broker.as_ref(),
-            execute,
             allow_bulk,
             Some(&cycle_id),
         )) {
@@ -1015,40 +962,8 @@ pub async fn cycle_run(
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("ok".into(), serde_json::json!(true));
                     obj.insert("source".into(), serde_json::json!("manual"));
-                    if trading_mode == crate::wealth::TradingMode::Live
-                        && settings.live_trading_enabled
-                        && confirmation_token.is_none()
-                    {
-                        let ids = obj
-                            .get("signalIds")
-                            .and_then(|v| v.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        let issued = state.live_intents.issue(
-                            cycle_id,
-                            broker.as_ref().map(|s| s.id().as_str().to_string()).unwrap_or_else(|| "wealth".into()),
-                            strategy_hash,
-                            ids,
-                            allow_bulk,
-                        );
-                        obj.insert("pendingLive".into(), serde_json::json!(true));
-                        obj.insert(
-                            "confirmationToken".into(),
-                            serde_json::json!(issued.token),
-                        );
-                        obj.insert("confirmationExpiresSec".into(), serde_json::json!(120));
-                        obj.insert("executed".into(), serde_json::json!(0));
-                    }
                     if trading_mode == crate::wealth::TradingMode::Live && !settings.live_trading_enabled {
-                        obj.insert("pendingLive".into(), serde_json::json!(false));
-                        obj.insert(
-                            "liveDisabled".into(),
-                            serde_json::json!(true),
-                        );
+                        obj.insert("liveDisabled".into(), serde_json::json!(true));
                     }
                 }
                 let _ = app.emit("cycle:complete", payload.clone());

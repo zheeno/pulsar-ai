@@ -235,12 +235,25 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
                     continue;
                 }
 
-                if has_recent_unexecuted_rule_sell(conn, &exit.symbol)? {
-                    tracing::debug!(
-                        target: "risk_monitor",
-                        symbol = %exit.symbol,
-                        "skip exit — recent unexecuted rule sell already persisted"
-                    );
+                if let Some(existing_id) = recent_unexecuted_rule_sell_id(conn, &exit.symbol)? {
+                    if !signal_ids.iter().any(|id| id == &existing_id) {
+                        tracing::info!(
+                            target: "risk_monitor",
+                            symbol = %exit.symbol,
+                            signal_id = %existing_id,
+                            "retrying unexecuted rule sell"
+                        );
+                        signal_ids.push(existing_id);
+                        exit_payloads.push(serde_json::json!({
+                            "symbol": exit.symbol,
+                            "kind": match exit.kind {
+                                ExitKind::StopLoss => "stop_loss",
+                                ExitKind::TakeProfit => "take_profit",
+                            },
+                            "rationale": exit.rationale,
+                            "retry": true,
+                        }));
+                    }
                     continue;
                 }
 
@@ -271,29 +284,37 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
 
         let live_market_open = if trading_mode == TradingMode::Live {
             match broker.as_ref() {
-                Some(session) => session.market_is_open().await.unwrap_or(false),
+                Some(session) => {
+                    crate::runtime_util::live_broker_market_open(session, &calendar).await
+                }
                 None => false,
             }
         } else {
             true
         };
 
-        // Persist always; execute when sandbox OR live-authorized (same gate as auto cycle).
-        let live_authorized = trading_mode == TradingMode::Live
-            && settings.live_trading_enabled
-            && settings.scheduled_live_authorized
-            && live_market_open;
-        let do_execute = trading_mode == TradingMode::Sandbox || live_authorized;
+        let do_execute = settings.should_execute_risk_exits(trading_mode, live_market_open);
+        let skip_result = settings.risk_exit_skip_result(trading_mode, live_market_open);
 
         if trading_mode == TradingMode::Live && !do_execute {
             tracing::info!(
                 target: "risk_monitor",
                 signals = signal_ids.len(),
                 live_trading_enabled = settings.live_trading_enabled,
-                scheduled_live_authorized = settings.scheduled_live_authorized,
                 live_market_open,
-                "risk exits persisted but live execution skipped (not authorized)"
+                skip_result,
+                "risk exits persisted but live execution skipped"
             );
+        }
+
+        if do_execute && trading_mode == TradingMode::Live {
+            if let Some(ref session) = broker {
+                let _ = crate::execution::ExecutionService::reconcile_if_possible(
+                    &state.db,
+                    session,
+                )
+                .await;
+            }
         }
 
         let (executed, warnings) = crate::execution::ExecutionService::process_signals(
@@ -307,8 +328,21 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
             do_execute,
             false,
             None,
+            skip_result,
         )
         .await?;
+
+        if !warnings.is_empty() {
+            tracing::warn!(
+                target: "risk_monitor",
+                ?warnings,
+                signals = signal_ids.len(),
+                executed,
+                do_execute,
+                live_market_open,
+                "risk exit execution warnings"
+            );
+        }
 
         if trading_mode == TradingMode::Sandbox && executed > 0 {
             let _ = state.db.with_conn(|conn| {
@@ -350,22 +384,157 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
     })
 }
 
-fn has_recent_unexecuted_rule_sell(
+pub(crate) fn recent_unexecuted_rule_sell_id(
     conn: &rusqlite::Connection,
     symbol: &str,
-) -> anyhow::Result<bool> {
-    let exists: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM signals
-             WHERE UPPER(symbol) = UPPER(?1)
-               AND action = 'SELL'
-               AND model_name IN ('rules:stop-loss', 'rules:take-profit')
-               AND executed = 0
-               AND generated_at >= datetime('now', '-1 hour')
-             LIMIT 1",
-            [symbol],
-            |row| row.get(0),
+) -> anyhow::Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM signals
+         WHERE UPPER(symbol) = UPPER(?1)
+           AND action = 'SELL'
+           AND model_name IN ('rules:stop-loss', 'rules:take-profit')
+           AND executed = 0
+           AND generated_at >= datetime('now', '-24 hours')
+         ORDER BY generated_at DESC
+         LIMIT 1",
+        [symbol],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use crate::db::Database;
+    use crate::seed::SeedService;
+
+    fn mem_with_signals() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE signals (
+                id TEXT PRIMARY KEY,
+                symbol TEXT,
+                action TEXT,
+                model_name TEXT,
+                executed INTEGER,
+                generated_at TEXT
+             );",
         )
-        .optional()?;
-    Ok(exists.is_some())
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn recent_unexecuted_rule_sell_id_returns_latest() {
+        let conn = mem_with_signals();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, model_name, executed, generated_at)
+             VALUES ('old', 'NIDF', 'SELL', 'rules:stop-loss', 0, datetime('now', '-2 hours'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, model_name, executed, generated_at)
+             VALUES ('new', 'NIDF', 'SELL', 'rules:stop-loss', 0, datetime('now', '-5 minutes'))",
+            [],
+        )
+        .unwrap();
+        let id = recent_unexecuted_rule_sell_id(&conn, "nidf").unwrap();
+        assert_eq!(id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn recent_unexecuted_rule_sell_id_ignores_executed() {
+        let conn = mem_with_signals();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, model_name, executed, generated_at)
+             VALUES ('done', 'VFDGROUP', 'SELL', 'rules:take-profit', 1, datetime('now'))",
+            [],
+        )
+        .unwrap();
+        assert!(recent_unexecuted_rule_sell_id(&conn, "VFDGROUP")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn recent_unexecuted_rule_sell_id_respects_24h_window() {
+        let conn = mem_with_signals();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, model_name, executed, generated_at)
+             VALUES ('stale', 'NIDF', 'SELL', 'rules:stop-loss', 0, datetime('now', '-25 hours'))",
+            [],
+        )
+        .unwrap();
+        assert!(recent_unexecuted_rule_sell_id(&conn, "NIDF")
+            .unwrap()
+            .is_none());
+    }
+
+    fn test_db() -> (std::path::PathBuf, Database) {
+        let dir = std::env::temp_dir().join(format!("pulsar-risk-{}", uuid::Uuid::new_v4()));
+        let db = Database::open(&dir).expect("test db");
+        db.with_conn(|conn| SeedService::seed_if_empty(conn, 10_000_000.0))
+            .expect("seed");
+        (dir, db)
+    }
+
+    fn insert_rule_sell(
+        conn: &rusqlite::Connection,
+        id: &str,
+        symbol: &str,
+        model: &str,
+        executed: i64,
+        generated_at_sql: &str,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            &format!(
+                "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed, generated_at)
+                 VALUES (?1, ?2, 'SELL', 1.0, 'test', '{{}}', ?3, 'v2.4.0', 'BLOCKED_OTHER', ?4, datetime('now', '{generated_at_sql}'))"
+            ),
+            rusqlite::params![id, symbol, model, executed],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn retries_unexecuted_stop_loss_and_take_profit_from_last_24h() {
+        let (dir, db) = test_db();
+        db.with_conn(|conn| {
+            insert_rule_sell(conn, "old", "GTCO", "rules:stop-loss", 0, "-25 hours")?;
+            insert_rule_sell(conn, "done", "GTCO", "rules:stop-loss", 1, "-1 hours")?;
+            insert_rule_sell(conn, "sl", "GTCO", "rules:stop-loss", 0, "-2 hours")?;
+            assert_eq!(recent_unexecuted_rule_sell_id(conn, "gtco")?.as_deref(), Some("sl"));
+
+            insert_rule_sell(conn, "tp", "MTNN", "rules:take-profit", 0, "-3 hours")?;
+            assert_eq!(recent_unexecuted_rule_sell_id(conn, "MTNN")?.as_deref(), Some("tp"));
+
+            assert_eq!(recent_unexecuted_rule_sell_id(conn, "ZENITHBANK")?, None);
+            Ok(())
+        })
+        .expect("retry selection");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retries_legacy_pending_confirm_unexecuted_sells() {
+        let (dir, db) = test_db();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed)
+                 VALUES ('legacy', 'GTCO', 'SELL', 1.0, 'stop', '{}', 'rules:stop-loss', 'v2.4.0', 'BLOCKED_PENDING_CONFIRM', 0)",
+                [],
+            )?;
+            assert_eq!(
+                recent_unexecuted_rule_sell_id(conn, "GTCO")?.as_deref(),
+                Some("legacy")
+            );
+            Ok(())
+        })
+        .expect("legacy retry");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

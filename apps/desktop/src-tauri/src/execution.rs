@@ -41,6 +41,10 @@ pub struct SignalInput {
 
 pub struct RiskPolicyService;
 
+fn symbols_match(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 impl RiskPolicyService {
     pub fn evaluate(
         signal: &SignalInput,
@@ -62,8 +66,19 @@ impl RiskPolicyService {
             return ("BLOCKED_DRAWDOWN".into(), 0.0);
         }
 
-        let current_price = prices.get(&signal.symbol).copied().unwrap_or(0.0);
-        let position = positions.iter().find(|(s, _, _)| s == &signal.symbol);
+        let current_price = prices
+            .get(&signal.symbol)
+            .copied()
+            .or_else(|| {
+                prices
+                    .iter()
+                    .find(|(s, _)| symbols_match(s, &signal.symbol))
+                    .map(|(_, p)| *p)
+            })
+            .unwrap_or(0.0);
+        let position = positions
+            .iter()
+            .find(|(s, _, _)| symbols_match(s, &signal.symbol));
         let position_value = position.map(|(_, q, _)| q * current_price).unwrap_or(0.0);
         let market_value: f64 = positions
             .iter()
@@ -94,7 +109,7 @@ impl RiskPolicyService {
                     return ("APPROVED".into(), available);
                 }
             }
-            return ("BLOCKED_OTHER".into(), 0.0);
+            return ("BLOCKED_NO_POSITION".into(), 0.0);
         }
 
         ("BLOCKED_OTHER".into(), 0.0)
@@ -235,6 +250,20 @@ impl FillSimulator {
 pub struct ExecutionService;
 
 impl ExecutionService {
+    fn mark_signal_results(
+        conn: &Connection,
+        signal_ids: &[String],
+        result: &str,
+    ) -> Result<()> {
+        for signal_id in signal_ids {
+            conn.execute(
+                "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2 AND executed = 0",
+                rusqlite::params![result, signal_id],
+            )?;
+        }
+        Ok(())
+    }
+
     pub async fn process_signals(
         db: &Database,
         cache: &PriceCache,
@@ -246,12 +275,17 @@ impl ExecutionService {
         execute: bool,
         allow_bulk_liquidation: bool,
         cycle_id: Option<&str>,
+        skip_result: Option<&str>,
     ) -> Result<(i64, Vec<String>)> {
         let mut executed = 0;
         let mut warnings = Vec::new();
         let mut cycle_sell_notional = 0.0;
 
         if !execute {
+            // Always overwrite the persist-time default (BLOCKED_OTHER) after an
+            // execution decision, even if the caller omitted skip_result.
+            let status = skip_result.unwrap_or("BLOCKED_NOT_EXECUTED");
+            db.with_conn(|conn| Self::mark_signal_results(conn, signal_ids, status))?;
             return Ok((0, warnings));
         }
 
@@ -260,11 +294,17 @@ impl ExecutionService {
                 "Live trader mode: brokerage market is closed — skipping live fills (no sandbox fallback)."
                     .into(),
             );
+            db.with_conn(|conn| {
+                Self::mark_signal_results(conn, signal_ids, "BLOCKED_MARKET_CLOSED")
+            })?;
             return Ok((0, warnings));
         }
 
         let ambiguous = db.with_conn(intents::ambiguous_pending).unwrap_or(true);
         if trading_mode == TradingMode::Live && ambiguous {
+            db.with_conn(|conn| {
+                Self::mark_signal_results(conn, signal_ids, "BLOCKED_AMBIGUOUS_ORDERS")
+            })?;
             return Ok((
                 0,
                 vec!["Live orders are in an ambiguous state — reconcile before placing new orders.".into()],
@@ -317,7 +357,14 @@ impl ExecutionService {
             }
         };
 
-        for signal_id in signal_ids.iter().take(settings.max_live_actions.max(1) as usize) {
+        let cap = settings.max_live_actions.max(1) as usize;
+        let (to_run, overflow) = if signal_ids.len() > cap {
+            (&signal_ids[..cap], &signal_ids[cap..])
+        } else {
+            (signal_ids, &[][..])
+        };
+
+        for signal_id in to_run {
             match Self::process_signal(
                 db,
                 cache,
@@ -334,8 +381,27 @@ impl ExecutionService {
             {
                 Ok(true) => executed += 1,
                 Ok(false) => {}
-                Err(e) => warnings.push(format!("Signal {signal_id}: {e}")),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let status = classify_live_execution_error(&msg);
+                    tracing::warn!(
+                        target: "execution",
+                        signal_id = %signal_id,
+                        error = %msg,
+                        status,
+                        "live signal execution failed"
+                    );
+                    let _ = db.with_conn(|conn| {
+                        Self::mark_signal_results(conn, std::slice::from_ref(signal_id), status)
+                    });
+                    warnings.push(format!("Signal {signal_id}: {msg}"));
+                }
             }
+        }
+        if !overflow.is_empty() {
+            db.with_conn(|conn| {
+                Self::mark_signal_results(conn, overflow, "BLOCKED_NOT_EXECUTED")
+            })?;
         }
         Ok((executed, warnings))
     }
@@ -419,7 +485,10 @@ impl ExecutionService {
                     .get(&symbol)
                     .copied()
                     .unwrap_or(0.0);
-                if pulse_price > 0.0 && !quote_within_deviation(pulse_price, broker_quote) {
+                if quote_deviation_applies(&action)
+                    && pulse_price > 0.0
+                    && !quote_within_deviation(pulse_price, broker_quote)
+                {
                     anyhow::bail!(
                         "Broker quote for {symbol} deviates more than {:.0}% from Pulse",
                         MAX_QUOTE_DEVIATION * 100.0
@@ -441,7 +510,10 @@ impl ExecutionService {
                         (h.symbol.clone(), qty, h.buy_price.unwrap_or(h.price))
                     })
                     .collect();
-                if !positions.iter().any(|(s, _, _)| s == &symbol) {
+                if !positions
+                    .iter()
+                    .any(|(s, _, _)| symbols_match(s, &symbol))
+                {
                     positions.push((symbol.clone(), 0.0, broker_quote));
                 }
                 let mut prices = std::collections::HashMap::new();
@@ -535,6 +607,15 @@ impl ExecutionService {
             }
 
             db.with_conn(|conn| intents::mark_submitted(conn, &intent.id, None))?;
+            tracing::info!(
+                target: "execution",
+                signal_id,
+                symbol = %symbol,
+                action = %action,
+                quantity,
+                venue = client.id().as_str(),
+                "submitting live broker order"
+            );
             let order = match client
                 .place_and_await_fill(
                     &instrument,
@@ -546,8 +627,17 @@ impl ExecutionService {
             {
                 Ok(o) => o,
                 Err(e) => {
+                    // HTTP/client failure: the broker never accepted an order id.
+                    // Mark rejected so this does not freeze all live trading via
+                    // ambiguous_pending / pending_sell_qty.
                     db.with_conn(|conn| {
-                        intents::mark_terminal(conn, &intent.id, "unknown", None, Some(&e.to_string()))
+                        intents::mark_terminal(
+                            conn,
+                            &intent.id,
+                            "rejected",
+                            None,
+                            Some(&e.to_string()),
+                        )
                     })?;
                     return Err(e);
                 }
@@ -903,6 +993,7 @@ impl ExecutionService {
     }
 
     pub async fn reconcile_if_possible(db: &Database, session: &BrokerSession) -> Result<()> {
+        let _ = db.with_conn(crate::intents::reject_unsubmitted_unknown);
         let open = db.with_conn(crate::intents::load_open_intents)?;
         for intent in open {
             if let Some(eid) = intent.external_order_ref.clone() {
@@ -950,9 +1041,44 @@ pub fn quote_within_deviation(reference: f64, broker: f64) -> bool {
     ((broker - reference) / reference).abs() <= MAX_QUOTE_DEVIATION
 }
 
+/// Quote-deviation is a BUY stale-price guard. SELLs (stop-loss / take-profit)
+/// must still reach the broker when the market is open.
+pub fn quote_deviation_applies(action: &str) -> bool {
+    action.eq_ignore_ascii_case("BUY")
+}
+
+/// Map a live execution failure to a specific BLOCKED_* so the persist-time
+/// default (`BLOCKED_OTHER`) is never left after an attempt.
+pub fn classify_live_execution_error(msg: &str) -> &'static str {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("deviates") {
+        "BLOCKED_QUOTE_DEVIATION"
+    } else if m.contains("drawdown") {
+        "BLOCKED_DRAWDOWN"
+    } else if m.contains("notional") || m.contains("bulk liquidation") {
+        "BLOCKED_NOTIONAL"
+    } else if m.contains("transaction pin") {
+        "BLOCKED_PIN_MISSING"
+    } else if m.contains("insufficient") || m.contains("brokerage balance") {
+        "BLOCKED_CASH"
+    } else if m.contains("no position") {
+        "BLOCKED_NO_POSITION"
+    } else if m.contains("market") && m.contains("closed") {
+        "BLOCKED_MARKET_CLOSED"
+    } else if m.contains("matching live order") {
+        "BLOCKED_NOT_EXECUTED"
+    } else {
+        "BLOCKED_BROKER"
+    }
+}
+
 pub fn live_drawdown_pct(conn: &Connection, venue: &str, current_equity: f64) -> Result<f64> {
+    // Missing equity history must not fail-closed: that blocked every live
+    // BUY/SELL on the first day (no prior-day row) and left BLOCKED_OTHER.
+    // Drawdown still applies once a prior-day point exists. SELLs ignore the
+    // numeric drawdown in evaluate(); BUYs use it as the daily breaker.
     if current_equity <= 0.0 || !current_equity.is_finite() {
-        anyhow::bail!("Live drawdown breaker: current brokerage equity is unavailable");
+        return Ok(0.0);
     }
     let prior: Option<f64> = conn
         .query_row(
@@ -964,7 +1090,7 @@ pub fn live_drawdown_pct(conn: &Connection, venue: &str, current_equity: f64) ->
         )
         .optional()?;
     let Some(prior) = prior.filter(|p| *p > 0.0 && p.is_finite()) else {
-        anyhow::bail!("Live drawdown breaker: prior brokerage equity is unavailable");
+        return Ok(0.0);
     };
     Ok(((prior - current_equity) / prior).max(0.0))
 }
@@ -1137,6 +1263,242 @@ mod tests {
         assert_eq!(buy_result, "BLOCKED_DRAWDOWN");
         assert_eq!(sell_result, "APPROVED");
         assert_eq!(sell_qty, 100.0);
+    }
+
+    #[test]
+    fn sell_approves_with_case_insensitive_position_match() {
+        let param_set = test_param_set();
+        let prices = std::collections::HashMap::from([("GTCO".into(), 50.0)]);
+        let positions = vec![("gtco".into(), 100.0, 40.0)];
+        let sell = SignalInput {
+            id: "s".into(),
+            symbol: "GTCO".into(),
+            action: "SELL".into(),
+            confidence: 0.8,
+        };
+        let (result, qty) = RiskPolicyService::evaluate(
+            &sell,
+            &param_set,
+            1_000_000.0,
+            &positions,
+            &prices,
+            0.0,
+            0.01,
+            None,
+        );
+        assert_eq!(result, "APPROVED");
+        assert_eq!(qty, 100.0);
+    }
+
+    #[test]
+    fn sell_without_position_is_blocked_no_position() {
+        let param_set = test_param_set();
+        let prices = std::collections::HashMap::from([("GTCO".into(), 50.0)]);
+        let sell = SignalInput {
+            id: "s".into(),
+            symbol: "GTCO".into(),
+            action: "SELL".into(),
+            confidence: 0.8,
+        };
+        let (result, qty) = RiskPolicyService::evaluate(
+            &sell,
+            &param_set,
+            1_000_000.0,
+            &[],
+            &prices,
+            0.0,
+            0.01,
+            None,
+        );
+        assert_eq!(result, "BLOCKED_NO_POSITION");
+        assert_eq!(qty, 0.0);
+    }
+
+    #[test]
+    fn sell_approves_live_shaped_holdings() {
+        let param_set = test_param_set();
+        // Mirrors Wealth/Bamboo book rows: mixed case, buy_price as cost.
+        let positions = vec![
+            ("NIDF".into(), 6.0, 181.25),
+            ("vfdgroup".into(), 102.0, 12.85),
+            ("HONYFLOUR".into(), 173.0, 17.57),
+        ];
+        let prices = std::collections::HashMap::from([
+            ("NIDF".into(), 147.7),
+            ("VFDGROUP".into(), 11.8),
+            ("HONYFLOUR".into(), 17.1),
+        ]);
+        let sell = SignalInput {
+            id: "s".into(),
+            symbol: "VFDGROUP".into(),
+            action: "SELL".into(),
+            confidence: 0.95,
+        };
+        let (result, qty) = RiskPolicyService::evaluate(
+            &sell,
+            &param_set,
+            1_501.72,
+            &positions,
+            &prices,
+            0.0,
+            0.0015,
+            None,
+        );
+        assert_eq!(result, "APPROVED");
+        assert_eq!(qty, 102.0);
+    }
+
+    #[test]
+    fn quote_deviation_is_buy_only() {
+        assert!(quote_deviation_applies("BUY"));
+        assert!(quote_deviation_applies("buy"));
+        assert!(!quote_deviation_applies("SELL"));
+        assert!(!quote_deviation_applies("HOLD"));
+        // A 20% Pulse/broker gap would block a BUY but must not gate a SELL.
+        assert!(!quote_within_deviation(100.0, 80.0));
+    }
+
+    #[test]
+    fn classify_live_errors_never_leave_blocked_other() {
+        assert_eq!(
+            classify_live_execution_error("Broker quote for GTCO deviates more than 5% from Pulse"),
+            "BLOCKED_QUOTE_DEVIATION"
+        );
+        assert_eq!(
+            classify_live_execution_error("Live notional exceeds configured cap"),
+            "BLOCKED_NOTIONAL"
+        );
+        assert_eq!(
+            classify_live_execution_error("Bulk liquidation requires extra confirmation"),
+            "BLOCKED_NOTIONAL"
+        );
+        assert_eq!(
+            classify_live_execution_error("Insufficient brokerage balance for GTCO (have ₦12.00)"),
+            "BLOCKED_CASH"
+        );
+        assert_eq!(
+            classify_live_execution_error("Bamboo transaction PIN missing — add it in Settings"),
+            "BLOCKED_PIN_MISSING"
+        );
+        assert_eq!(
+            classify_live_execution_error("Wealth HTTP 401 unauthorized"),
+            "BLOCKED_BROKER"
+        );
+        assert_eq!(
+            classify_live_execution_error("Matching live order already submitted for NIDF"),
+            "BLOCKED_NOT_EXECUTED"
+        );
+        assert_ne!(classify_live_execution_error("timeout"), "BLOCKED_OTHER");
+    }
+
+    #[test]
+    fn live_drawdown_is_zero_without_prior_day() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE equity_curve_points (
+                venue TEXT, recorded_at TEXT, total_equity REAL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO equity_curve_points (venue, recorded_at, total_equity)
+             VALUES ('wealth', datetime('now'), 9572.62)",
+            [],
+        )
+        .unwrap();
+        let pct = live_drawdown_pct(&conn, "wealth", 9572.62).unwrap();
+        assert_eq!(pct, 0.0);
+
+        conn.execute(
+            "INSERT INTO equity_curve_points (venue, recorded_at, total_equity)
+             VALUES ('wealth', datetime('now', '-1 day'), 10_000.0)",
+            [],
+        )
+        .unwrap();
+        let pct = live_drawdown_pct(&conn, "wealth", 9_000.0).unwrap();
+        assert!((pct - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn skip_statuses_match_live_gates() {
+        let mut on = AppSettings::default();
+        on.live_trading_enabled = true;
+        assert!(on.should_execute(TradingMode::Live));
+        assert!(on.should_execute_risk_exits(TradingMode::Live, true));
+        assert!(!on.should_execute_risk_exits(TradingMode::Live, false));
+        assert_eq!(on.cycle_skip_result(TradingMode::Live), None);
+        // Live path reaches place_and_await_fill only when this gate is open.
+        assert!(on.execution_skip(TradingMode::Live, true).is_none());
+
+        let off = AppSettings::default();
+        assert!(!off.should_execute(TradingMode::Live));
+        assert_eq!(
+            off.cycle_skip_result(TradingMode::Live),
+            Some("BLOCKED_LIVE_DISABLED")
+        );
+        assert!(off.should_execute(TradingMode::Sandbox));
+        assert_eq!(off.cycle_skip_result(TradingMode::Sandbox), None);
+        assert!(!on.should_execute(TradingMode::Sandbox));
+        assert_eq!(on.cycle_skip_result(TradingMode::Sandbox), Some("BLOCKED_BROKER"));
+    }
+
+    #[test]
+    fn process_signals_execute_false_overwrites_blocked_other() {
+        use crate::cache::PriceCache;
+        use crate::db::Database;
+        use crate::runtime_util::block_on_local;
+        use crate::seed::SeedService;
+
+        let dir = std::env::temp_dir().join(format!("pulsar-exec-skip-{}", uuid::Uuid::new_v4()));
+        let db = Database::open(&dir).expect("test db");
+        db.with_conn(|conn| SeedService::seed_if_empty(conn, 10_000_000.0))
+            .expect("seed");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed)
+                 VALUES ('sig-1', 'GTCO', 'SELL', 1.0, 'stop', '{}', 'rules:stop-loss', 'v2.4.0', 'BLOCKED_OTHER', 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("insert");
+
+        let cache = PriceCache::new(60);
+        let mut settings = AppSettings::default();
+        settings.live_trading_enabled = false;
+        let ids = vec!["sig-1".to_string()];
+        let skip = settings.cycle_skip_result(TradingMode::Live);
+        assert_eq!(skip, Some("BLOCKED_LIVE_DISABLED"));
+
+        let (executed, _) = block_on_local(ExecutionService::process_signals(
+            &db,
+            &cache,
+            &settings,
+            &ids,
+            None,
+            TradingMode::Live,
+            true,
+            false,
+            false,
+            None,
+            skip,
+        ))
+        .expect("process");
+        assert_eq!(executed, 0);
+        let result: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT risk_policy_result FROM signals WHERE id = 'sig-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("read");
+        assert_eq!(result, "BLOCKED_LIVE_DISABLED");
+        assert_ne!(result, "BLOCKED_OTHER");
+        assert_ne!(result, "BLOCKED_PENDING_CONFIRM");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

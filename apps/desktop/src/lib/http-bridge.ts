@@ -63,7 +63,6 @@ function defaultSettings(): Settings {
     bambooPhone: undefined,
     bambooConnected: false,
     liveTradingEnabled: false,
-    scheduledLiveAuthorized: false,
     maxLiveNotional: 500_000,
     maxLiveActions: 10,
     retainRawLlmLogs: false,

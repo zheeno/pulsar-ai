@@ -105,7 +105,7 @@ pub fn pending_buy_notional(conn: &Connection) -> Result<f64> {
 pub fn pending_sell_qty(conn: &Connection, symbol: &str) -> Result<f64> {
     let v: f64 = conn.query_row(
         "SELECT COALESCE(SUM(requested_qty), 0) FROM order_intents
-         WHERE symbol = ?1 AND side = 'SELL' AND state IN ('created', 'submitted', 'unknown')",
+         WHERE UPPER(symbol) = UPPER(?1) AND side = 'SELL' AND state IN ('created', 'submitted', 'unknown')",
         [symbol],
         |row| row.get(0),
     )?;
@@ -157,6 +157,22 @@ pub fn load_open_intents(conn: &Connection) -> Result<Vec<OrderIntent>> {
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Place/HTTP failures must not stay `unknown` (that freezes all live trading
+/// via `ambiguous_pending`). Only intents that were actually submitted to the
+/// broker (have an order id) belong in `unknown`.
+pub fn reject_unsubmitted_unknown(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE order_intents SET state = 'rejected',
+            last_error = COALESCE(last_error, 'never submitted to broker'),
+            updated_at = datetime('now')
+         WHERE state = 'unknown'
+           AND external_order_ref IS NULL
+           AND external_order_id IS NULL",
+        [],
+    )?;
+    Ok(n)
+}
+
 pub fn find_duplicate(
     conn: &Connection,
     symbol: &str,
@@ -165,7 +181,7 @@ pub fn find_duplicate(
 ) -> Result<Option<String>> {
     conn.query_row(
         "SELECT id FROM order_intents
-         WHERE symbol = ?1 AND side = ?2 AND requested_qty = ?3
+         WHERE UPPER(symbol) = UPPER(?1) AND side = ?2 AND requested_qty = ?3
            AND created_at >= datetime('now', '-10 minutes')
            AND state IN ('submitted', 'filled', 'unknown')
          LIMIT 1",
@@ -174,4 +190,64 @@ pub fn find_duplicate(
     )
     .optional()
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE order_intents (
+                id TEXT PRIMARY KEY,
+                client_order_id TEXT,
+                cycle_id TEXT,
+                signal_id TEXT,
+                symbol TEXT,
+                side TEXT,
+                requested_qty REAL,
+                requested_quote REAL,
+                requested_notional REAL,
+                venue TEXT,
+                state TEXT,
+                external_order_ref TEXT,
+                external_order_id INTEGER,
+                last_error TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn reject_unsubmitted_unknown_clears_ambiguous_gate() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO order_intents (id, client_order_id, symbol, side, requested_qty, venue, state, last_error)
+             VALUES ('a', 'c1', 'NIDF', 'SELL', 6, 'wealth', 'unknown', 'HTTP timeout')",
+            [],
+        )
+        .unwrap();
+        assert!(ambiguous_pending(&conn).unwrap());
+        let n = reject_unsubmitted_unknown(&conn).unwrap();
+        assert_eq!(n, 1);
+        assert!(!ambiguous_pending(&conn).unwrap());
+    }
+
+    #[test]
+    fn keeps_unknown_when_external_ref_exists() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO order_intents (id, client_order_id, symbol, side, requested_qty, venue, state, external_order_ref)
+             VALUES ('b', 'c2', 'NIDF', 'SELL', 6, 'wealth', 'unknown', '12345')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(reject_unsubmitted_unknown(&conn).unwrap(), 0);
+        assert!(ambiguous_pending(&conn).unwrap());
+    }
 }

@@ -5,7 +5,6 @@ mod broker;
 mod cache;
 mod calendar;
 mod commands;
-mod cycle_auth;
 mod db;
 mod execution;
 mod http_client;
@@ -160,7 +159,11 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ngx_pulse=debug,wealth=debug")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "info,ngx_pulse=debug,wealth=debug,bamboo=debug,secrets=debug",
+                    )
+                }),
         )
         .init();
     load_dotenv();
@@ -193,6 +196,7 @@ pub fn run() {
 
             let app_data = app.path().app_data_dir().expect("app data dir");
             crate::secrets::init(&app_data);
+            tracing::info!(target: "secrets", "preloading secrets vault");
             crate::secrets::preload();
 
             let worker_path =
@@ -200,6 +204,10 @@ pub fn run() {
             tracing::info!(worker = %worker_path.display(), exists = worker_path.is_file(), "agent worker path");
             let db = Database::open(&app_data).expect("open database");
             let settings = db.with_conn(get_settings).unwrap_or_default();
+            crate::secrets::log_broker_restore_probe(
+                settings.wealth_connected,
+                settings.bamboo_connected,
+            );
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
                 .expect("seed database");
 
