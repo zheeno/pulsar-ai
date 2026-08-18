@@ -17,7 +17,7 @@
     "desktop:build:mac": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs mac",
     "desktop:build:win": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs win",
     "desktop:prepare": "node scripts/prepare-desktop-resources.mjs",
-    "agent:build": "npm run build -w @ngx/agent && node scripts/prepare-desktop-resources.mjs",
+    "agent:build": "npm run build -w @ngx/shared && npm run build -w @ngx/agent && node scripts/prepare-desktop-resources.mjs",
     "agent:ping": "node scripts/test-agent-ping.js"
   },
   "devDependencies": {
