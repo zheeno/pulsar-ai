@@ -77,6 +77,7 @@ export interface AppSettings {
   llmProvider: string;
   llmModel: string;
   llmBaseUrl?: string;
+  llmTemperature?: number | null;
   pulseConfigured: boolean;
   llmConfigured: boolean;
   onboardingComplete: boolean;

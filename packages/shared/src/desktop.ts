@@ -8,6 +8,7 @@ export const LlmConfigSchema = z.object({
   model: z.string().min(1),
   apiKey: z.string().min(1),
   baseUrl: z.string().url().nullish(),
+  temperature: z.number().min(0).max(2).nullable().optional(),
 });
 export type LlmConfig = z.infer<typeof LlmConfigSchema>;
 

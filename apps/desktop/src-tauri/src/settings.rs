@@ -14,6 +14,8 @@ pub struct AppSettings {
     pub llm_provider: String,
     pub llm_model: String,
     pub llm_base_url: Option<String>,
+    /// When None, the agent omits temperature and uses the provider default.
+    pub llm_temperature: Option<f64>,
     pub pulse_configured: bool,
     pub llm_configured: bool,
     pub onboarding_complete: bool,
@@ -62,8 +64,9 @@ impl Default for AppSettings {
             pulse_email: None,
             pulse_base_url: "https://ngxpulse.ng/api".into(),
             llm_provider: "openai".into(),
-            llm_model: "gpt-4o-mini".into(),
+            llm_model: "gpt-5.6-luna".into(),
             llm_base_url: None,
+            llm_temperature: None,
             pulse_configured: false,
             llm_configured: false,
             onboarding_complete: false,
@@ -105,6 +108,9 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
             "llm_provider" => settings.llm_provider = value,
             "llm_model" => settings.llm_model = value,
             "llm_base_url" => settings.llm_base_url = Some(value),
+            "llm_temperature" => {
+                settings.llm_temperature = value.parse().ok();
+            }
             "pulse_configured" => settings.pulse_configured = value == "true",
             "llm_configured" => settings.llm_configured = value == "true",
             "onboarding_complete" => settings.onboarding_complete = value == "true",
@@ -175,6 +181,12 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
             conn.execute("DELETE FROM settings WHERE key = 'llm_base_url'", [])?;
         }
         Some(v) => set_setting(conn, "llm_base_url", v)?,
+    }
+    match settings.llm_temperature {
+        Some(v) => set_setting(conn, "llm_temperature", &v.to_string())?,
+        None => {
+            conn.execute("DELETE FROM settings WHERE key = 'llm_temperature'", [])?;
+        }
     }
     set_setting(
         conn,
@@ -317,6 +329,9 @@ pub fn validate_numeric_settings(settings: &AppSettings) -> Result<()> {
     finite_in_range("simulated_slippage_bps", settings.simulated_slippage_bps, 0.0, 500.0)?;
     finite_in_range("simulated_fee_pct", settings.simulated_fee_pct, 0.0, 0.05)?;
     finite_in_range("max_live_notional", settings.max_live_notional, 1_000.0, 50_000_000.0)?;
+    if let Some(t) = settings.llm_temperature {
+        finite_in_range("llm_temperature", t, 0.0, 2.0)?;
+    }
     if settings.max_live_actions < 1 || settings.max_live_actions > 40 {
         anyhow::bail!("max_live_actions must be between 1 and 40");
     }
@@ -467,6 +482,18 @@ mod tests {
         assert!(!s.flatten_on_drawdown_armed);
         assert!(!s.halt_new_buys);
         assert!(!s.launch_at_login);
+    }
+
+    #[test]
+    fn llm_temperature_validates_range() {
+        let mut s = AppSettings::default();
+        assert!(validate_numeric_settings(&s).is_ok());
+        s.llm_temperature = Some(0.7);
+        assert!(validate_numeric_settings(&s).is_ok());
+        s.llm_temperature = Some(2.0);
+        assert!(validate_numeric_settings(&s).is_ok());
+        s.llm_temperature = Some(2.1);
+        assert!(validate_numeric_settings(&s).is_err());
     }
 
     #[test]

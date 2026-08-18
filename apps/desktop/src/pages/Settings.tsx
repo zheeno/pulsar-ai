@@ -2,6 +2,12 @@ import { Fragment, useEffect, useId, useRef, useState } from 'react';
 import bambooLogo from '../assets/bamboo.webp';
 import wealthLogo from '../assets/wealth.webp';
 import { IconLogout, IconSpinner } from '../components/Icons';
+import {
+  draftFromLlmTemperature,
+  formatLlmTemperatureLabel,
+  LlmTemperatureControl,
+  llmTemperatureFromDraft,
+} from '../components/LlmTemperatureControl';
 import { api, type AppSettings } from '../lib/api';
 import { formatNaira } from '../lib/format';
 import { useSession } from '../lib/session';
@@ -11,6 +17,7 @@ type LlmStatus = {
   provider: string;
   model: string;
   baseUrl?: string | null;
+  temperature?: number | null;
   configured: boolean;
   maskedKey?: string | null;
 };
@@ -290,6 +297,8 @@ export default function SettingsPage() {
   const [draftProvider, setDraftProvider] = useState('openai');
   const [draftModel, setDraftModel] = useState('');
   const [draftBaseUrl, setDraftBaseUrl] = useState('');
+  const [draftUseProviderDefault, setDraftUseProviderDefault] = useState(true);
+  const [draftTemperature, setDraftTemperature] = useState(0.7);
   const [draftApiKey, setDraftApiKey] = useState('');
   const [modalStatus, setModalStatus] = useState('');
   const [modalBusy, setModalBusy] = useState(false);
@@ -382,9 +391,14 @@ export default function SettingsPage() {
 
   function openLlmModal() {
     if (!settings && !llmStatus) return;
+    const tempDraft = draftFromLlmTemperature(
+      llmStatus?.temperature ?? settings?.llmTemperature ?? null,
+    );
     setDraftProvider(llmStatus?.provider || settings?.llmProvider || 'openai');
     setDraftModel(llmStatus?.model || settings?.llmModel || '');
     setDraftBaseUrl(llmStatus?.baseUrl || settings?.llmBaseUrl || '');
+    setDraftUseProviderDefault(tempDraft.useProviderDefault);
+    setDraftTemperature(tempDraft.temperature);
     setDraftApiKey('');
     setModalStatus('');
     setLlmModalOpen(true);
@@ -399,8 +413,9 @@ export default function SettingsPage() {
 
   async function saveLlmFromModal() {
     if (!settings) return;
-    if (!draftApiKey.trim()) {
-      setModalStatus('Enter a new API key to update LLM credentials.');
+    const needsNewKey = !llmStatus?.configured;
+    if (needsNewKey && !draftApiKey.trim()) {
+      setModalStatus('Enter an API key to configure LLM credentials.');
       return;
     }
     setModalBusy(true);
@@ -412,9 +427,10 @@ export default function SettingsPage() {
           llmProvider: draftProvider,
           llmModel: draftModel,
           llmBaseUrl: draftBaseUrl.trim() || undefined,
+          llmTemperature: llmTemperatureFromDraft(draftUseProviderDefault, draftTemperature),
           llmConfigured: true,
         },
-        llmApiKey: draftApiKey.trim(),
+        ...(draftApiKey.trim() ? { llmApiKey: draftApiKey.trim() } : {}),
       });
       await api('test_llm');
       await refresh();
@@ -1134,6 +1150,8 @@ export default function SettingsPage() {
           <dd>{providerLabel}</dd>
           <dt>Model</dt>
           <dd>{llmStatus.model || '—'}</dd>
+          <dt>Temperature</dt>
+          <dd>{formatLlmTemperatureLabel(llmStatus.temperature)}</dd>
           {llmStatus.baseUrl ? (
             <>
               <dt>Base URL</dt>
@@ -1511,6 +1529,14 @@ export default function SettingsPage() {
               placeholder="Leave blank for provider default"
             />
 
+            <LlmTemperatureControl
+              useProviderDefault={draftUseProviderDefault}
+              temperature={draftTemperature}
+              disabled={modalBusy}
+              onUseProviderDefaultChange={setDraftUseProviderDefault}
+              onTemperatureChange={setDraftTemperature}
+            />
+
             <label className="label" htmlFor={keyId}>API key</label>
             <input
               id={keyId}
@@ -1520,7 +1546,11 @@ export default function SettingsPage() {
               disabled={modalBusy}
               value={draftApiKey}
               onChange={(e) => setDraftApiKey(e.target.value)}
-              placeholder="Paste new API key"
+              placeholder={
+                llmStatus?.configured
+                  ? 'Leave blank to keep current key'
+                  : 'Paste API key'
+              }
             />
 
             {modalStatus && (

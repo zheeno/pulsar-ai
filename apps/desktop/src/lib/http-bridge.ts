@@ -49,7 +49,8 @@ function defaultSettings(): Settings {
   return {
     pulseBaseUrl: 'https://ngxpulse.ng/api',
     llmProvider: 'openai',
-    llmModel: 'gpt-4o-mini',
+    llmModel: 'gpt-5.6-luna',
+    llmTemperature: null,
     pulseConfigured: false,
     llmConfigured: false,
     onboardingComplete: false,
@@ -498,8 +499,9 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       }
       return {
         provider: s.llmProvider || 'openai',
-        model: s.llmModel || 'gpt-4o-mini',
+        model: s.llmModel || 'gpt-5.6-luna',
         baseUrl: s.llmBaseUrl ?? null,
+        temperature: s.llmTemperature ?? null,
         configured,
         maskedKey,
       } as T;

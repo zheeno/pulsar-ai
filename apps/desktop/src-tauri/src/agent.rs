@@ -135,6 +135,9 @@ impl AgentBridge {
             let normalized = validate_llm_base_url(url, true)?;
             llm["baseUrl"] = json!(normalized);
         }
+        if let Some(t) = settings.llm_temperature {
+            llm["temperature"] = json!(t);
+        }
         Ok(llm)
     }
 

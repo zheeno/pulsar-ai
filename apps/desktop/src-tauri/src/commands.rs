@@ -147,6 +147,7 @@ pub struct LlmStatus {
     pub provider: String,
     pub model: String,
     pub base_url: Option<String>,
+    pub temperature: Option<f64>,
     pub configured: bool,
     pub masked_key: Option<String>,
 }
@@ -171,6 +172,7 @@ pub fn llm_status(state: State<'_, Arc<AppState>>) -> Result<LlmStatus, String> 
         provider: settings.llm_provider,
         model: settings.llm_model,
         base_url: settings.llm_base_url,
+        temperature: settings.llm_temperature,
         configured,
         masked_key: key
             .filter(|k| !k.is_empty())

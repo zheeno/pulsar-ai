@@ -1000,6 +1000,20 @@ select.input {
   border-color: rgba(56, 189, 248, 0.35);
 }
 
+.llm-temperature {
+  margin-top: var(--space-3);
+}
+
+.llm-temperature__hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.llm-temperature .param-slider {
+  margin-top: var(--space-3);
+}
+
 /* ——— Tables ——— */
 
 .data-table {
