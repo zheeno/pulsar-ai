@@ -47,6 +47,7 @@ pub struct PortfolioGeneration {
     pub signal_ids: Vec<String>,
     pub universe_size: usize,
     pub warnings: Vec<String>,
+    pub buys_disabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ struct TradeCapacity {
     min_confidence: f64,
     skip_llm: bool,
     skip_reason: Option<String>,
+    capital_reason: Option<&'static str>,
 }
 
 pub struct SignalGenerationService;
@@ -124,6 +126,12 @@ impl SignalGenerationService {
             )
             .unwrap_or(0.0)
         });
+        let spendable = if venue == "sandbox" {
+            cash
+        } else {
+            let pending = crate::intents::pending_buy_notional_on(conn, Some(&venue)).unwrap_or(0.0);
+            (cash - pending).max(0.0)
+        };
 
         let universe_tsv = Self::encode_universe_tsv(&universe_rows);
         let universe_size = universe_rows.len();
@@ -233,10 +241,16 @@ impl SignalGenerationService {
         let total_equity = cash + market_value;
         let risk_params = param_set.to_param_set();
 
+        let min_n = crate::execution::min_order_notional_for_venue(&venue);
+        let remaining_budget = crate::execution::remaining_buy_budget(
+            spendable,
+            param_set.cycle_budget_pct,
+            min_n,
+        );
         let capacity = compute_trade_capacity(
             &param_set,
             &risk_params,
-            cash,
+            spendable,
             total_equity,
             daily_drawdown,
             settings_fee,
@@ -244,7 +258,8 @@ impl SignalGenerationService {
             &positions_for_risk,
             &held_symbols,
             &seen,
-            crate::execution::min_order_notional_for_venue(&venue),
+            min_n,
+            remaining_budget,
         );
 
         let min_buy_signals = MIN_BUY_TARGET.min(capacity.max_buy_signals);
@@ -323,11 +338,16 @@ impl SignalGenerationService {
                 signal_ids: vec![],
                 universe_size: 0,
                 warnings: vec!["No priced instruments or active strategy.".into()],
+                buys_disabled: true,
             });
         };
 
         if capacity.skip_llm {
             let mut warnings = Vec::new();
+            if let Some(reason) = capacity.capital_reason {
+                tracing::info!(target: "signals", reason, "capital-constrained");
+                warnings.push(format!("capital-constrained: {reason}"));
+            }
             if let Some(reason) = capacity.skip_reason {
                 warnings.push(reason);
             }
@@ -335,6 +355,7 @@ impl SignalGenerationService {
                 signal_ids,
                 universe_size,
                 warnings,
+                buys_disabled: capacity.buys_disabled,
             });
         }
 
@@ -374,7 +395,10 @@ impl SignalGenerationService {
         let model_name = result.get("modelName").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
         let mut gen_warnings: Vec<String> = Vec::new();
-        if capacity.buys_disabled {
+        if let Some(reason) = capacity.capital_reason {
+            tracing::info!(target: "signals", reason, "capital-constrained");
+            gen_warnings.push(format!("capital-constrained: {reason}"));
+        } else if capacity.buys_disabled {
             gen_warnings.push(
                 "BUY capacity exhausted — LLM was constrained to discretionary SELLs only.".into(),
             );
@@ -550,6 +574,7 @@ impl SignalGenerationService {
             signal_ids,
             universe_size,
             warnings: gen_warnings,
+            buys_disabled: capacity.buys_disabled,
         })
     }
 
@@ -1052,14 +1077,13 @@ fn compute_trade_capacity(
     held_symbols: &std::collections::HashSet<String>,
     seen: &std::collections::HashSet<String>,
     min_order_notional: f64,
+    remaining_budget: f64,
 ) -> TradeCapacity {
     let drawdown_ok = daily_drawdown < param_set.max_daily_drawdown_pct;
-    let cycle_budget = crate::execution::live_buy_budget(
-        cash,
-        param_set.cycle_budget_pct,
-        min_order_notional,
-    );
-    let can_afford = if cycle_budget <= 0.0 {
+    let capital_reason =
+        crate::execution::buy_ineligible_reason(cash, remaining_budget, min_order_notional);
+    let cycle_budget = remaining_budget;
+    let can_afford = if capital_reason.is_some() || cycle_budget <= 0.0 {
         false
     } else {
         universe.iter().any(|row| {
@@ -1069,6 +1093,7 @@ fn compute_trade_capacity(
             }
             if min_order_notional > 0.0 {
                 cash + 1e-9 >= min_order_notional
+                    && cycle_budget + 1e-9 >= min_order_notional
                     && crate::execution::RiskPolicyService::can_afford_one_share(cash, price, fee_pct)
             } else {
                 crate::execution::RiskPolicyService::can_afford_one_share(
@@ -1079,7 +1104,7 @@ fn compute_trade_capacity(
             }
         })
     };
-    let buy_allowed = drawdown_ok && can_afford && cash > 0.0;
+    let buy_allowed = drawdown_ok && can_afford && cash > 0.0 && capital_reason.is_none();
     let sell_allowed = held_symbols.iter().any(|s| !seen.contains(s));
     let max_buy_signals = if buy_allowed {
         crate::execution::max_buys_for_min_notional(
@@ -1108,6 +1133,8 @@ fn compute_trade_capacity(
         let mut reasons = Vec::new();
         if !drawdown_ok {
             reasons.push("daily drawdown limit");
+        } else if let Some(reason) = capital_reason {
+            reasons.push(reason);
         } else if !can_afford {
             if min_order_notional > 0.0 {
                 reasons.push("cash below broker minimum order");
@@ -1137,6 +1164,7 @@ fn compute_trade_capacity(
         min_confidence: param_set.min_confidence_to_trade,
         skip_llm,
         skip_reason,
+        capital_reason,
     }
 }
 
@@ -1432,6 +1460,7 @@ pub async fn run_cycle(
                 conn,
                 24,
                 settings.max_live_actions.max(1) as usize,
+                !generated.buys_disabled,
             )
         })?;
         let generated_set: std::collections::HashSet<String> =
@@ -1736,6 +1765,10 @@ mod tests {
         }
     }
 
+    fn remaining_for(cash: f64, min_n: f64) -> f64 {
+        crate::execution::remaining_buy_budget(cash, sample_param_row().cycle_budget_pct, min_n)
+    }
+
     #[test]
     fn capacity_skips_llm_when_no_cash_and_no_holds() {
         let row = sample_param_row();
@@ -1759,6 +1792,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             0.0,
+            remaining_for(0.0, 0.0),
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1790,6 +1824,7 @@ mod tests {
             &held,
             &HashSet::new(),
             0.0,
+            remaining_for(1_000_000.0, 0.0),
         );
         assert!(!cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1823,6 +1858,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             0.0,
+            remaining_for(1_000_000.0, 0.0),
         );
         assert!(!cap.skip_llm);
         assert!(cap.buy_allowed);
@@ -1857,6 +1893,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             0.0,
+            remaining_for(200.0, 0.0),
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1890,10 +1927,114 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             crate::execution::BAMBOO_MIN_ORDER_NOTIONAL,
+            remaining_for(16_750.0, crate::execution::BAMBOO_MIN_ORDER_NOTIONAL),
         );
         assert!(cap.buy_allowed);
         assert_eq!(cap.max_buy_signals, 1);
         assert!(!cap.skip_llm);
+        assert!(cap.capital_reason.is_none());
+    }
+
+    #[test]
+    fn capacity_blocks_buys_when_cash_below_bamboo_minimum() {
+        let row = sample_param_row();
+        let risk = row.to_param_set();
+        let universe = vec![UniverseRow {
+            symbol: "GTCO".into(),
+            sector: None,
+            price: Some(50.0),
+            change_percent: Some(1.0),
+            volume: Some(1000),
+        }];
+        let cash = 4_000.0;
+        let min_n = crate::execution::BAMBOO_MIN_ORDER_NOTIONAL;
+        let cap = compute_trade_capacity(
+            &row,
+            &risk,
+            cash,
+            cash,
+            0.0,
+            0.0015,
+            &universe,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            min_n,
+            remaining_for(cash, min_n),
+        );
+        assert!(!cap.buy_allowed);
+        assert!(cap.buys_disabled);
+        assert_eq!(cap.max_buy_signals, 0);
+        assert!(cap.capital_reason.unwrap_or("").contains("minimum"));
+    }
+
+    #[test]
+    fn capacity_allows_buys_from_leftover_cash() {
+        let row = sample_param_row();
+        let risk = row.to_param_set();
+        let universe = vec![UniverseRow {
+            symbol: "GTCO".into(),
+            sector: None,
+            price: Some(50.0),
+            change_percent: Some(1.0),
+            volume: Some(1000),
+        }];
+        let cash = 11_043.0;
+        let min_n = crate::execution::BAMBOO_MIN_ORDER_NOTIONAL;
+        let remaining = crate::execution::remaining_buy_budget(cash, 1.0, min_n);
+        let cap = compute_trade_capacity(
+            &row,
+            &risk,
+            cash,
+            cash,
+            0.0,
+            0.0015,
+            &universe,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            min_n,
+            remaining,
+        );
+        assert!(cap.buy_allowed);
+        assert!(!cap.buys_disabled);
+        assert_eq!(cap.max_buy_signals, 2);
+        assert!(cap.capital_reason.is_none());
+    }
+
+    #[test]
+    fn capacity_keeps_sells_when_capital_constrained() {
+        let row = sample_param_row();
+        let risk = row.to_param_set();
+        let universe = vec![UniverseRow {
+            symbol: "GTCO".into(),
+            sector: None,
+            price: Some(50.0),
+            change_percent: Some(1.0),
+            volume: Some(1000),
+        }];
+        let held = held(&["GTCO"]);
+        let cash = 4_000.0;
+        let min_n = crate::execution::BAMBOO_MIN_ORDER_NOTIONAL;
+        let cap = compute_trade_capacity(
+            &row,
+            &risk,
+            cash,
+            cash,
+            0.0,
+            0.0015,
+            &universe,
+            &[("GTCO".into(), 100.0, 40.0)],
+            &held,
+            &HashSet::new(),
+            min_n,
+            remaining_for(cash, min_n),
+        );
+        assert!(!cap.skip_llm);
+        assert!(cap.buys_disabled);
+        assert!(cap.sell_allowed);
+        assert_eq!(cap.max_sell_signals, 1);
+        assert_eq!(cap.max_buy_signals, 0);
     }
 
     #[test]

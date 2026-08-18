@@ -61,7 +61,7 @@ export const StrategyParamSetSchema = z.object({
   max_daily_drawdown_pct: z.number().min(0).max(1),
   allowed_symbols: z.array(z.string()).nullable().optional(), // deprecated: unused; universe is all active instruments
   position_size_pct: z.number().min(0).max(1).default(0.05),
-  cycle_budget_pct: z.number().min(0.05).max(0.5).default(0.2),
+  cycle_budget_pct: z.number().min(0.05).max(1).default(0.2),
   is_active: z.boolean().optional(),
 });
 export type StrategyParamSet = z.infer<typeof StrategyParamSetSchema>;

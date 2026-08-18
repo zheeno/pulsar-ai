@@ -116,9 +116,9 @@ function toPct(ratio: number, min: number, max: number) {
 function draftFromStrategy(s: StrategyRecord): StrategyDraft {
   return {
     maxPositionPct: toPct(s.max_position_pct, 1, 50),
-    cycleBudgetPct: toPct(s.cycle_budget_pct ?? 0.2, 5, 50),
+    cycleBudgetPct: toPct(s.cycle_budget_pct ?? 0.2, 5, 100),
     minConfidenceToTrade: toPct(s.min_confidence_to_trade, 40, 95),
-    maxDailyDrawdownPct: toPct(s.max_daily_drawdown_pct, 1, 15),
+    maxDailyDrawdownPct: toPct(s.max_daily_drawdown_pct, 1, 100),
     stopLossPct: toPct(s.stop_loss_pct, 1, 25),
     takeProfitPct: toPct(s.take_profit_pct ?? 0.1, 2, 40),
   };
@@ -769,10 +769,10 @@ export default function SettingsPage() {
           <ParamSlider
             id={posSizeId}
             label="Cycle cash budget"
-            hint="Share of available cash reserved for buys in a single cycle. That budget is split across approved buys by model confidence (higher confidence gets a larger slice), then capped by max position, fees, and whole shares."
+            hint="Share of available cash reserved for buys in a single cycle. 100% uses all spendable cash (still subject to the broker minimum, max position, fees, and whole shares). That budget is split across approved buys by model confidence."
             value={strategyDraft.cycleBudgetPct}
             min={5}
-            max={50}
+            max={100}
             format={(v) => `${v}%`}
             disabled={strategyBusy}
             onChange={(v) => setStrategyDraft({ ...strategyDraft, cycleBudgetPct: v })}
@@ -791,10 +791,10 @@ export default function SettingsPage() {
           <ParamSlider
             id={maxDdId}
             label="Max daily drawdown"
-            hint="If today’s equity drop reaches this level, new buys are blocked for the rest of the day. Protects the book after a sharp session loss."
+            hint="If today’s equity drop reaches this level, new buys are blocked for the rest of the day. Set to 100% to leave buys unrestricted by session loss."
             value={strategyDraft.maxDailyDrawdownPct}
             min={1}
-            max={15}
+            max={100}
             format={(v) => `${v}%`}
             disabled={strategyBusy}
             onChange={(v) => setStrategyDraft({ ...strategyDraft, maxDailyDrawdownPct: v })}

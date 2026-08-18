@@ -1499,8 +1499,8 @@ pub fn update_strategy(
     validate_ratio("stopLossPct", strategy.stop_loss_pct)?;
     validate_ratio("minConfidenceToTrade", strategy.min_confidence_to_trade)?;
     validate_ratio("maxDailyDrawdownPct", strategy.max_daily_drawdown_pct)?;
-    if !(0.05..=0.5).contains(&strategy.cycle_budget_pct) {
-        return Err("cycleBudgetPct must be between 0.05 and 0.5".into());
+    if !(0.05..=1.0).contains(&strategy.cycle_budget_pct) {
+        return Err("cycleBudgetPct must be between 0.05 and 1.0".into());
     }
     if let Some(tp) = strategy.take_profit_pct {
         validate_ratio("takeProfitPct", tp)?;

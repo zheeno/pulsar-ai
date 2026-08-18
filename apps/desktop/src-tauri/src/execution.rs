@@ -50,6 +50,51 @@ pub fn max_buys_for_min_notional(budget: f64, min_notional: f64, cap: usize) -> 
     ((budget / min_notional).floor() as usize).min(cap)
 }
 
+/// Per-cycle BUY budget from current spendable cash.
+/// Fills already reduce the wallet, so today's buy notional is not subtracted again.
+pub fn remaining_buy_budget(
+    cash: f64,
+    cycle_budget_pct: f64,
+    min_notional: f64,
+) -> f64 {
+    live_buy_budget(cash, cycle_budget_pct, min_notional)
+}
+
+/// Why a new BUY cannot be funded this cycle. `None` means cash/budget may still
+/// allow a legal order (sandbox/wealth still need a whole-share price check).
+pub fn buy_ineligible_reason(
+    spendable: f64,
+    remaining_budget: f64,
+    min_notional: f64,
+) -> Option<&'static str> {
+    if spendable <= 0.0 {
+        return Some("insufficient spendable cash");
+    }
+    if min_notional > 0.0 && spendable + 1e-9 < min_notional {
+        return Some("cash below Bamboo ₦5000 minimum");
+    }
+    if remaining_budget <= 0.0
+        || (min_notional > 0.0 && remaining_budget + 1e-9 < min_notional)
+    {
+        return Some("daily spend budget exhausted");
+    }
+    None
+}
+
+/// Today's BUY notional at `venue` (submitted/filled/unknown).
+/// Excludes rejected and abandoned `created` rows. Not used as a second spend cap.
+pub fn todays_buy_notional(conn: &Connection, venue: &str) -> Result<f64> {
+    let v: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(requested_notional), 0) FROM order_intents
+         WHERE UPPER(side) = 'BUY' AND venue = ?1
+           AND date(created_at) = date('now')
+           AND LOWER(state) IN ('submitted', 'filled', 'unknown')",
+        [venue],
+        |row| row.get(0),
+    )?;
+    Ok(v)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSet {
     pub id: String,
@@ -151,7 +196,7 @@ impl RiskPolicyService {
     }
 
     pub fn clamp_cycle_budget_pct(pct: f64) -> f64 {
-        pct.clamp(0.05, 0.5)
+        pct.clamp(0.05, 1.0)
     }
 
     /// Normalize confidences to weights that sum to 1 via √confidence (flatter than raw).
@@ -317,6 +362,35 @@ impl ExecutionService {
         Ok(())
     }
 
+    fn mark_buys_capital_constrained(
+        conn: &Connection,
+        signal_ids: &[String],
+        reason: &str,
+    ) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+        for signal_id in signal_ids {
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT symbol, action FROM signals WHERE id = ?1 AND executed = 0",
+                    [signal_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((symbol, action)) = row else {
+                continue;
+            };
+            if !action.eq_ignore_ascii_case("BUY") {
+                continue;
+            }
+            conn.execute(
+                "UPDATE signals SET risk_policy_result = 'BLOCKED_CASH' WHERE id = ?1 AND executed = 0",
+                [signal_id],
+            )?;
+            warnings.push(format!("Skipped BUY {symbol}: {reason}"));
+        }
+        Ok(warnings)
+    }
+
     pub async fn process_signals(
         db: &Database,
         cache: &PriceCache,
@@ -367,6 +441,7 @@ impl ExecutionService {
             ));
         }
 
+        let mut skip_buy_reason: Option<&'static str> = None;
         let buy_targets = match trading_mode {
             TradingMode::Sandbox => db.with_conn(|conn| {
                 Self::plan_sandbox_buy_targets(conn, cache, signal_ids)
@@ -381,9 +456,10 @@ impl ExecutionService {
                         snap.holdings.iter().map(|h| h.current_value).sum()
                     };
                     let equity = wallet.brokerage_balance + mv;
-                    let planned = db.with_conn(|conn| {
+                    let (planned, skip) = db.with_conn(|conn| {
                         let pending_buy = intents::pending_buy_notional_on(conn, Some(client.id().as_str()))?;
                         let spendable = (wallet.brokerage_balance - pending_buy).max(0.0);
+                        let min_n = min_order_notional_for_venue(client.id().as_str());
                         let daily_drawdown =
                             live_drawdown_pct(conn, client.id().as_str(), equity).unwrap_or(0.0);
                         let portfolio: Option<(String, String)> = conn
@@ -394,25 +470,45 @@ impl ExecutionService {
                             )
                             .ok();
                         let Some((_, strategy_id)) = portfolio else {
-                            return Ok(std::collections::HashMap::new());
+                            return Ok((std::collections::HashMap::new(), None));
                         };
                         let param_set = Self::load_param_set(conn, &strategy_id)?;
-                        Self::plan_buy_targets(
+                        let remaining = remaining_buy_budget(
+                            spendable,
+                            param_set.cycle_budget_pct,
+                            min_n,
+                        );
+                        if let Some(reason) = buy_ineligible_reason(spendable, remaining, min_n) {
+                            return Ok((std::collections::HashMap::new(), Some(reason)));
+                        }
+                        let targets = Self::plan_buy_targets(
                             conn,
                             cache,
                             signal_ids,
                             &param_set,
                             spendable,
                             daily_drawdown,
-                            min_order_notional_for_venue(client.id().as_str()),
-                        )
+                            min_n,
+                            remaining,
+                        )?;
+                        Ok((targets, None))
                     })?;
+                    skip_buy_reason = skip;
                     planned
                 } else {
                     std::collections::HashMap::new()
                 }
             }
         };
+
+        if let Some(reason) = skip_buy_reason {
+            tracing::info!(target: "execution", reason, "capital-constrained");
+            warnings.push(format!("capital-constrained: {reason}"));
+            let extra = db.with_conn(|conn| {
+                Self::mark_buys_capital_constrained(conn, signal_ids, reason)
+            })?;
+            warnings.extend(extra);
+        }
 
         let cap = settings.max_live_actions.max(1) as usize;
         let (to_run, overflow) = if signal_ids.len() > cap {
@@ -433,6 +529,7 @@ impl ExecutionService {
                 cycle_id,
                 &mut cycle_sell_notional,
                 buy_targets.get(signal_id).copied(),
+                skip_buy_reason,
             )
             .await
             {
@@ -474,6 +571,7 @@ impl ExecutionService {
         cycle_id: Option<&str>,
         cycle_sell_notional: &mut f64,
         buy_target_notional: Option<f64>,
+        skip_buy_reason: Option<&str>,
     ) -> Result<bool> {
         let loaded = db.with_conn(|conn| {
             let signal: Option<(String, String, f64)> = conn
@@ -515,7 +613,8 @@ impl ExecutionService {
         let fee_pct = settings.simulated_fee_pct.max(0.0);
 
         // BUY already failed Pass A qualify — risk_policy_result was written in the planner.
-        if action == "BUY" && buy_target_notional.is_none() {
+        // Capital-constrained cycles must not call the broker for BUYs at all.
+        if action == "BUY" && (buy_target_notional.is_none() || skip_buy_reason.is_some()) {
             return Ok(false);
         }
 
@@ -1051,6 +1150,11 @@ impl ExecutionService {
                 |row| row.get(0),
             )
             .unwrap_or(0.0);
+        let remaining = remaining_buy_budget(
+            portfolio.1,
+            param_set.cycle_budget_pct,
+            0.0,
+        );
         Self::plan_buy_targets(
             conn,
             cache,
@@ -1059,6 +1163,7 @@ impl ExecutionService {
             portfolio.1,
             daily_drawdown,
             0.0,
+            remaining,
         )
     }
 
@@ -1071,6 +1176,7 @@ impl ExecutionService {
         cash: f64,
         daily_drawdown: f64,
         min_notional: f64,
+        remaining_budget: f64,
     ) -> Result<std::collections::HashMap<String, f64>> {
         let mut qualified: Vec<(String, f64)> = Vec::new();
 
@@ -1124,7 +1230,7 @@ impl ExecutionService {
         }
 
         qualified.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let budget = live_buy_budget(cash, param_set.cycle_budget_pct, min_notional);
+        let budget = remaining_budget.min(cash).max(0.0);
         if budget <= 0.0 {
             return Ok(std::collections::HashMap::new());
         }
@@ -1283,12 +1389,16 @@ impl ExecutionService {
 }
 
 /// Unexecuted BUY/SELL signals from recent cycles that should be retried on the next live run.
+/// Affordability (`BLOCKED_CASH`) BUYs are never retried — they re-hit the broker while broke.
+/// Pass `allow_buys = false` when the cycle is capital-constrained so queued BUYs stay parked.
 pub fn retryable_unexecuted_signal_ids(
     conn: &Connection,
     hours: i64,
     limit: usize,
+    allow_buys: bool,
 ) -> Result<Vec<String>> {
     let cutoff = format!("-{hours} hours");
+    let allow_buys_i: i64 = if allow_buys { 1 } else { 0 };
     let mut stmt = conn.prepare(
         "SELECT id FROM signals
          WHERE executed = 0
@@ -1299,10 +1409,15 @@ pub fn retryable_unexecuted_signal_ids(
              'BLOCKED_OTHER', 'BLOCKED_AMBIGUOUS_ORDERS', 'BLOCKED_MARKET_CLOSED',
              'BLOCKED_PENDING_CONFIRM', 'BLOCKED_LIVE_DISABLED', 'BLOCKED_QUOTE_DEVIATION'
            )
+           AND NOT (
+             UPPER(action) = 'BUY'
+             AND COALESCE(risk_policy_result, '') = 'BLOCKED_CASH'
+           )
+           AND (?3 = 1 OR UPPER(action) = 'SELL')
          ORDER BY generated_at ASC
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![cutoff, limit as i64], |row| {
+    let rows = stmt.query_map(rusqlite::params![cutoff, limit as i64, allow_buys_i], |row| {
         row.get::<_, String>(0)
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1481,6 +1596,94 @@ mod tests {
     }
 
     #[test]
+    fn buy_ineligible_when_cash_is_zero() {
+        let remaining = super::remaining_buy_budget(0.0, 0.20, super::BAMBOO_MIN_ORDER_NOTIONAL);
+        let reason = super::buy_ineligible_reason(0.0, remaining, super::BAMBOO_MIN_ORDER_NOTIONAL);
+        assert_eq!(reason, Some("insufficient spendable cash"));
+    }
+
+    #[test]
+    fn buy_ineligible_when_cash_below_bamboo_minimum() {
+        let remaining = super::remaining_buy_budget(4_000.0, 0.20, super::BAMBOO_MIN_ORDER_NOTIONAL);
+        let reason = super::buy_ineligible_reason(4_000.0, remaining, super::BAMBOO_MIN_ORDER_NOTIONAL);
+        assert!(reason.unwrap_or("").contains("minimum"));
+        assert_eq!(reason, Some("cash below Bamboo ₦5000 minimum"));
+    }
+
+    #[test]
+    fn leftover_cash_after_fills_can_still_fund_min_lot() {
+        // Wallet is already net of today's fills; do not treat prior BUY notional as a second cap.
+        let cash = 11_043.0;
+        let min_n = super::BAMBOO_MIN_ORDER_NOTIONAL;
+        let remaining_full = super::remaining_buy_budget(cash, 1.0, min_n);
+        assert!(super::buy_ineligible_reason(cash, remaining_full, min_n).is_none());
+        assert_eq!(super::max_buys_for_min_notional(remaining_full, min_n, 15), 2);
+
+        let remaining_half = super::remaining_buy_budget(cash, 0.5, min_n);
+        assert!(super::buy_ineligible_reason(cash, remaining_half, min_n).is_none());
+        assert_eq!(super::max_buys_for_min_notional(remaining_half, min_n, 15), 1);
+    }
+
+    #[test]
+    fn buy_eligible_on_recovery_with_one_min_lot() {
+        let cash = 16_750.0;
+        let remaining = super::remaining_buy_budget(cash, 0.20, super::BAMBOO_MIN_ORDER_NOTIONAL);
+        assert!(super::buy_ineligible_reason(cash, remaining, super::BAMBOO_MIN_ORDER_NOTIONAL).is_none());
+        assert_eq!(
+            super::max_buys_for_min_notional(remaining, super::BAMBOO_MIN_ORDER_NOTIONAL, 15),
+            1
+        );
+    }
+
+    #[test]
+    fn todays_buy_notional_counts_filled_and_pending_not_rejected() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE order_intents (
+                id TEXT PRIMARY KEY,
+                side TEXT,
+                requested_notional REAL,
+                venue TEXT,
+                state TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO order_intents (id, side, requested_notional, venue, state)
+             VALUES ('f', 'BUY', 5000, 'bamboo', 'filled')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO order_intents (id, side, requested_notional, venue, state)
+             VALUES ('s', 'BUY', 2500, 'bamboo', 'submitted')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO order_intents (id, side, requested_notional, venue, state)
+             VALUES ('r', 'BUY', 9000, 'bamboo', 'rejected')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO order_intents (id, side, requested_notional, venue, state)
+             VALUES ('c', 'BUY', 111, 'bamboo', 'created')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO order_intents (id, side, requested_notional, venue, state)
+             VALUES ('w', 'BUY', 8000, 'wealth', 'filled')",
+            [],
+        )
+        .unwrap();
+        let n = super::todays_buy_notional(&conn, "bamboo").unwrap();
+        assert!((n - 7500.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn bamboo_min_lot_allowed_when_it_breaches_position_cap() {
         let (result, qty) = RiskPolicyService::size_buy_from_notional(
             5_000.0,
@@ -1547,6 +1750,13 @@ mod tests {
         assert_eq!(r1, "APPROVED");
         assert!(q0 > q1);
         assert!((q0 as f64 / q1 as f64 - std::f64::consts::SQRT_2).abs() < 0.05);
+    }
+
+    #[test]
+    fn clamp_cycle_budget_allows_full_cash() {
+        assert_eq!(RiskPolicyService::clamp_cycle_budget_pct(1.0), 1.0);
+        assert_eq!(RiskPolicyService::clamp_cycle_budget_pct(1.2), 1.0);
+        assert_eq!(RiskPolicyService::clamp_cycle_budget_pct(0.01), 0.05);
     }
 
     #[test]
@@ -1918,8 +2128,54 @@ mod tests {
             [],
         )
         .unwrap();
-        let ids = super::retryable_unexecuted_signal_ids(&conn, 24, 10).unwrap();
+        let ids = super::retryable_unexecuted_signal_ids(&conn, 24, 10, true).unwrap();
         assert_eq!(ids, vec!["buy-1".to_string()]);
+    }
+
+    #[test]
+    fn retryable_excludes_blocked_cash_buys_and_all_buys_when_disallowed() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE signals (
+                id TEXT PRIMARY KEY,
+                symbol TEXT,
+                action TEXT,
+                confidence REAL,
+                rationale TEXT,
+                technical_snapshot TEXT,
+                model_name TEXT,
+                prompt_version TEXT,
+                risk_policy_result TEXT,
+                executed INTEGER,
+                generated_at TEXT DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed)
+             VALUES ('cash-buy', 'UACN', 'BUY', 0.7, 'idea', '{}', 'llm', 'v2.4.0', 'BLOCKED_CASH', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed)
+             VALUES ('broker-buy', 'GTCO', 'BUY', 0.7, 'idea', '{}', 'llm', 'v2.4.0', 'BLOCKED_BROKER', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed)
+             VALUES ('sell-1', 'NIDF', 'SELL', 0.9, 'stop', '{}', 'rules:stop-loss', 'v2.4.0', 'BLOCKED_MARKET_CLOSED', 0)",
+            [],
+        )
+        .unwrap();
+        let with_buys = super::retryable_unexecuted_signal_ids(&conn, 24, 10, true).unwrap();
+        assert!(!with_buys.iter().any(|id| id == "cash-buy"));
+        assert!(with_buys.iter().any(|id| id == "broker-buy"));
+        assert!(with_buys.iter().any(|id| id == "sell-1"));
+        assert_eq!(with_buys.len(), 2);
+        let sells_only = super::retryable_unexecuted_signal_ids(&conn, 24, 10, false).unwrap();
+        assert_eq!(sells_only, vec!["sell-1".to_string()]);
     }
 }
 
