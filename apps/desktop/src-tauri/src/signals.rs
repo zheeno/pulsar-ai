@@ -97,6 +97,8 @@ impl SignalGenerationService {
         let recent_set: std::collections::HashSet<String> =
             recent_active.iter().map(|s| s.to_uppercase()).collect();
         let recently_sold = Self::recently_sold_symbols(conn, BUY_REENTRY_COOLDOWN_HOURS)?;
+        let queued_buy_symbols = Self::queued_unexecuted_buy_symbols(conn)?;
+        let pending_unexecuted = Self::pending_unexecuted_for_prompt(conn)?;
 
         let universe_rows = Self::build_universe(conn, &held_symbols, &recent_set)?;
         if universe_rows.is_empty() {
@@ -242,6 +244,7 @@ impl SignalGenerationService {
             &positions_for_risk,
             &held_symbols,
             &seen,
+            crate::execution::min_order_notional_for_venue(&venue),
         );
 
         let min_buy_signals = MIN_BUY_TARGET.min(capacity.max_buy_signals);
@@ -270,6 +273,7 @@ impl SignalGenerationService {
                 "estimatedFeePct": settings_fee,
                 "cycleBudgetPct": param_set.cycle_budget_pct,
                 "maxPositionPct": param_set.max_position_pct,
+                "minOrderNotional": crate::execution::min_order_notional_for_venue(&venue),
             },
             "diversification": {
                 "minBuySignals": min_buy_signals,
@@ -278,6 +282,7 @@ impl SignalGenerationService {
                 "buyReentryCooldownHours": BUY_REENTRY_COOLDOWN_HOURS,
             },
             "recentlySold": recently_sold_list,
+            "pendingUnexecuted": pending_unexecuted,
             "marketContext": market_context,
             "maxActions": capacity.max_actions as i64,
             "symbolMemory": symbol_memory,
@@ -297,6 +302,7 @@ impl SignalGenerationService {
             symbol_sectors,
             min_buy_signals,
             recently_sold,
+            queued_buy_symbols,
         )))
         })?;
         let Some((
@@ -310,6 +316,7 @@ impl SignalGenerationService {
             symbol_sectors,
             min_buy_signals,
             recently_sold,
+            queued_buy_symbols,
         )) = prep
         else {
             return Ok(PortfolioGeneration {
@@ -390,6 +397,7 @@ impl SignalGenerationService {
             let mut dropped_confidence = 0usize;
             let mut dropped_symbol = 0usize;
             let mut dropped_reentry = 0usize;
+            let mut dropped_queued = 0usize;
             let mut drop_symbol_samples: Vec<String> = Vec::new();
             let buy_cap = capacity.max_buy_signals.min(crate::execution::MAX_SIGNAL_BUYS);
             let sell_cap = capacity.max_sell_signals.min(crate::execution::MAX_SIGNAL_SELLS);
@@ -429,6 +437,10 @@ impl SignalGenerationService {
                     }
                     if buy_blocked_by_reentry_cooldown(&symbol, &recently_sold) {
                         dropped_reentry += 1;
+                        continue;
+                    }
+                    if queued_buy_symbols.contains(&symbol) {
+                        dropped_queued += 1;
                         continue;
                     }
                     let sec = symbol_sectors
@@ -506,6 +518,11 @@ impl SignalGenerationService {
             if dropped_reentry > 0 {
                 gen_warnings.push(format!(
                     "Dropped {dropped_reentry} BUY(s) in SELL re-entry cooldown ({BUY_REENTRY_COOLDOWN_HOURS}h)."
+                ));
+            }
+            if dropped_queued > 0 {
+                gen_warnings.push(format!(
+                    "Dropped {dropped_queued} BUY(s) already queued from earlier cycles (will retry those orders)."
                 ));
             }
             if dropped_sector > 0 {
@@ -805,6 +822,44 @@ impl SignalGenerationService {
         Ok(set)
     }
 
+    fn queued_unexecuted_buy_symbols(
+        conn: &Connection,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut set = std::collections::HashSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT UPPER(symbol) FROM signals
+             WHERE executed = 0 AND UPPER(action) = 'BUY'
+               AND generated_at >= datetime('now', '-24 hours')",
+        )?;
+        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            set.insert(row?);
+        }
+        Ok(set)
+    }
+
+    fn pending_unexecuted_for_prompt(conn: &Connection) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT UPPER(symbol), action, COALESCE(risk_policy_result, ''), generated_at
+             FROM signals
+             WHERE executed = 0 AND UPPER(action) IN ('BUY', 'SELL')
+               AND generated_at >= datetime('now', '-24 hours')
+             ORDER BY generated_at DESC
+             LIMIT 20",
+        )?;
+        for row in stmt.query_map([], |row| {
+            Ok(json!({
+                "symbol": row.get::<_, String>(0)?,
+                "action": row.get::<_, String>(1)?,
+                "status": row.get::<_, String>(2)?,
+                "generatedAt": row.get::<_, String>(3)?,
+            }))
+        })? {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     fn recent_active_symbols(conn: &Connection, days: i64) -> Result<Vec<String>> {
         let cutoff = format!("-{days} days");
         let mut set = std::collections::HashSet::new();
@@ -996,22 +1051,42 @@ fn compute_trade_capacity(
     _positions: &[(String, f64, f64)],
     held_symbols: &std::collections::HashSet<String>,
     seen: &std::collections::HashSet<String>,
+    min_order_notional: f64,
 ) -> TradeCapacity {
     let drawdown_ok = daily_drawdown < param_set.max_daily_drawdown_pct;
-    let cycle_budget = cash
-        * crate::execution::RiskPolicyService::clamp_cycle_budget_pct(param_set.cycle_budget_pct);
-    let can_afford = universe.iter().any(|row| {
-        let price = row.price.unwrap_or(0.0);
-        if price <= 0.0 {
-            return false;
-        }
-        // Capacity gate: cycle cash budget can fund ≥1 share of some name after fees.
-        crate::execution::RiskPolicyService::can_afford_one_share(cycle_budget, price, fee_pct)
-    });
+    let cycle_budget = crate::execution::live_buy_budget(
+        cash,
+        param_set.cycle_budget_pct,
+        min_order_notional,
+    );
+    let can_afford = if cycle_budget <= 0.0 {
+        false
+    } else {
+        universe.iter().any(|row| {
+            let price = row.price.unwrap_or(0.0);
+            if price <= 0.0 {
+                return false;
+            }
+            if min_order_notional > 0.0 {
+                cash + 1e-9 >= min_order_notional
+                    && crate::execution::RiskPolicyService::can_afford_one_share(cash, price, fee_pct)
+            } else {
+                crate::execution::RiskPolicyService::can_afford_one_share(
+                    cycle_budget,
+                    price,
+                    fee_pct,
+                )
+            }
+        })
+    };
     let buy_allowed = drawdown_ok && can_afford && cash > 0.0;
     let sell_allowed = held_symbols.iter().any(|s| !seen.contains(s));
     let max_buy_signals = if buy_allowed {
-        crate::execution::MAX_SIGNAL_BUYS.min(LLM_SIGNAL_CAP)
+        crate::execution::max_buys_for_min_notional(
+            cycle_budget,
+            min_order_notional,
+            crate::execution::MAX_SIGNAL_BUYS.min(LLM_SIGNAL_CAP),
+        )
     } else {
         0
     };
@@ -1034,7 +1109,11 @@ fn compute_trade_capacity(
         if !drawdown_ok {
             reasons.push("daily drawdown limit");
         } else if !can_afford {
-            reasons.push("cycle cash budget cannot fund a whole share");
+            if min_order_notional > 0.0 {
+                reasons.push("cash below broker minimum order");
+            } else {
+                reasons.push("cycle cash budget cannot fund a whole share");
+            }
         }
         if !sell_allowed {
             reasons.push("no discretionary SELLs available");
@@ -1344,8 +1423,33 @@ pub async fn run_cycle(
         },
     )
     .await?;
-    let signal_ids = generated.signal_ids;
     warnings.extend(generated.warnings);
+
+    let mut signal_ids = generated.signal_ids.clone();
+    if trading_mode == crate::wealth::TradingMode::Live {
+        let extra = db.with_conn(|conn| {
+            crate::execution::retryable_unexecuted_signal_ids(
+                conn,
+                24,
+                settings.max_live_actions.max(1) as usize,
+            )
+        })?;
+        let generated_set: std::collections::HashSet<String> =
+            signal_ids.iter().cloned().collect();
+        let retried: Vec<String> = extra
+            .into_iter()
+            .filter(|id| !generated_set.contains(id))
+            .collect();
+        if !retried.is_empty() {
+            warnings.push(format!(
+                "Retrying {} unexecuted signal(s) from earlier cycles.",
+                retried.len()
+            ));
+            let mut merged = retried;
+            merged.extend(signal_ids);
+            signal_ids = merged;
+        }
+    }
 
     if generated.universe_size > 0 && generated.universe_size <= 20 {
         warnings.push(format!(
@@ -1425,11 +1529,12 @@ pub async fn run_cycle(
                 uuid::Uuid::new_v4().to_string(),
                 cycle_id.unwrap_or(""),
                 format!(
-                    "signals={} executed={} venue={} universe={}",
-                    signal_ids.len(),
+                    "signals={} executed={} venue={} universe={}{}",
+                    generated.signal_ids.len(),
                     executed,
                     trading_mode.as_str(),
-                    generated.universe_size
+                    generated.universe_size,
+                    warnings.first().map(|w| format!(" warn={w}")).unwrap_or_default()
                 )
             ],
         )?;
@@ -1437,7 +1542,7 @@ pub async fn run_cycle(
     });
 
     Ok(json!({
-        "signals": signal_ids.len(),
+        "signals": generated.signal_ids.len(),
         "executed": executed,
         "signalIds": signal_ids,
         "tradingMode": trading_mode.as_str(),
@@ -1653,6 +1758,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            0.0,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1683,6 +1789,7 @@ mod tests {
             &[("GTCO".into(), 100.0, 40.0)],
             &held,
             &HashSet::new(),
+            0.0,
         );
         assert!(!cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1715,6 +1822,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            0.0,
         );
         assert!(!cap.skip_llm);
         assert!(cap.buy_allowed);
@@ -1748,6 +1856,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            0.0,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1756,5 +1865,67 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("cycle cash budget"));
+    }
+
+    #[test]
+    fn bamboo_min_notional_limits_buy_count() {
+        let row = sample_param_row();
+        let risk = row.to_param_set();
+        let universe = vec![UniverseRow {
+            symbol: "GTCO".into(),
+            sector: None,
+            price: Some(50.0),
+            change_percent: Some(1.0),
+            volume: Some(1000),
+        }];
+        let cap = compute_trade_capacity(
+            &row,
+            &risk,
+            16_750.0,
+            16_750.0,
+            0.0,
+            0.0015,
+            &universe,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            crate::execution::BAMBOO_MIN_ORDER_NOTIONAL,
+        );
+        assert!(cap.buy_allowed);
+        assert_eq!(cap.max_buy_signals, 1);
+        assert!(!cap.skip_llm);
+    }
+
+    #[test]
+    fn queued_unexecuted_buys_ignore_filled_and_sells() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE signals (
+                id TEXT PRIMARY KEY,
+                symbol TEXT,
+                action TEXT,
+                executed INTEGER,
+                generated_at TEXT DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, executed) VALUES ('1', 'uacn', 'BUY', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, executed) VALUES ('2', 'GTCO', 'BUY', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, executed) VALUES ('3', 'ZENITHBANK', 'SELL', 0)",
+            [],
+        )
+        .unwrap();
+        let set = SignalGenerationService::queued_unexecuted_buy_symbols(&conn).unwrap();
+        assert!(set.contains("UACN"));
+        assert_eq!(set.len(), 1);
     }
 }

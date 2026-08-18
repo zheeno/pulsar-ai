@@ -224,7 +224,12 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
                     continue;
                 }
 
-                let pending = intents::pending_sell_qty(conn, &exit.symbol).unwrap_or(0.0);
+                let pending = intents::pending_sell_qty_on(
+                    conn,
+                    &exit.symbol,
+                    broker.as_ref().map(|s| s.id().as_str()),
+                )
+                .unwrap_or(0.0);
                 if pending > 0.0 {
                     tracing::debug!(
                         target: "risk_monitor",

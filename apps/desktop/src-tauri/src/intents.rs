@@ -93,22 +93,48 @@ pub fn mark_terminal(
 }
 
 pub fn pending_buy_notional(conn: &Connection) -> Result<f64> {
-    let v: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(requested_notional), 0) FROM order_intents
-         WHERE side = 'BUY' AND state IN ('created', 'submitted', 'unknown')",
-        [],
-        |row| row.get(0),
-    )?;
+    pending_buy_notional_on(conn, None)
+}
+
+pub fn pending_buy_notional_on(conn: &Connection, venue: Option<&str>) -> Result<f64> {
+    let v: f64 = match venue {
+        Some(v) => conn.query_row(
+            "SELECT COALESCE(SUM(requested_notional), 0) FROM order_intents
+             WHERE side = 'BUY' AND venue = ?1 AND state IN ('created', 'submitted', 'unknown')",
+            [v],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COALESCE(SUM(requested_notional), 0) FROM order_intents
+             WHERE side = 'BUY' AND state IN ('created', 'submitted', 'unknown')",
+            [],
+            |row| row.get(0),
+        )?,
+    };
     Ok(v)
 }
 
 pub fn pending_sell_qty(conn: &Connection, symbol: &str) -> Result<f64> {
-    let v: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(requested_qty), 0) FROM order_intents
-         WHERE UPPER(symbol) = UPPER(?1) AND side = 'SELL' AND state IN ('created', 'submitted', 'unknown')",
-        [symbol],
-        |row| row.get(0),
-    )?;
+    pending_sell_qty_on(conn, symbol, None)
+}
+
+pub fn pending_sell_qty_on(conn: &Connection, symbol: &str, venue: Option<&str>) -> Result<f64> {
+    let v: f64 = match venue {
+        Some(venue) => conn.query_row(
+            "SELECT COALESCE(SUM(requested_qty), 0) FROM order_intents
+             WHERE UPPER(symbol) = UPPER(?1) AND side = 'SELL' AND venue = ?2
+               AND state IN ('created', 'submitted', 'unknown')",
+            rusqlite::params![symbol, venue],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COALESCE(SUM(requested_qty), 0) FROM order_intents
+             WHERE UPPER(symbol) = UPPER(?1) AND side = 'SELL'
+               AND state IN ('created', 'submitted', 'unknown')",
+            [symbol],
+            |row| row.get(0),
+        )?,
+    };
     Ok(v)
 }
 
@@ -124,37 +150,62 @@ pub fn pending_action_count(conn: &Connection) -> Result<i64> {
 }
 
 pub fn ambiguous_pending(conn: &Connection) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM order_intents WHERE state = 'unknown'",
-        [],
-        |row| row.get(0),
-    )?;
+    ambiguous_pending_on(conn, None)
+}
+
+/// Unknown intents on another broker must not freeze the active venue.
+pub fn ambiguous_pending_on(conn: &Connection, venue: Option<&str>) -> Result<bool> {
+    let n: i64 = match venue {
+        Some(v) => conn.query_row(
+            "SELECT COUNT(*) FROM order_intents WHERE state = 'unknown' AND venue = ?1",
+            [v],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM order_intents WHERE state = 'unknown'",
+            [],
+            |row| row.get(0),
+        )?,
+    };
     Ok(n > 0)
 }
 
 pub fn load_open_intents(conn: &Connection) -> Result<Vec<OrderIntent>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, client_order_id, external_order_id, external_order_ref, signal_id, symbol, side, requested_qty, requested_quote, requested_notional, state
-         FROM order_intents WHERE state IN ('created', 'submitted', 'unknown')",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let numeric: Option<i64> = row.get(2)?;
-        let pref: Option<String> = row.get(3)?;
-        Ok(OrderIntent {
-            id: row.get(0)?,
-            client_order_id: row.get(1)?,
-            external_order_id: numeric,
-            external_order_ref: pref.or_else(|| numeric.map(|n| n.to_string())),
-            signal_id: row.get(4)?,
-            symbol: row.get(5)?,
-            side: row.get(6)?,
-            requested_qty: row.get(7)?,
-            requested_quote: row.get(8)?,
-            requested_notional: row.get(9)?,
-            state: row.get(10)?,
-        })
-    })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    load_open_intents_on(conn, None)
+}
+
+fn map_open_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrderIntent> {
+    let numeric: Option<i64> = row.get(2)?;
+    let pref: Option<String> = row.get(3)?;
+    Ok(OrderIntent {
+        id: row.get(0)?,
+        client_order_id: row.get(1)?,
+        external_order_id: numeric,
+        external_order_ref: pref.or_else(|| numeric.map(|n| n.to_string())),
+        signal_id: row.get(4)?,
+        symbol: row.get(5)?,
+        side: row.get(6)?,
+        requested_qty: row.get(7)?,
+        requested_quote: row.get(8)?,
+        requested_notional: row.get(9)?,
+        state: row.get(10)?,
+    })
+}
+
+pub fn load_open_intents_on(conn: &Connection, venue: Option<&str>) -> Result<Vec<OrderIntent>> {
+    let sql = "SELECT id, client_order_id, external_order_id, external_order_ref, signal_id, symbol, side, requested_qty, requested_quote, requested_notional, state
+         FROM order_intents WHERE state IN ('created', 'submitted', 'unknown')";
+    let mut intents = Vec::new();
+    if let Some(v) = venue {
+        let mut stmt = conn.prepare(&format!("{sql} AND venue = ?1"))?;
+        let rows = stmt.query_map([v], map_open_intent)?;
+        intents.extend(rows.filter_map(|r| r.ok()));
+    } else {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], map_open_intent)?;
+        intents.extend(rows.filter_map(|r| r.ok()));
+    }
+    Ok(intents)
 }
 
 /// Place/HTTP failures must not stay `unknown` (that freezes all live trading
@@ -170,6 +221,32 @@ pub fn reject_unsubmitted_unknown(conn: &Connection) -> Result<usize> {
            AND external_order_id IS NULL",
         [],
     )?;
+    Ok(n)
+}
+
+/// Intents left in `created` never reached the broker (fee/quote failure after insert).
+/// Drop them so they do not reserve cash or block a retry of the same signal.
+pub fn reject_abandoned_created(conn: &Connection, venue: Option<&str>) -> Result<usize> {
+    let n = match venue {
+        Some(v) => conn.execute(
+            "UPDATE order_intents SET state = 'rejected',
+                last_error = COALESCE(last_error, 'abandoned before broker submit'),
+                updated_at = datetime('now')
+             WHERE state = 'created' AND venue = ?1
+               AND external_order_ref IS NULL
+               AND external_order_id IS NULL",
+            [v],
+        )?,
+        None => conn.execute(
+            "UPDATE order_intents SET state = 'rejected',
+                last_error = COALESCE(last_error, 'abandoned before broker submit'),
+                updated_at = datetime('now')
+             WHERE state = 'created'
+               AND external_order_ref IS NULL
+               AND external_order_id IS NULL",
+            [],
+        )?,
+    };
     Ok(n)
 }
 
@@ -249,5 +326,35 @@ mod tests {
         .unwrap();
         assert_eq!(reject_unsubmitted_unknown(&conn).unwrap(), 0);
         assert!(ambiguous_pending(&conn).unwrap());
+    }
+
+    #[test]
+    fn wealth_unknown_does_not_block_bamboo() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO order_intents (id, client_order_id, symbol, side, requested_qty, venue, state, external_order_ref)
+             VALUES ('w', 'c3', 'ZENITHBANK', 'SELL', 4, 'wealth', 'unknown', '274163')",
+            [],
+        )
+        .unwrap();
+        assert!(ambiguous_pending_on(&conn, Some("wealth")).unwrap());
+        assert!(!ambiguous_pending_on(&conn, Some("bamboo")).unwrap());
+        assert!(ambiguous_pending(&conn).unwrap());
+    }
+
+    #[test]
+    fn reject_abandoned_created_clears_cash_reservation() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO order_intents (id, client_order_id, symbol, side, requested_qty, requested_notional, venue, state)
+             VALUES ('c', 'c4', 'UACN', 'BUY', 1, 166.9, 'bamboo', 'created')",
+            [],
+        )
+        .unwrap();
+        assert!((pending_buy_notional_on(&conn, Some("bamboo")).unwrap() - 166.9).abs() < 0.01);
+        let n = reject_abandoned_created(&conn, Some("bamboo")).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(pending_buy_notional_on(&conn, Some("bamboo")).unwrap(), 0.0);
+        assert!(load_open_intents_on(&conn, Some("bamboo")).unwrap().is_empty());
     }
 }

@@ -573,28 +573,50 @@ impl BambooClient {
     pub async fn resolve_quote(&self, symbol: &str) -> Result<f64> {
         let target = symbol.to_uppercase();
         let q = urlencoding_encode(&target);
-        let _ = self
+        let search = self
             .request_json(
                 reqwest::Method::GET,
                 &format!("/api/lsx/ng/stocks?query={q}"),
                 None,
                 &[],
             )
-            .await;
-        let raw = self
+            .await
+            .ok();
+        let search_px = search
+            .as_ref()
+            .and_then(|v| extract_stock_quote(v, &target));
+
+        let detail = match self
             .request_json(
                 reqwest::Method::GET,
                 &format!("/api/lsx/ng/stocks/{target}"),
                 None,
                 &[],
             )
-            .await?;
-        let root = raw.get("data").unwrap_or(&raw);
-        json_f64_field(root, "market_price")
-            .or_else(|| json_f64_field(root, "price"))
-            .or_else(|| json_f64_field(root, "close_price"))
-            .filter(|p| *p > 0.0)
-            .ok_or_else(|| anyhow!("Bamboo quote missing for {symbol}"))
+            .await
+        {
+            Ok(raw) => extract_stock_quote(&raw, &target),
+            Err(e) => {
+                tracing::warn!(
+                    target: "bamboo",
+                    symbol = %target,
+                    error = %e,
+                    "bamboo stock detail failed; using search quote if any"
+                );
+                None
+            }
+        };
+
+        if let Some(px) = detail.or(search_px) {
+            tracing::info!(
+                target: "bamboo",
+                symbol = %target,
+                price = px,
+                "bamboo quote resolved"
+            );
+            return Ok(px);
+        }
+        Err(anyhow!("Bamboo quote missing for {symbol}"))
     }
 
     pub async fn calculate_fee(
@@ -609,6 +631,7 @@ impl BambooClient {
         } else {
             "BUY"
         };
+        let qty = ngx_whole_shares(quantity)?;
         let raw = self
             .request_json(
                 reqwest::Method::POST,
@@ -617,27 +640,40 @@ impl BambooClient {
                     "type": "MARKET",
                     "symbol": symbol.to_uppercase(),
                     "side": side,
-                    "quantity": quantity,
+                    "quantity": qty,
                     "price": price,
                     "currency": "NGN",
                 })),
                 &[("currency", "NGN")],
             )
             .await?;
-        Ok(parse_fee_quote(&raw, symbol, side, quantity, price))
+        Ok(parse_fee_quote(&raw, symbol, side, qty as f64, price))
     }
 
     pub async fn get_order(&self, order_id: &str) -> Result<crate::broker::BrokerOrder> {
         let encoded = urlencoding_encode(order_id);
-        let raw = self
-            .request_json(
-                reqwest::Method::GET,
-                &format!("/api/lsx/ng/order/{encoded}/status"),
-                None,
-                &[],
-            )
-            .await?;
-        Ok(parse_broker_order(&raw, order_id))
+        let status_path = format!("/api/lsx/ng/order/{encoded}/status");
+        match self
+            .request_json(reqwest::Method::GET, &status_path, None, &[])
+            .await
+        {
+            Ok(raw) => Ok(parse_broker_order(&raw, order_id)),
+            Err(e) if is_missing_resource(&e.to_string()) => {
+                match self
+                    .request_json(
+                        reqwest::Method::GET,
+                        &format!("/api/lsx/ng/order/{encoded}"),
+                        None,
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(raw) => Ok(parse_broker_order(&raw, order_id)),
+                    Err(_) => Ok(pending_broker_order(order_id, 0.0, None)),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn place_and_await_fill(
@@ -647,7 +683,13 @@ impl BambooClient {
         if calc.side.eq_ignore_ascii_case("BUY") && calc.available_quantity <= 0.0 {
             anyhow::bail!("Bamboo available_quantity is 0");
         }
-        let cash = self.ngn_cash().await.unwrap_or(0.0);
+        if calc.side.eq_ignore_ascii_case("BUY") && calc.total_price + 1e-9 < 5_000.0 {
+            anyhow::bail!(
+                "Bamboo minimum order is ₦5000 (got ₦{:.2})",
+                calc.total_price
+            );
+        }
+        let cash = self.ngn_cash().await?;
         if calc.side.eq_ignore_ascii_case("BUY") && calc.total_price > cash {
             anyhow::bail!(
                 "Insufficient Bamboo cash (need ₦{:.2}, have ₦{:.2})",
@@ -657,11 +699,12 @@ impl BambooClient {
         }
         let wallet_id = self.ensure_ngn_wallet_id().await?;
         let pin = bamboo_transaction_pin()?;
+        let qty = ngx_whole_shares(calc.quantity)?;
         let mut body = serde_json::json!({
             "symbol": calc.symbol.to_uppercase(),
             "side": calc.side,
             "order_type": "MARKET",
-            "quantity": calc.quantity,
+            "quantity": qty,
             "price": calc.price,
             "price_per_share": calc.price_per_share,
             "fee": calc.fee,
@@ -688,23 +731,11 @@ impl BambooClient {
                 &[("currency", "NGN")],
             )
             .await?;
-        let order_id = placed
-            .get("order_id")
-            .or_else(|| placed.get("id"))
-            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_i64().map(|n| n.to_string())))
+        let order_id = extract_order_id(&placed)
             .ok_or_else(|| anyhow!("Bamboo place missing order_id"))?;
 
         let mut order = self.get_order(&order_id).await.unwrap_or_else(|_| {
-            crate::broker::BrokerOrder {
-                id: order_id.clone(),
-                numeric_id: None,
-                stock_id: None,
-                status: "pending".into(),
-                quantity: calc.quantity,
-                quote_price: Some(calc.price_per_share),
-                unit_price: Some(calc.price_per_share),
-                rejection_reason: None,
-            }
+            pending_broker_order(&order_id, qty as f64, Some(calc.price_per_share))
         });
         if order.status == "executed" || order.status == "rejected" {
             return Ok(order);
@@ -727,8 +758,23 @@ impl BambooSyncService {
         db: &crate::db::Database,
         client: &BambooClient,
     ) -> Result<CachedWealthBook> {
+        let previous = Self::load(db).ok().flatten();
         let snap = client.get_portfolio().await?;
-        let cash = client.ngn_cash().await.unwrap_or(0.0);
+        let cash = match client.ngn_cash().await {
+            Ok(c) => c,
+            Err(e) => match previous.as_ref().map(|b| b.brokerage_balance) {
+                Some(cached) if cached > 0.0 => {
+                    tracing::warn!(
+                        target: "bamboo",
+                        error = %e,
+                        cached,
+                        "Bamboo NGN cash fetch failed; keeping cached balance"
+                    );
+                    cached
+                }
+                _ => return Err(e),
+            },
+        };
         db.with_conn(|conn| persist_snapshot(conn, &snap, cash))?;
         db.with_conn(load_snapshot)?
             .ok_or_else(|| anyhow!("Bamboo cache empty after persist"))
@@ -905,6 +951,12 @@ pub fn parse_ngn_cash(raw: &Value) -> Option<f64> {
     json_f64_field(row, "wallet_balance").or_else(|| json_f64_field(row, "balance"))
 }
 
+/// Prefer a live wallet read. A fetch failure must not be stored as ₦0 (that
+/// skips the LLM on the next cycle while the account still has cash).
+pub fn pick_ngn_cash(fetched: Option<f64>, previous: Option<f64>) -> Option<f64> {
+    fetched.or_else(|| previous.filter(|c| *c > 0.0))
+}
+
 pub fn map_order_status(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "successful" | "success" | "filled" | "executed" | "complete" | "completed" => "executed",
@@ -930,18 +982,27 @@ fn parse_fee_quote(
     price: f64,
 ) -> BambooFeeQuote {
     let root = raw.get("data").unwrap_or(raw);
-    let qty = json_f64_field(root, "quantity").unwrap_or(quantity);
+    let qty = json_f64_field(root, "quantity")
+        .unwrap_or(quantity)
+        .floor()
+        .max(0.0);
     let pps = json_f64_field(root, "price_per_share")
         .or_else(|| json_f64_field(root, "price"))
         .unwrap_or(price);
     let fee = json_f64_field(root, "fee").unwrap_or(0.0);
     let total = json_f64_field(root, "total_price").unwrap_or(qty * pps + fee);
+    let requested = qty.max(quantity).max(0.0);
+    // 0/missing available_quantity is not "no shares" — treating it as 0 made
+    // live BUYs walk qty down one share at a time (hundreds of calculate calls).
+    let available_quantity = json_f64_field(root, "available_quantity")
+        .filter(|q| *q >= 1.0)
+        .unwrap_or(requested);
     BambooFeeQuote {
         fee,
         quantity: qty,
         price_per_share: pps,
         total_price: total,
-        available_quantity: json_f64_field(root, "available_quantity").unwrap_or(qty),
+        available_quantity,
         symbol: root
             .get("symbol")
             .and_then(|v| v.as_str())
@@ -1082,9 +1143,151 @@ fn is_auth_error_body(text: &str) -> bool {
 fn extract_error_message(body: &Value) -> Option<String> {
     body.get("message")
         .or_else(|| body.get("error"))
-        .and_then(|v| v.as_str())
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        }))
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            body.pointer("/errors/0")
+                .and_then(|v| v.as_str().map(str::to_string).or_else(|| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                }))
+        })
+}
+
+fn is_missing_resource(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("missing required resource") || m.contains("bamboo api error 404")
+}
+
+fn ngx_whole_shares(quantity: f64) -> Result<i64> {
+    if !quantity.is_finite() || quantity < 1.0 {
+        anyhow::bail!("Only whole share trading is possible");
+    }
+    let n = quantity.floor() as i64;
+    if n < 1 {
+        anyhow::bail!("Only whole share trading is possible");
+    }
+    Ok(n)
+}
+
+fn quote_price_of(obj: &Value) -> Option<f64> {
+    json_f64_field(obj, "market_price")
+        .or_else(|| json_f64_field(obj, "price"))
+        .or_else(|| json_f64_field(obj, "close_price"))
+        .or_else(|| json_f64_field(obj, "last_price"))
+        .or_else(|| json_f64_field(obj, "naira_price"))
+        .or_else(|| json_f64_field(obj, "prev_close_price"))
+        .or_else(|| json_f64_field(obj, "open_price"))
+        .filter(|p| *p > 0.0)
+}
+
+fn quote_symbol_of(obj: &Value) -> Option<String> {
+    ["symbol", "ticker", "code"]
+        .into_iter()
+        .find_map(|k| obj.get(k).and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+}
+
+fn find_matching_quote(v: &Value, want: &str, depth: usize) -> Option<f64> {
+    if depth == 0 {
+        return None;
+    }
+    match v {
+        Value::Object(_) => {
+            if quote_symbol_of(v)
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(want))
+            {
+                if let Some(px) = quote_price_of(v) {
+                    return Some(px);
+                }
+            }
+            if let Some(obj) = v.as_object() {
+                for child in obj.values() {
+                    if let Some(px) = find_matching_quote(child, want, depth - 1) {
+                        return Some(px);
+                    }
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                if let Some(px) = find_matching_quote(child, want, depth - 1) {
+                    return Some(px);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_stock_quote(raw: &Value, symbol: &str) -> Option<f64> {
+    let want = symbol.trim().to_uppercase();
+    if let Some(px) = find_matching_quote(raw, &want, 8) {
+        return Some(px);
+    }
+    let root = raw.get("data").or_else(|| raw.get("stock")).unwrap_or(raw);
+    if let Some(s) = quote_symbol_of(root) {
+        if !s.eq_ignore_ascii_case(&want) {
+            return None;
+        }
+    }
+    quote_price_of(root).or_else(|| root.get("stock").and_then(quote_price_of))
+}
+
+fn json_id_string(v: &Value) -> Option<String> {
+    v.as_str()
         .map(str::to_string)
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_order_id(placed: &Value) -> Option<String> {
+    const KEYS: &[&str] = &["order_id", "orderId", "id"];
+    for root in [placed, placed.get("data").unwrap_or(placed)] {
+        for key in KEYS {
+            if let Some(id) = root.get(*key).and_then(json_id_string) {
+                if id != "0" {
+                    return Some(id);
+                }
+            }
+        }
+        if let Some(id) = root
+            .pointer("/order/order_id")
+            .or_else(|| root.pointer("/order/id"))
+            .and_then(json_id_string)
+        {
+            if id != "0" {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn pending_broker_order(
+    order_id: &str,
+    quantity: f64,
+    price: Option<f64>,
+) -> crate::broker::BrokerOrder {
+    crate::broker::BrokerOrder {
+        id: order_id.to_string(),
+        numeric_id: None,
+        stock_id: None,
+        status: "pending".into(),
+        quantity,
+        quote_price: price,
+        unit_price: price,
+        rejection_reason: None,
+    }
 }
 
 fn json_f64_field(obj: &Value, key: &str) -> Option<f64> {
@@ -1162,6 +1365,14 @@ mod tests {
     }
 
     #[test]
+    fn pick_ngn_cash_keeps_cache_when_fetch_fails() {
+        assert_eq!(pick_ngn_cash(None, Some(16_750.0)), Some(16_750.0));
+        assert_eq!(pick_ngn_cash(Some(0.0), Some(16_750.0)), Some(0.0));
+        assert_eq!(pick_ngn_cash(None, Some(0.0)), None);
+        assert_eq!(pick_ngn_cash(Some(4_900.0), Some(16_750.0)), Some(4_900.0));
+    }
+
+    #[test]
     fn maps_order_status_strings() {
         assert_eq!(map_order_status("Successful"), "executed");
         assert_eq!(map_order_status("Filled"), "executed");
@@ -1169,6 +1380,109 @@ mod tests {
         assert_eq!(map_order_status("Pending"), "pending");
         assert_eq!(map_order_status("New"), "pending");
         assert_eq!(map_order_status("Cancelled"), "cancelled");
+    }
+
+    #[test]
+    fn quote_from_search_result_matches_symbol() {
+        let raw = serde_json::json!({
+            "result": [{
+                "symbol": "FLOURMILL",
+                "market_price": 42.5,
+                "price": 42.5
+            }]
+        });
+        assert_eq!(extract_stock_quote(&raw, "flourmill"), Some(42.5));
+    }
+
+    #[test]
+    fn quote_from_nested_data_stock() {
+        let raw = serde_json::json!({
+            "data": {
+                "stock": { "market_price": "88.10" }
+            }
+        });
+        assert_eq!(extract_stock_quote(&raw, "GTCO"), Some(88.10));
+    }
+
+    #[test]
+    fn quote_from_detail_close_price() {
+        let raw = serde_json::json!({
+            "data": {
+                "symbol": "DANGCEM",
+                "close_price": 330.5
+            }
+        });
+        assert_eq!(extract_stock_quote(&raw, "DANGCEM"), Some(330.5));
+    }
+
+    #[test]
+    fn quote_ignores_unrelated_search_hits() {
+        let raw = serde_json::json!({
+            "result": [
+                { "symbol": "GTCO", "market_price": 50.0 },
+                { "symbol": "ZENITHBANK", "market_price": 40.0 }
+            ]
+        });
+        assert_eq!(extract_stock_quote(&raw, "FLOURMILL"), None);
+    }
+
+    #[test]
+    fn ngx_quantity_is_whole_shares_json_integer() {
+        assert_eq!(ngx_whole_shares(10.9).unwrap(), 10);
+        assert_eq!(ngx_whole_shares(1.0).unwrap(), 1);
+        assert!(ngx_whole_shares(0.4).is_err());
+        let body = serde_json::json!({ "quantity": ngx_whole_shares(12.0).unwrap() });
+        assert_eq!(body["quantity"].as_i64(), Some(12));
+        assert!(body["quantity"].as_i64().is_some());
+    }
+
+    #[test]
+    fn fee_quote_floors_fractional_quantity() {
+        let raw = serde_json::json!({
+            "quantity": 3.7,
+            "price_per_share": 10.0,
+            "fee": 1.0,
+            "total_price": 38.0,
+            "available_quantity": 3.7,
+            "symbol": "GTCO",
+            "side": "BUY"
+        });
+        let q = parse_fee_quote(&raw, "GTCO", "BUY", 3.7, 10.0);
+        assert_eq!(q.quantity, 3.0);
+        assert_eq!(q.available_quantity, 3.7);
+    }
+
+    #[test]
+    fn fee_quote_zero_available_falls_back_to_requested() {
+        let raw = serde_json::json!({
+            "quantity": 252,
+            "price_per_share": 1.61,
+            "fee": 5.0,
+            "total_price": 411.0,
+            "available_quantity": 0,
+            "symbol": "DAARCOMM",
+            "side": "BUY"
+        });
+        let q = parse_fee_quote(&raw, "DAARCOMM", "BUY", 252.0, 1.61);
+        assert_eq!(q.quantity, 252.0);
+        assert_eq!(q.available_quantity, 252.0);
+    }
+
+    #[test]
+    fn order_id_from_nested_data() {
+        let placed = serde_json::json!({
+            "data": { "order_id": "BB.LAMB_abc" }
+        });
+        assert_eq!(extract_order_id(&placed).as_deref(), Some("BB.LAMB_abc"));
+        let top = serde_json::json!({ "order_id": "BB.LAMB_top" });
+        assert_eq!(extract_order_id(&top).as_deref(), Some("BB.LAMB_top"));
+    }
+
+    #[test]
+    fn missing_resource_is_detected() {
+        assert!(is_missing_resource("Missing required resource to complete request"));
+        assert!(is_missing_resource("Bamboo API error 404"));
+        assert!(!is_missing_resource("Only whole share trading is possible"));
     }
 
     #[test]

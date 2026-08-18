@@ -13,6 +13,7 @@ export function buildPortfolioSignalPrompt(context: Record<string, unknown>): st
   const minConfidence = Number(
     constraints.minConfidenceToTrade ?? strategy.minConfidenceToTrade ?? 0.65,
   );
+  const minOrderNotional = Number(constraints.minOrderNotional ?? 0);
   const diversification = (context.diversification ?? {}) as Record<string, unknown>;
   const minBuySignals = Math.max(
     1,
@@ -25,6 +26,9 @@ export function buildPortfolioSignalPrompt(context: Record<string, unknown>): st
   );
   const heldSectorCounts = diversification.heldSectorCounts ?? {};
   const recentlySold = Array.isArray(context.recentlySold) ? context.recentlySold : [];
+  const pendingUnexecuted = Array.isArray(context.pendingUnexecuted)
+    ? context.pendingUnexecuted
+    : [];
   const buysDisabled = Boolean(constraints.buysDisabled);
   const universeTsv = String(context.universeTsv ?? '');
   const universeSize = Number(context.universeSize ?? 0);
@@ -36,6 +40,7 @@ export function buildPortfolioSignalPrompt(context: Record<string, unknown>): st
     executionConstraints: constraints,
     diversification,
     recentlySold,
+    pendingUnexecuted,
     marketContext: context.marketContext ?? null,
     cashBalance: context.cashBalance ?? 0,
     brokerageBalance: context.brokerageBalance ?? null,
@@ -50,7 +55,9 @@ export function buildPortfolioSignalPrompt(context: Record<string, unknown>): st
     : `- Target at least ${minBuySignals} and at most ${maxBuySignals} BUY ideas when maxBuySignals > 0 (hard cap per cycle). Do not return an empty signals array.
 - Only include a BUY when confidence >= ${minConfidence}
 - Do not propose a BUY that cannot fund at least one whole share given cashBalance × cycleBudgetPct and estimatedFeePct
+${minOrderNotional > 0 ? `- Broker minimum is ₦${minOrderNotional} per order. Return at most ${maxBuySignals} BUY(s). Prefer liquid mid/large names; do not spray penny stocks that would need thousands of shares to clear the minimum` : ''}
 - Do NOT BUY any ticker in recentlySold (SELL re-entry cooldown of ${buyReentryCooldownHours}h)
+- Do NOT repeat tickers in pendingUnexecuted — those orders are already queued and will be retried. If buy slots remain, pick different UNIVERSE names. Do not return an empty signals array when maxBuySignals > 0.
 - At most ${maxBuysPerSector} BUYs per UNIVERSE sec code; cover at least 3 sectors when the table has that many
 - Prefer names that do not further concentrate heldSectorCounts=${JSON.stringify(heldSectorCounts)} or recent symbolMemory when data supports it
 - Higher confidence receives a larger share of the cycle cash budget at execution; you do not choose quantities`;
