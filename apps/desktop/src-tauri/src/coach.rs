@@ -18,6 +18,7 @@ const TITLE_MAX: usize = 72;
 
 thread_local! {
     static ACTIVE_SESSION: RefCell<Option<String>> = const { RefCell::new(None) };
+    static ACTIVE_INTENT: RefCell<Option<(String, Vec<String>)>> = const { RefCell::new(None) };
 }
 
 pub fn with_active_session<T>(id: &str, f: impl FnOnce() -> T) -> T {
@@ -27,8 +28,25 @@ pub fn with_active_session<T>(id: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
+pub fn with_active_intent<T>(class: &str, allowed: &[&str], f: impl FnOnce() -> T) -> T {
+    ACTIVE_INTENT.with(|s| {
+        *s.borrow_mut() = Some((
+            class.to_string(),
+            allowed.iter().map(|n| (*n).to_string()).collect(),
+        ));
+    });
+    let out = f();
+    ACTIVE_INTENT.with(|s| *s.borrow_mut() = None);
+    out
+}
+
 fn active_session_id() -> Option<String> {
     ACTIVE_SESSION.with(|s| s.borrow().clone())
+}
+
+/// Agent loop may never execute or apply; UI confirm/apply commands do that.
+pub fn tool_refused_for_active_intent(name: &str) -> bool {
+    crate::coach_intent::is_irreversible_coach_tool(name)
 }
 
 pub fn list_sessions(conn: &Connection) -> Result<Vec<Value>> {
@@ -195,6 +213,13 @@ fn arg_f64(args: &Value, key: &str) -> Option<f64> {
 }
 
 pub fn handle_tool(db: &Database, settings: &AppSettings, name: &str, args: &Value) -> Value {
+    if tool_refused_for_active_intent(name) {
+        return json!({
+            "ok": false,
+            "refused": true,
+            "error": format!("{name} must be confirmed in the UI, not called from chat"),
+        });
+    }
     let result = db.with_conn(|conn| dispatch(conn, settings, name, args));
     match result {
         Ok(v) => v,
@@ -1257,5 +1282,92 @@ mod tests {
         assert_eq!(redacted["symbol"], "GTCO");
         assert_eq!(redacted["apiKey"], "[redacted]");
         assert_eq!(redacted["token"], "[redacted]");
+    }
+
+    #[test]
+    fn agent_loop_refuses_irreversible_writes_only() {
+        let (dir, db) = setup();
+        let settings = AppSettings::default();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO instruments (symbol, name) VALUES ('GTCO', 'GTCO')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO price_history (symbol, trade_date, price) VALUES ('GTCO', '2026-08-18', 46.2)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let quote = with_active_intent("conversation", crate::coach_intent::COACH_AGENT_TOOLS, || {
+            handle_tool(
+                &db,
+                &settings,
+                "get_symbol_quote",
+                &json!({ "symbol": "GTCO" }),
+            )
+        });
+        assert_ne!(quote.get("refused"), Some(&json!(true)));
+        assert_ne!(quote["ok"], false);
+        let snapshot = handle_tool(&db, &settings, "get_account_snapshot", &json!({}));
+        assert_ne!(snapshot.get("refused"), Some(&json!(true)));
+        let exec = handle_tool(
+            &db,
+            &settings,
+            "execute_trade",
+            &json!({ "proposalId": "x" }),
+        );
+        assert_eq!(exec["ok"], false);
+        assert!(
+            exec.get("refused") == Some(&json!(true))
+                || exec["error"].as_str().unwrap_or("").contains("Confirm")
+        );
+        let apply = handle_tool(&db, &settings, "apply_strategy_patch", &json!({}));
+        assert_eq!(apply["ok"], false);
+        let unknown = handle_tool(&db, &settings, "invent_prices", &json!({}));
+        assert_eq!(unknown["ok"], false);
+        assert!(unknown.get("refused").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn research_intent_still_allows_quote() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO instruments (symbol, name) VALUES ('GTCO', 'GTCO')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO price_history (symbol, trade_date, price) VALUES ('GTCO', '2026-08-18', 46.2)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let settings = AppSettings::default();
+        let v = with_active_intent("conversation", crate::coach_intent::COACH_AGENT_TOOLS, || {
+            handle_tool(
+                &db,
+                &settings,
+                "get_symbol_quote",
+                &json!({ "symbol": "GTCO" }),
+            )
+        });
+        assert_ne!(v.get("refused"), Some(&json!(true)));
+        let trade = handle_tool(
+            &db,
+            &settings,
+            "execute_trade",
+            &json!({
+                "sessionId": "x",
+                "symbol": "GTCO",
+                "side": "BUY",
+                "quantity": 1.0
+            }),
+        );
+        assert_eq!(trade["ok"], false);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

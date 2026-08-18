@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { IconStrategy } from '../components/Icons';
+import { CoachMarkdown } from '../components/CoachMarkdown';
 import { api } from '../lib/api';
 import { formatNaira } from '../lib/format';
 import { useToast } from '../lib/toast';
@@ -149,7 +150,9 @@ function turnsFromSession(session: {
             current: (payload.current as Record<string, number>) || {},
           }
         : undefined,
-      toolTrace: (payload.toolTrace as ToolChip[]) || undefined,
+      toolTrace: Array.isArray(payload.toolTrace) && (payload.toolTrace as ToolChip[]).length
+        ? (payload.toolTrace as ToolChip[])
+        : undefined,
       trade: tradeCard,
     };
   });
@@ -361,8 +364,9 @@ export default function CoachPage() {
         <div>
           <h1>Coach</h1>
           <p>
-            Ask about the market, history, news, and risk. Coach can propose slider changes and
-            trades; nothing is saved or sent until you confirm. Closing a card does not place an order.
+            Ask about the market, history, news, and risk in plain language. Coach is a
+            conversational copilot: it uses tools only when it needs a fact, and it can
+            propose slider changes and trades. Nothing is saved or sent until you confirm.
           </p>
         </div>
       </header>
@@ -431,7 +435,11 @@ export default function CoachPage() {
                 <div className="coach-bubble__role">
                   {turn.role === 'user' ? 'You' : 'Coach'}
                 </div>
-                <p className="coach-bubble__text">{turn.text}</p>
+                {turn.role === 'assistant' ? (
+                  <CoachMarkdown content={turn.text} className="coach-bubble__text" />
+                ) : (
+                  <p className="coach-bubble__text">{turn.text}</p>
+                )}
 
                 {turn.toolTrace?.length ? (
                   <ul className="coach-tools" aria-label="Tools used">
@@ -455,7 +463,9 @@ export default function CoachPage() {
                 {turn.proposal?.needMoreContext || (turn.proposal?.clarifyingQuestions?.length ?? 0) > 0 ? (
                   <ul className="coach-questions">
                     {(turn.proposal?.clarifyingQuestions || []).map((q) => (
-                      <li key={q}>{q}</li>
+                      <li key={q}>
+                        <CoachMarkdown content={q} />
+                      </li>
                     ))}
                   </ul>
                 ) : null}

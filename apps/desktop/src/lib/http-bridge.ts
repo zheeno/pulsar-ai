@@ -786,9 +786,32 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       let toolTrace: { name: string; ok: boolean; summary: string }[] = [];
       let trade: Record<string, unknown> | null = null;
       let extra: Record<string, unknown> = {};
-      if (lower.includes('news')) {
-        toolTrace = [{ name: 'get_news', ok: false, summary: 'unavailable' }];
-        summary = 'NGX news is not wired in this mock. No headlines were invented.';
+      const isMeta =
+        /tell me about yourself|tell me about you|who are you|what can you do|how do you work|what are you|introduce yourself/.test(
+          lower,
+        );
+      const isGreeting =
+        /^(hi|hey|hello|yo|thanks|thank you|cheers|ty|bye|goodbye|later|see ya|see you)\b/.test(lower) &&
+        lower.length <= 40;
+      const isAdvisory =
+        /\badvisable\b|\bshould i\b|\bthoughts on\b|\bworth buying\b/.test(lower);
+      if (isMeta) {
+        toolTrace = [];
+        summary =
+          "I'm Coach, Pulsar's NGX desk copilot. I can check the tape, a name's history, news when it's wired, help you tighten risk sliders, and propose trades. I won't silently place live orders, and I won't invent prices or headlines. What do you want to look at?";
+      } else if (isGreeting) {
+        toolTrace = [];
+        summary = lower.includes('thank')
+          ? 'Anytime. Ping me if you want the tape, a name, or a trade idea.'
+          : 'Hey. Tape, a ticker, news, risk sliders, or a trade idea — your call.';
+      } else if (isAdvisory || lower.includes('news')) {
+        const news = lower.includes('news');
+        toolTrace = news
+          ? [{ name: 'get_news', ok: false, summary: 'unavailable' }]
+          : [{ name: 'get_symbol_quote', ok: true, summary: 'GTCO @ 46.2' }];
+        summary = news
+          ? 'NGX news is not wired in this mock. No headlines were invented.'
+          : 'GTCO last ₦46.20 as-of mock tape. Advice only — not an order.';
       } else if (lower.includes('moving') || lower.includes('quote')) {
         toolTrace = [{ name: 'list_universe_quotes', ok: true, summary: '2 quotes' }];
         summary = 'GTCO ₦46.20 (+1.2% as-of mock). MTNN ₦225.00. Figures are mock store data.';

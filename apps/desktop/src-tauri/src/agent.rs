@@ -247,6 +247,13 @@ fn dispatch_agent_tool(
     name: &str,
     args: &Value,
 ) -> Value {
+    if crate::coach::tool_refused_for_active_intent(name) {
+        return json!({
+            "ok": false,
+            "refused": true,
+            "error": format!("{name} must be confirmed in the UI, not called from chat"),
+        });
+    }
     let mapped = if name == "search_memory" {
         "memory_search"
     } else {

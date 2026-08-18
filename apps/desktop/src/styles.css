@@ -751,6 +751,153 @@ select.input {
   line-height: 1.5;
 }
 
+.coach-md {
+  margin: 0;
+  line-height: 1.55;
+  font-size: 0.95rem;
+  color: inherit;
+  overflow-wrap: anywhere;
+}
+
+.coach-md > :first-child {
+  margin-top: 0;
+}
+
+.coach-md > :last-child {
+  margin-bottom: 0;
+}
+
+.coach-md p,
+.coach-md ul,
+.coach-md ol,
+.coach-md blockquote,
+.coach-md pre,
+.coach-md .coach-md__table-wrap,
+.coach-md hr {
+  margin: 0.65em 0;
+}
+
+.coach-md h1,
+.coach-md h2,
+.coach-md h3,
+.coach-md h4 {
+  margin: 0.85em 0 0.35em;
+  line-height: 1.25;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.coach-md h1 { font-size: 1.15rem; }
+.coach-md h2 { font-size: 1.05rem; }
+.coach-md h3,
+.coach-md h4 { font-size: 0.98rem; }
+
+.coach-md ul,
+.coach-md ol {
+  padding-left: 1.25rem;
+}
+
+.coach-md li + li {
+  margin-top: 0.25em;
+}
+
+.coach-md li > .coach-md {
+  margin-top: 0.25em;
+}
+
+.coach-md strong {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.coach-md em {
+  color: var(--text-muted);
+}
+
+.coach-md a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.coach-md a:hover {
+  filter: brightness(1.08);
+}
+
+.coach-md code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 0.1em 0.35em;
+}
+
+.coach-md pre {
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  overflow: auto;
+}
+
+.coach-md pre code {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 0.84rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.coach-md blockquote {
+  margin-left: 0;
+  padding: 0.35rem 0 0.35rem 0.85rem;
+  border-left: 3px solid rgba(56, 189, 248, 0.45);
+  color: var(--text-muted);
+}
+
+.coach-md hr {
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.coach-md__table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.coach-md table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.coach-md th,
+.coach-md td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: top;
+}
+
+.coach-md th {
+  font-weight: 600;
+  color: var(--text-muted);
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.coach-md tr:last-child td {
+  border-bottom: 0;
+}
+
+.coach-questions .coach-md {
+  font-size: inherit;
+  color: inherit;
+}
+
 .coach-questions,
 .coach-warnings {
   margin: 10px 0 0;

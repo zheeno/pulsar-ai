@@ -1,4 +1,4 @@
-import { HumanMessage, ToolMessage, type BaseMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from '@langchain/core/messages';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import {
   LlmPortfolioSignalOutputSchema,
@@ -7,10 +7,10 @@ import {
   type LlmConfig,
 } from '@ngx/shared';
 import { z } from 'zod';
+import { buildCoachMessages, gateToolCall, parseCoachOutput } from './coach-brain';
 import { createChatModel } from './model-factory';
 import { buildSignalPrompt } from './prompt/v1.0.0';
 import { buildPortfolioSignalPrompt } from './prompt/v2.4.0';
-import { buildStrategyCoachPrompt } from './prompt/strategy-coach';
 
 const MAX_TOOL_ROUNDS = 3;
 /** Prompt allows 1 search + 2 upserts; hard-cap total invocations across rounds. */
@@ -31,6 +31,21 @@ function parseJson(text: string): unknown {
 
 function contentToText(content: unknown): string {
   if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && 'text' in part) {
+          return String((part as { text?: unknown }).text ?? '');
+        }
+        return '';
+      })
+      .join('')
+      .trim();
+  }
+  if (content && typeof content === 'object' && 'text' in content) {
+    return String((content as { text?: unknown }).text ?? '').trim();
+  }
   return JSON.stringify(content);
 }
 
@@ -63,7 +78,7 @@ function memoryTools(callTool: ToolCaller): any[] {
   ];
 }
 
-function coachTools(callTool: ToolCaller): any[] {
+function coachTools(callTool: ToolCaller, allowed?: string[]): any[] {
   const t = (
     name: string,
     description: string,
@@ -77,7 +92,7 @@ function coachTools(callTool: ToolCaller): any[] {
         JSON.stringify(await callTool(name, input ?? {})),
     } as any);
 
-  return [
+  const all = [
     t('get_account_snapshot', 'Cash, equity, venue, live/sandbox, Bamboo floor.', z.object({})),
     t('get_holdings', 'Open lots with avg cost, last, unrealized PnL.', z.object({})),
     t('get_recent_trades', 'Recent fills.', z.object({ limit: z.number().int().optional() })),
@@ -156,6 +171,109 @@ function coachTools(callTool: ToolCaller): any[] {
     ),
     ...memoryTools(callTool),
   ];
+  if (!allowed) return all;
+  return all.filter((tool) => allowed.includes(tool.name));
+}
+
+function toBaseMessages(
+  turns: { role: 'system' | 'user' | 'assistant'; content: string }[],
+): BaseMessage[] {
+  return turns.map((t) => {
+    if (t.role === 'system') return new SystemMessage(t.content);
+    if (t.role === 'assistant') return new AIMessage(t.content);
+    return new HumanMessage(t.content);
+  });
+}
+
+async function invokeCoachMessages(
+  config: LlmConfig,
+  context: Record<string, unknown>,
+  callTool: ToolCaller | undefined,
+): Promise<{ output: unknown; prompt: string; rawResponse: string; modelName: string }> {
+  const modelName = `${config.provider}:${config.model}`;
+  const layout = buildCoachMessages(context);
+  const prompt = layout.map((m) => `${m.role}: ${m.content}`).join('\n\n');
+  const forceHint =
+    'Do not call tools. Return the JSON copilot object (summary/patch) now. Empty patch unless this turn is a strategy change. Do not invent prices.';
+
+  const gated: ToolCaller | undefined = callTool
+    ? async (name, args) => gateToolCall('other', name, args, callTool)
+    : undefined;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (gated) {
+        const tools = coachTools(gated);
+        const bound = createChatModel(config).bindTools(tools);
+        const messages: BaseMessage[] = toBaseMessages(layout);
+        let toolCallsUsed = 0;
+        for (let round = 0; round <= COACH_TOOL_ROUNDS; round++) {
+          const response = await bound.invoke(messages);
+          const toolCalls = response.tool_calls as
+            | { name: string; args?: Record<string, unknown>; id?: string }[]
+            | undefined;
+          if (toolCalls && toolCalls.length > 0) {
+            const budgetLeft = COACH_TOOL_CALLS - toolCallsUsed;
+            messages.push(response as BaseMessage);
+            const slice = toolCalls.slice(0, Math.max(0, budgetLeft));
+            for (const tc of slice) {
+              const result = await gated(tc.name, tc.args ?? {});
+              toolCallsUsed += 1;
+              messages.push(
+                new ToolMessage({
+                  content: JSON.stringify(result),
+                  tool_call_id: tc.id || tc.name,
+                }),
+              );
+            }
+            for (const tc of toolCalls.slice(slice.length)) {
+              messages.push(
+                new ToolMessage({
+                  content: JSON.stringify({
+                    ok: false,
+                    refused: true,
+                    error: 'tool budget exhausted — finish without more tools',
+                  }),
+                  tool_call_id: tc.id || tc.name,
+                }),
+              );
+            }
+            if (toolCallsUsed >= COACH_TOOL_CALLS || round === COACH_TOOL_ROUNDS) {
+              messages.push(new HumanMessage(forceHint));
+              const finalResponse = await createChatModel(config).invoke(messages);
+              const rawResponse = contentToText(finalResponse.content);
+              return {
+                output: parseCoachOutput(rawResponse),
+                prompt,
+                rawResponse,
+                modelName,
+              };
+            }
+            continue;
+          }
+          const rawResponse = contentToText(response.content);
+          return {
+            output: parseCoachOutput(rawResponse),
+            prompt,
+            rawResponse,
+            modelName,
+          };
+        }
+      }
+
+      const response = await createChatModel(config).invoke(toBaseMessages(layout));
+      const rawResponse = contentToText(response.content);
+      return {
+        output: parseCoachOutput(rawResponse),
+        prompt,
+        rawResponse,
+        modelName,
+      };
+    } catch (err) {
+      if (attempt === 1) throw err;
+    }
+  }
+  throw new Error('LLM invoke failed after retries');
 }
 
 async function invokeWithRetry(
@@ -295,20 +413,7 @@ export async function generateStrategyCoach(
   llm: LlmConfig,
   callTool?: ToolCaller,
 ) {
-  const prompt = buildStrategyCoachPrompt(context);
-  return invokeWithRetry(
-    llm,
-    prompt,
-    (parsed) => LlmStrategyCoachOutputSchema.parse(parsed),
-    callTool,
-    {
-      tools: coachTools,
-      maxRounds: COACH_TOOL_ROUNDS,
-      maxCalls: COACH_TOOL_CALLS,
-      forceHint:
-        'Tool budget exhausted. Do not call tools. Return the JSON copilot object (summary/patch) now. Do not invent prices.',
-    },
-  );
+  return invokeCoachMessages(llm, context, callTool);
 }
 
 export async function testLlmConnection(llm: LlmConfig): Promise<string> {

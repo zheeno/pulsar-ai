@@ -5,6 +5,7 @@ mod broker;
 mod cache;
 mod calendar;
 mod coach;
+mod coach_intent;
 mod commands;
 mod db;
 mod execution;

@@ -9,7 +9,7 @@ use tauri::State;
 
 use crate::app_state::AppState;
 use crate::db::Database;
-use crate::execution::{remaining_buy_budget, BAMBOO_MIN_ORDER_NOTIONAL};
+use crate::execution::BAMBOO_MIN_ORDER_NOTIONAL;
 use crate::memory;
 use crate::settings::get_settings;
 
@@ -593,173 +593,27 @@ fn snapshot_cash(portfolio: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CoachIntent {
-    pub defer: bool,
-    pub wants_sl_tp: bool,
-    pub drawdown_pct: Option<f64>,
-    pub profit_pct: Option<f64>,
-    pub already_asked: bool,
-    pub greeting: bool,
-    pub research: bool,
+fn spendable_cash(state: &Arc<AppState>) -> f64 {
+    crate::commands::load_portfolio_default_sync(state)
+        .ok()
+        .map(|p| snapshot_cash(&p))
+        .unwrap_or(0.0)
 }
 
-impl CoachIntent {
-    /// Force a slider patch only when this turn is actually about changing Settings.
-    pub fn should_decide(&self) -> bool {
-        if self.greeting || self.research {
-            return false;
-        }
-        self.defer || self.wants_sl_tp || self.drawdown_pct.is_some()
-    }
-}
+pub use crate::coach_intent::{
+    attaches_book, canned_social_reply, is_irreversible_coach_tool, tool_allowed_for_intent,
+    CoachIntent, CoachIntentClass, COACH_AGENT_TOOLS,
+};
 
-fn looks_like_greeting(message: &str) -> bool {
-    let t = message
-        .trim()
-        .trim_matches(|c: char| matches!(c, '!' | '.' | ','))
-        .trim()
-        .to_lowercase();
-    matches!(
-        t.as_str(),
-        "hi" | "hey" | "hello" | "yo" | "sup" | "hiya" | "good morning" | "good afternoon"
-            | "good evening" | "gm" | "howdy"
-    ) || t.starts_with("hi ")
-        || t.starts_with("hey ")
-        || t.starts_with("hello ")
-}
-
-fn looks_like_research(message: &str) -> bool {
-    let t = message.to_lowercase();
-    const KEYS: &[&str] = &[
-        "price",
-        "quote",
-        "moving",
-        "movers",
-        "gainer",
-        "loser",
-        "news",
-        "headline",
-        "history",
-        "how is",
-        "how's",
-        "hows ",
-        "rsi",
-        "sma",
-        "indicator",
-        "chart",
-        "current price",
-        "last price",
-        "big mover",
-        "what's moving",
-        "whats moving",
-        "what is moving",
-        "tape",
-        "universe",
-    ];
-    KEYS.iter().any(|k| t.contains(k))
-}
-
-fn looks_like_change_request(message: &str) -> bool {
-    const KEYS: &[&str] = &[
-        "tighten",
-        "loosen",
-        "increase",
-        "decrease",
-        "set ",
-        "change",
-        "adjust",
-        "update",
-        "you decide",
-        "your call",
-        "you choose",
-        "you pick",
-        "you should decide",
-        "appropriate response",
-    ];
-    KEYS.iter().any(|k| message.contains(k))
+fn history_pairs(history: &[CoachChatTurn]) -> Vec<(String, String)> {
+    history
+        .iter()
+        .map(|t| (t.role.clone(), t.content.clone()))
+        .collect()
 }
 
 fn extract_coach_intent(message: &str, history: &[CoachChatTurn]) -> CoachIntent {
-    let current = message.to_lowercase();
-    let greeting = looks_like_greeting(message);
-    let research = !greeting && looks_like_research(message);
-    // Strategy signals come from this user turn only — never from assistant recaps of current sliders.
-    let defer = [
-        "you decide",
-        "your call",
-        "you should decide",
-        "appropriate response",
-        "i don't have a strategy",
-        "i dont have a strategy",
-        "where you come in",
-        "that's on you",
-        "thats on you",
-        "you choose",
-        "you pick",
-    ]
-    .iter()
-    .any(|p| current.contains(p));
-    let mentions_sl_tp = current.contains("stop loss")
-        || current.contains("stop-loss")
-        || current.contains("take profit")
-        || current.contains("take-profit");
-    let wants_sl_tp = mentions_sl_tp && (looks_like_change_request(&current) || defer);
-    let already_asked = history.iter().any(|t| {
-        t.role.eq_ignore_ascii_case("assistant")
-            && (t.content.contains('?') || t.content.to_lowercase().contains("need more"))
-    });
-    CoachIntent {
-        defer,
-        wants_sl_tp,
-        drawdown_pct: if greeting || research {
-            None
-        } else {
-            parse_pct_near(
-                &current,
-                &["drop", "drawdown", "tolerate", "tolerance", "loss", "dd"],
-            )
-        },
-        profit_pct: if greeting || research {
-            None
-        } else {
-            parse_pct_near(&current, &["profit", "gain", "target", "return"])
-        },
-        already_asked,
-        greeting,
-        research,
-    }
-}
-
-fn parse_pct_near(blob: &str, keywords: &[&str]) -> Option<f64> {
-    let bytes = blob.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                i += 1;
-            }
-            let Some(num) = blob.get(start..i).and_then(|s| s.parse::<f64>().ok()) else {
-                continue;
-            };
-            let rest_trim = blob.get(i..).unwrap_or("").trim_start();
-            let is_pct = rest_trim.starts_with('%')
-                || rest_trim.starts_with("percent")
-                || rest_trim.starts_with("per cent");
-            if is_pct && num > 0.0 && num <= 100.0 {
-                let window_start = start.saturating_sub(48);
-                let window_end = (i + 24).min(blob.len());
-                let window = blob.get(window_start..window_end).unwrap_or("");
-                if keywords.iter().any(|k| window.contains(k)) {
-                    return Some(num / 100.0);
-                }
-            }
-            continue;
-        }
-        i += 1;
-    }
-    None
+    crate::coach_intent::extract_coach_intent(message, &history_pairs(history))
 }
 
 pub fn coach_decide_patch(current: &StrategyParams, intent: &CoachIntent) -> StrategyPatch {
@@ -807,42 +661,39 @@ pub fn apply_forced_decision(
     current: &StrategyParams,
     intent: &CoachIntent,
 ) {
-    if intent.greeting || intent.research {
-        proposal.patch = StrategyPatch::default();
-        proposal.rationale.clear();
+    if !proposal.patch.is_empty() {
+        proposal.need_more_context = false;
+        proposal.clarifying_questions.clear();
         return;
     }
     if !intent.should_decide() {
         return;
     }
+    proposal.patch = coach_decide_patch(current, intent);
     if proposal.patch.is_empty() {
-        proposal.patch = coach_decide_patch(current, intent);
-        if !proposal.patch.is_empty() {
-            if proposal.need_more_context || proposal.summary.trim().is_empty() {
-                proposal.summary = forced_decision_summary(intent, &proposal.patch);
-            }
-            for (field, _) in proposal.patch.entries() {
-                proposal.rationale.entry(field.to_string()).or_insert_with(|| {
-                    match field {
-                        "max_daily_drawdown_pct" => {
-                            "Matches the drop you said you can tolerate.".into()
-                        }
-                        "stop_loss_pct" => {
-                            "Stop inside your drawdown band so one name cannot exhaust the daily cap.".into()
-                        }
-                        "take_profit_pct" => {
-                            "Position take-profit. A daily account profit target is not a slider.".into()
-                        }
-                        _ => "Chosen from the constraints you already stated.".into(),
-                    }
-                });
-            }
-        }
+        return;
     }
-    if !proposal.patch.is_empty() {
-        proposal.need_more_context = false;
-        proposal.clarifying_questions.clear();
+    if proposal.need_more_context || proposal.summary.trim().is_empty() {
+        proposal.summary = forced_decision_summary(intent, &proposal.patch);
     }
+    for (field, _) in proposal.patch.entries() {
+        proposal.rationale.entry(field.to_string()).or_insert_with(|| {
+            match field {
+                "max_daily_drawdown_pct" => {
+                    "Matches the drop you said you can tolerate.".into()
+                }
+                "stop_loss_pct" => {
+                    "Stop inside your drawdown band so one name cannot exhaust the daily cap.".into()
+                }
+                "take_profit_pct" => {
+                    "Position take-profit. A daily account profit target is not a slider.".into()
+                }
+                _ => "Chosen from the constraints you already stated.".into(),
+            }
+        });
+    }
+    proposal.need_more_context = false;
+    proposal.clarifying_questions.clear();
 }
 
 fn gather_context(
@@ -850,64 +701,29 @@ fn gather_context(
     message: &str,
     history: &[CoachChatTurn],
 ) -> Result<(StrategyRow, Value, Vec<String>), String> {
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let row = state
         .db
         .with_conn(read_active_strategy)
         .map_err(|e| e.to_string())?;
-    let params = &row.params;
-
-    let portfolio = crate::commands::load_portfolio_default_sync(state)?;
-    if portfolio
-        .get("stale")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        warnings.push("Live book refresh failed; using cached broker book.".into());
-    }
-    if let Some(err) = portfolio.get("wealthError").and_then(|v| v.as_str()) {
-        warnings.push(format!("Live book unavailable ({err}); using sandbox figures."));
-    }
-
-    let cash = snapshot_cash(&portfolio);
-    let equity = portfolio
-        .get("total_equity")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(cash);
-    let market_value = portfolio
-        .get("market_value")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let trading_mode = portfolio
-        .get("tradingMode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("sandbox");
-    let broker_id = portfolio
-        .get("brokerId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let min_notional = crate::execution::min_order_notional_for_venue(broker_id);
-    let remaining = remaining_buy_budget(cash, params.cycle_budget_pct, min_notional);
-
-    let trades = state
-        .db
-        .with_conn(|conn| load_recent_trades(conn, 20))
-        .unwrap_or_default();
-    let memories = state
-        .db
-        .with_conn(|conn| memory::keyword_search(conn, "strategy", None, 6))
-        .unwrap_or_default();
-
     let intent = extract_coach_intent(message, history);
-    let holdings = portfolio.get("positions").cloned().unwrap_or(json!([]));
+    let history_json: Vec<Value> = history
+        .iter()
+        .rev()
+        .take(HISTORY_TURNS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|t| json!({ "role": t.role, "content": t.content }))
+        .collect();
+
     let context = json!({
         "conversation": {
             "message": message,
-            "history": history.iter().rev().take(HISTORY_TURNS).collect::<Vec<_>>().into_iter().rev().map(|t| {
-                json!({ "role": t.role, "content": t.content })
-            }).collect::<Vec<_>>(),
+            "history": history_json,
         },
         "coachIntent": {
+            "class": intent.class.as_str(),
             "defer": intent.defer,
             "shouldDecide": intent.should_decide(),
             "wantsStopTakeProfit": intent.wants_sl_tp,
@@ -916,36 +732,11 @@ fn gather_context(
             "alreadyAskedQuestions": intent.already_asked,
             "greeting": intent.greeting,
             "research": intent.research,
+            "allowedTools": COACH_AGENT_TOOLS,
         },
-        "account": {
-            "tradingMode": trading_mode,
-            "brokerId": broker_id,
-            "brokerName": portfolio.get("brokerName"),
-            "cash": cash,
-            "equity": equity,
-            "marketValue": market_value,
-            "pnlToday": portfolio.get("pnl_today").cloned().or_else(|| portfolio.get("pnlToday").cloned()),
-        },
-        "holdings": holdings,
-        "currentParams": {
-            "max_position_pct": params.max_position_pct,
-            "cycle_budget_pct": params.cycle_budget_pct,
-            "min_confidence_to_trade": params.min_confidence_to_trade,
-            "max_daily_drawdown_pct": params.max_daily_drawdown_pct,
-            "stop_loss_pct": params.stop_loss_pct,
-            "take_profit_pct": params.take_profit_pct.unwrap_or(TAKE_PROFIT_DISPLAY_DEFAULT),
-        },
-        "recentTrades": trades,
-        "strategyMemories": memories.iter().map(|m| json!({
-            "kind": m.kind,
-            "text": m.text,
-            "source": m.source,
-            "createdAt": m.created_at,
-        })).collect::<Vec<_>>(),
         "facts": {
             "BAMBOO_MIN_ORDER_NOTIONAL": BAMBOO_MIN_ORDER_NOTIONAL,
-            "remainingBuyBudget": remaining,
-            "remainingBuyBudgetNote": "Per-cycle share of CURRENT spendable cash. Fills already reduced the wallet — do not subtract today's fills again.",
+            "remainingBuyBudgetNote": "Per-cycle share of CURRENT spendable cash. Fetch cash with get_account_snapshot — do not invent balances.",
             "sliderBounds": {
                 "max_position_pct": [0.01, 0.50],
                 "cycle_budget_pct": [0.05, 1.0],
@@ -954,18 +745,50 @@ fn gather_context(
                 "stop_loss_pct": [0.01, 0.25],
                 "take_profit_pct": [0.02, 0.40],
             },
-            "balancedDefaults": {
-                "max_position_pct": 0.10,
-                "cycle_budget_pct": 0.20,
-                "min_confidence_to_trade": 0.65,
-                "max_daily_drawdown_pct": 0.03,
-                "stop_loss_pct": 0.05,
-                "take_profit_pct": 0.10,
-            },
         },
         "contextWarnings": warnings,
     });
     Ok((row, context, warnings))
+}
+
+fn persist_coach_assistant(
+    state: &AppState,
+    session_id: &str,
+    summary: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    state
+        .db
+        .with_conn(|conn| {
+            crate::coach::append_message(conn, session_id, "assistant", summary, Some(payload))
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn social_coach_body(summary: &str) -> Value {
+    json!({
+        "current": {
+            "max_position_pct": 0.0,
+            "cycle_budget_pct": 0.0,
+            "min_confidence_to_trade": 0.0,
+            "max_daily_drawdown_pct": 0.0,
+            "stop_loss_pct": 0.0,
+            "take_profit_pct": TAKE_PROFIT_DISPLAY_DEFAULT,
+        },
+        "proposed": {},
+        "diff": [],
+        "needMoreContext": false,
+        "clarifyingQuestions": [],
+        "warnings": [],
+        "assumptions": [],
+        "rationale": summary,
+        "summary": summary,
+        "toolTrace": [],
+        "trade": null,
+        "status": "done",
+        "patch": {},
+    })
 }
 
 #[tauri::command]
@@ -981,24 +804,26 @@ pub async fn strategy_coach_propose(
             return Err("Message is required".into());
         }
         let history = history.unwrap_or_default();
-        let (row, context, book_warnings) = gather_context(&state, &message, &history)?;
-        let cash = context
-            .pointer("/account/cash")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let intent = extract_coach_intent(&message, &history);
+        let (row, mut context, book_warnings) = gather_context(&state, &message, &history)?;
+        if let Some(obj) = context.as_object_mut() {
+            obj.insert("coachCapabilities".into(), json!(COACH_AGENT_TOOLS));
+        }
+        let cash = spendable_cash(&state);
 
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
         let traces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let agent_data = state
-            .agent
-            .strategy_coach_sync(&settings, context, &state.db, Some(traces.clone()))
-            .map_err(|e| e.to_string())?;
+        let agent_data = crate::coach::with_active_intent("conversation", COACH_AGENT_TOOLS, || {
+            state
+                .agent
+                .strategy_coach_sync(&settings, context, &state.db, Some(traces.clone()))
+        })
+        .map_err(|e| e.to_string())?;
         let output = agent_data
             .get("output")
             .cloned()
             .unwrap_or(agent_data.clone());
         let mut proposal = proposal_from_llm(&output, &row.params)?;
-        let intent = extract_coach_intent(&message, &history);
         apply_forced_decision(&mut proposal, &row.params, &intent);
         if proposal.patch.is_empty() {
             proposal.warnings.retain(|w| !is_current_state_nag(w));
@@ -1209,40 +1034,24 @@ pub async fn coach_turn(
             .rev()
             .collect();
 
+        let intent = extract_coach_intent(&message, &history);
         let (row, mut context, book_warnings) = gather_context(&state, &message, &history)?;
         if let Some(obj) = context.as_object_mut() {
             obj.insert("sessionId".into(), json!(session_id));
-            obj.insert(
-                "coachCapabilities".into(),
-                json!([
-                    "get_account_snapshot",
-                    "get_holdings",
-                    "get_recent_trades",
-                    "get_strategy_params",
-                    "list_universe_quotes",
-                    "get_symbol_quote",
-                    "get_price_history",
-                    "get_indicators",
-                    "search_memory",
-                    "get_news",
-                    "propose_strategy_patch",
-                    "propose_trade"
-                ]),
-            );
+            obj.insert("coachCapabilities".into(), json!(COACH_AGENT_TOOLS));
         }
-        let cash = context
-            .pointer("/account/cash")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let cash = spendable_cash(&state);
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
         let traces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let agent_data = crate::coach::with_active_session(&session_id, || {
-            state.agent.strategy_coach_sync(
-                &settings,
-                context,
-                &state.db,
-                Some(traces.clone()),
-            )
+            crate::coach::with_active_intent("conversation", COACH_AGENT_TOOLS, || {
+                state.agent.strategy_coach_sync(
+                    &settings,
+                    context,
+                    &state.db,
+                    Some(traces.clone()),
+                )
+            })
         })
         .map_err(|e| e.to_string())?;
         let output = agent_data
@@ -1250,7 +1059,6 @@ pub async fn coach_turn(
             .cloned()
             .unwrap_or(agent_data.clone());
         let mut proposal = proposal_from_llm(&output, &row.params)?;
-        let intent = extract_coach_intent(&message, &history);
         apply_forced_decision(&mut proposal, &row.params, &intent);
         if proposal.patch.is_empty() {
             proposal.warnings.retain(|w| !is_current_state_nag(w));
@@ -1310,18 +1118,7 @@ pub async fn coach_turn(
             "toolTrace": tool_trace,
             "trade": trade,
         });
-        state
-            .db
-            .with_conn(|conn| {
-                crate::coach::append_message(
-                    conn,
-                    &session_id,
-                    "assistant",
-                    proposal.summary.as_str(),
-                    Some(&payload),
-                )
-            })
-            .map_err(|e| e.to_string())?;
+        persist_coach_assistant(&state, &session_id, proposal.summary.as_str(), &payload)?;
         if let Some(obj) = body.as_object_mut() {
             obj.insert("sessionId".into(), json!(session_id));
         }
@@ -1671,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn research_strips_accidental_llm_patch() {
+    fn research_keeps_accidental_llm_patch() {
         let current = sample_current();
         let intent = extract_coach_intent("what's the current price for MTNN", &[]);
         let mut proposal = CoachProposal {
@@ -1686,7 +1483,73 @@ mod tests {
             warnings: vec![],
         };
         apply_forced_decision(&mut proposal, &current, &intent);
-        assert!(proposal.patch.is_empty());
+        assert!((proposal.patch.stop_loss_pct.unwrap() - 0.04).abs() < EPS);
         assert_eq!(proposal.summary, "MTNN last ₦805.");
+    }
+
+    #[test]
+    fn lazy_context_never_preattaches_book() {
+        assert!(!attaches_book(CoachIntentClass::Meta));
+        assert!(!attaches_book(CoachIntentClass::Greeting));
+        assert!(!attaches_book(CoachIntentClass::Research));
+        assert!(!attaches_book(CoachIntentClass::Account));
+        assert!(!attaches_book(CoachIntentClass::Trade));
+        assert!(!attaches_book(CoachIntentClass::Strategy));
+    }
+
+    #[test]
+    fn golden_gtco_then_tell_me_about_yourself() {
+        let history = vec![
+            CoachChatTurn {
+                role: "user".into(),
+                content: "is it advisable to buy GTCO?".into(),
+            },
+            CoachChatTurn {
+                role: "assistant".into(),
+                content: "GTCO last ₦46.20; cash ₦5,485.".into(),
+            },
+        ];
+        let intent = extract_coach_intent("tell me about yourself", &history);
+        assert_eq!(intent.class, CoachIntentClass::Meta);
+        assert!(!attaches_book(intent.class));
+        assert!(tool_allowed_for_intent("meta", "get_symbol_quote"));
+        assert!(!is_irreversible_coach_tool("get_symbol_quote"));
+        let reply = canned_social_reply(&intent, "tell me about yourself");
+        let lower = reply.to_lowercase();
+        assert!(lower.contains("copilot") || lower.contains("pulsar"));
+        assert!(!lower.contains("gtco"));
+        assert!(!reply.contains('₦'));
+        let body = social_coach_body(&reply);
+        assert_eq!(body["toolTrace"], json!([]));
+        assert!(body.get("trade").unwrap().is_null());
+        assert_eq!(body["diff"], json!([]));
+    }
+
+    #[test]
+    fn research_and_trade_share_full_catalog() {
+        let intent = extract_coach_intent("is it advisable to buy GTCO?", &[]);
+        assert_eq!(intent.class, CoachIntentClass::Research);
+        assert!(tool_allowed_for_intent("research", "get_symbol_quote"));
+        assert!(tool_allowed_for_intent("research", "get_news"));
+        assert!(tool_allowed_for_intent("research", "propose_trade"));
+        assert!(!tool_allowed_for_intent("research", "execute_trade"));
+    }
+
+    #[test]
+    fn strategy_and_trade_paths_keep_write_tools() {
+        assert_eq!(
+            extract_coach_intent("tighten risk", &[]).class,
+            CoachIntentClass::Strategy
+        );
+        assert!(tool_allowed_for_intent("strategy", "get_strategy_params"));
+        assert!(tool_allowed_for_intent("strategy", "propose_strategy_patch"));
+        assert!(!tool_allowed_for_intent("strategy", "apply_strategy_patch"));
+        assert_eq!(
+            extract_coach_intent("sell half my MTNN", &[]).class,
+            CoachIntentClass::Trade
+        );
+        assert!(tool_allowed_for_intent("trade", "propose_trade"));
+        assert!(tool_allowed_for_intent("trade", "get_symbol_quote"));
+        assert!(!tool_allowed_for_intent("trade", "execute_trade"));
     }
 }
