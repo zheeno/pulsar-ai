@@ -847,7 +847,7 @@ fn persist_snapshot(
     }
 }
 
-fn load_snapshot(conn: &rusqlite::Connection) -> Result<Option<CachedWealthBook>> {
+pub(crate) fn load_snapshot(conn: &rusqlite::Connection) -> Result<Option<CachedWealthBook>> {
     let account: Option<(f64, f64, f64, String)> = conn
         .query_row(
             "SELECT brokerage_balance, stock_value, profit, synced_at FROM bamboo_account WHERE id = 1",

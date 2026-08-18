@@ -5,7 +5,10 @@ function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-/** Map frontend camelCase args to Tauri command parameter names. */
+/**
+ * Tauri 2 IPC deserializes command args as camelCase (`session_id` → `sessionId`).
+ * Wrap payload-style commands; pass other keys in camelCase.
+ */
 function tauriArgs(command: string, args?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!args) return undefined;
 
@@ -19,7 +22,7 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
 
   if (command === 'cycle_run') {
     return {
-      allow_bulk_liquidation: args.allowBulkLiquidation,
+      allowBulkLiquidation: args.allowBulkLiquidation,
     };
   }
 
@@ -35,12 +38,24 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     return { message: args.message, history: args.history };
   }
 
+  if (command === 'coach_turn') {
+    return { sessionId: args.sessionId, message: args.message };
+  }
+
+  if (command === 'coach_get_session' || command === 'coach_delete_session') {
+    return { id: args.id };
+  }
+
+  if (command === 'coach_execute_trade' || command === 'coach_cancel_trade') {
+    return { proposalId: args.proposalId };
+  }
+
   if (command === 'strategy_coach_apply') {
     return {
       selected: args.selected,
       rationale: args.rationale,
       summary: args.summary,
-      chat_excerpt: args.chatExcerpt,
+      chatExcerpt: args.chatExcerpt,
     };
   }
 

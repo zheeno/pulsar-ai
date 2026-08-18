@@ -696,6 +696,39 @@ impl SignalGenerationService {
         Ok(Some(signal_id))
     }
 
+    /// Persist a Coach-proposed trade (execution still goes through process_signals).
+    pub(crate) fn persist_coach_trade(
+        conn: &Connection,
+        symbol: &str,
+        action: &str,
+        rationale: &str,
+        quantity: f64,
+    ) -> Result<Option<String>> {
+        let pick = json!({
+            "action": action,
+            "confidence": 0.9,
+            "rationale": rationale,
+        });
+        let id = Self::persist_signal(
+            conn,
+            &pick,
+            symbol,
+            "coach",
+            rationale,
+            "coach:propose",
+            PORTFOLIO_PROMPT_VERSION,
+            false,
+        )?;
+        if let Some(ref sid) = id {
+            let snap = json!({ "coachQty": quantity.max(0.0) });
+            conn.execute(
+                "UPDATE signals SET technical_snapshot = ?1 WHERE id = ?2",
+                rusqlite::params![snap.to_string(), sid],
+            )?;
+        }
+        Ok(id)
+    }
+
     /// Persist a rules-engine SELL (stop-loss / take-profit) without an LLM log payload.
     pub(crate) fn persist_rule_sell(
         conn: &Connection,

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::State;
@@ -600,18 +600,135 @@ pub struct CoachIntent {
     pub drawdown_pct: Option<f64>,
     pub profit_pct: Option<f64>,
     pub already_asked: bool,
+    pub greeting: bool,
+    pub research: bool,
 }
 
 impl CoachIntent {
+    /// Force a slider patch only when this turn is actually about changing Settings.
     pub fn should_decide(&self) -> bool {
-        self.defer || self.already_asked || self.drawdown_pct.is_some() || self.wants_sl_tp
+        if self.greeting || self.research {
+            return false;
+        }
+        self.defer || self.wants_sl_tp || self.drawdown_pct.is_some()
     }
 }
 
-fn conversation_blob(message: &str, history: &[CoachChatTurn]) -> String {
-    let mut parts: Vec<&str> = history.iter().map(|t| t.content.as_str()).collect();
-    parts.push(message);
-    parts.join("\n").to_lowercase()
+fn looks_like_greeting(message: &str) -> bool {
+    let t = message
+        .trim()
+        .trim_matches(|c: char| matches!(c, '!' | '.' | ','))
+        .trim()
+        .to_lowercase();
+    matches!(
+        t.as_str(),
+        "hi" | "hey" | "hello" | "yo" | "sup" | "hiya" | "good morning" | "good afternoon"
+            | "good evening" | "gm" | "howdy"
+    ) || t.starts_with("hi ")
+        || t.starts_with("hey ")
+        || t.starts_with("hello ")
+}
+
+fn looks_like_research(message: &str) -> bool {
+    let t = message.to_lowercase();
+    const KEYS: &[&str] = &[
+        "price",
+        "quote",
+        "moving",
+        "movers",
+        "gainer",
+        "loser",
+        "news",
+        "headline",
+        "history",
+        "how is",
+        "how's",
+        "hows ",
+        "rsi",
+        "sma",
+        "indicator",
+        "chart",
+        "current price",
+        "last price",
+        "big mover",
+        "what's moving",
+        "whats moving",
+        "what is moving",
+        "tape",
+        "universe",
+    ];
+    KEYS.iter().any(|k| t.contains(k))
+}
+
+fn looks_like_change_request(message: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "tighten",
+        "loosen",
+        "increase",
+        "decrease",
+        "set ",
+        "change",
+        "adjust",
+        "update",
+        "you decide",
+        "your call",
+        "you choose",
+        "you pick",
+        "you should decide",
+        "appropriate response",
+    ];
+    KEYS.iter().any(|k| message.contains(k))
+}
+
+fn extract_coach_intent(message: &str, history: &[CoachChatTurn]) -> CoachIntent {
+    let current = message.to_lowercase();
+    let greeting = looks_like_greeting(message);
+    let research = !greeting && looks_like_research(message);
+    // Strategy signals come from this user turn only — never from assistant recaps of current sliders.
+    let defer = [
+        "you decide",
+        "your call",
+        "you should decide",
+        "appropriate response",
+        "i don't have a strategy",
+        "i dont have a strategy",
+        "where you come in",
+        "that's on you",
+        "thats on you",
+        "you choose",
+        "you pick",
+    ]
+    .iter()
+    .any(|p| current.contains(p));
+    let mentions_sl_tp = current.contains("stop loss")
+        || current.contains("stop-loss")
+        || current.contains("take profit")
+        || current.contains("take-profit");
+    let wants_sl_tp = mentions_sl_tp && (looks_like_change_request(&current) || defer);
+    let already_asked = history.iter().any(|t| {
+        t.role.eq_ignore_ascii_case("assistant")
+            && (t.content.contains('?') || t.content.to_lowercase().contains("need more"))
+    });
+    CoachIntent {
+        defer,
+        wants_sl_tp,
+        drawdown_pct: if greeting || research {
+            None
+        } else {
+            parse_pct_near(
+                &current,
+                &["drop", "drawdown", "tolerate", "tolerance", "loss", "dd"],
+            )
+        },
+        profit_pct: if greeting || research {
+            None
+        } else {
+            parse_pct_near(&current, &["profit", "gain", "target", "return"])
+        },
+        already_asked,
+        greeting,
+        research,
+    }
 }
 
 fn parse_pct_near(blob: &str, keywords: &[&str]) -> Option<f64> {
@@ -643,43 +760,6 @@ fn parse_pct_near(blob: &str, keywords: &[&str]) -> Option<f64> {
         i += 1;
     }
     None
-}
-
-pub fn extract_coach_intent(message: &str, history: &[CoachChatTurn]) -> CoachIntent {
-    let blob = conversation_blob(message, history);
-    let defer = [
-        "you decide",
-        "your call",
-        "you should decide",
-        "appropriate response",
-        "i don't have a strategy",
-        "i dont have a strategy",
-        "where you come in",
-        "that's on you",
-        "thats on you",
-        "you choose",
-        "you pick",
-    ]
-    .iter()
-    .any(|p| blob.contains(p));
-    let wants_sl_tp = blob.contains("stop loss")
-        || blob.contains("stop-loss")
-        || blob.contains("take profit")
-        || blob.contains("take-profit");
-    let already_asked = history.iter().any(|t| {
-        t.role.eq_ignore_ascii_case("assistant")
-            && (t.content.contains('?') || t.content.to_lowercase().contains("need more"))
-    });
-    CoachIntent {
-        defer,
-        wants_sl_tp,
-        drawdown_pct: parse_pct_near(
-            &blob,
-            &["drop", "drawdown", "tolerate", "tolerance", "loss", "dd"],
-        ),
-        profit_pct: parse_pct_near(&blob, &["profit", "gain", "target", "return"]),
-        already_asked,
-    }
 }
 
 pub fn coach_decide_patch(current: &StrategyParams, intent: &CoachIntent) -> StrategyPatch {
@@ -727,13 +807,20 @@ pub fn apply_forced_decision(
     current: &StrategyParams,
     intent: &CoachIntent,
 ) {
+    if intent.greeting || intent.research {
+        proposal.patch = StrategyPatch::default();
+        proposal.rationale.clear();
+        return;
+    }
     if !intent.should_decide() {
         return;
     }
     if proposal.patch.is_empty() {
         proposal.patch = coach_decide_patch(current, intent);
         if !proposal.patch.is_empty() {
-            proposal.summary = forced_decision_summary(intent, &proposal.patch);
+            if proposal.need_more_context || proposal.summary.trim().is_empty() {
+                proposal.summary = forced_decision_summary(intent, &proposal.patch);
+            }
             for (field, _) in proposal.patch.entries() {
                 proposal.rationale.entry(field.to_string()).or_insert_with(|| {
                     match field {
@@ -827,6 +914,8 @@ fn gather_context(
             "statedDrawdownPct": intent.drawdown_pct,
             "statedProfitPct": intent.profit_pct,
             "alreadyAskedQuestions": intent.already_asked,
+            "greeting": intent.greeting,
+            "research": intent.research,
         },
         "account": {
             "tradingMode": trading_mode,
@@ -899,9 +988,10 @@ pub async fn strategy_coach_propose(
             .unwrap_or(0.0);
 
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let traces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let agent_data = state
             .agent
-            .strategy_coach_sync(&settings, context)
+            .strategy_coach_sync(&settings, context, &state.db, Some(traces.clone()))
             .map_err(|e| e.to_string())?;
         let output = agent_data
             .get("output")
@@ -920,7 +1010,13 @@ pub async fn strategy_coach_propose(
             ));
             proposal.warnings.extend(book_warnings);
         }
-        Ok(proposal_json(&proposal, &row.params, Vec::new()))
+        let mut body = proposal_json(&proposal, &row.params, Vec::new());
+        if let Ok(g) = traces.lock() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("toolTrace".into(), json!(g.clone()));
+            }
+        }
+        Ok(body)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1015,6 +1111,288 @@ fn format_audit(
         lines.push(format!("Chat: {}", truncate(excerpt, 400)));
     }
     lines.join("\n")
+}
+
+#[tauri::command]
+pub fn coach_list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<Value>, String> {
+    state
+        .db
+        .with_conn(crate::coach::list_sessions)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn coach_new_session(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    state
+        .db
+        .with_conn(crate::coach::create_session)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn coach_delete_session(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state
+        .db
+        .with_conn(|conn| crate::coach::delete_session(conn, &id))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn coach_get_session(
+    id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Value, String> {
+    state
+        .db
+        .with_conn(|conn| {
+            let sid = match id.as_deref().filter(|s| !s.is_empty()) {
+                Some(s) => s.to_string(),
+                None => match crate::coach::latest_session_id(conn)? {
+                    Some(s) => s,
+                    None => {
+                        return crate::coach::create_session(conn);
+                    }
+                },
+            };
+            crate::coach::load_session(conn, &sid)
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn coach_turn(
+    session_id: String,
+    message: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Value, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let message = message.trim().to_string();
+        if message.is_empty() {
+            return Err("Message is required".into());
+        }
+        let session_id = session_id.trim().to_string();
+        if session_id.is_empty() {
+            return Err("sessionId is required".into());
+        }
+
+        let history: Vec<CoachChatTurn> = state
+            .db
+            .with_conn(|conn| {
+                crate::coach::append_message(conn, &session_id, "user", &message, None)?;
+                let session = crate::coach::load_session(conn, &session_id)?;
+                let mut turns = Vec::new();
+                if let Some(arr) = session.get("messages").and_then(|v| v.as_array()) {
+                    for m in arr {
+                        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                        let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if role == "user" || role == "assistant" {
+                            turns.push(CoachChatTurn {
+                                role: role.into(),
+                                content: text.into(),
+                            });
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(turns)
+            })
+            .map_err(|e| e.to_string())?;
+        // Drop the user message we just appended from history passed as "history"
+        // gather_context uses history + current message separately.
+        let history: Vec<CoachChatTurn> = history
+            .into_iter()
+            .rev()
+            .skip(1)
+            .take(HISTORY_TURNS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let (row, mut context, book_warnings) = gather_context(&state, &message, &history)?;
+        if let Some(obj) = context.as_object_mut() {
+            obj.insert("sessionId".into(), json!(session_id));
+            obj.insert(
+                "coachCapabilities".into(),
+                json!([
+                    "get_account_snapshot",
+                    "get_holdings",
+                    "get_recent_trades",
+                    "get_strategy_params",
+                    "list_universe_quotes",
+                    "get_symbol_quote",
+                    "get_price_history",
+                    "get_indicators",
+                    "search_memory",
+                    "get_news",
+                    "propose_strategy_patch",
+                    "propose_trade"
+                ]),
+            );
+        }
+        let cash = context
+            .pointer("/account/cash")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let traces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent_data = crate::coach::with_active_session(&session_id, || {
+            state.agent.strategy_coach_sync(
+                &settings,
+                context,
+                &state.db,
+                Some(traces.clone()),
+            )
+        })
+        .map_err(|e| e.to_string())?;
+        let output = agent_data
+            .get("output")
+            .cloned()
+            .unwrap_or(agent_data.clone());
+        let mut proposal = proposal_from_llm(&output, &row.params)?;
+        let intent = extract_coach_intent(&message, &history);
+        apply_forced_decision(&mut proposal, &row.params, &intent);
+        if proposal.patch.is_empty() {
+            proposal.warnings.retain(|w| !is_current_state_nag(w));
+        } else {
+            proposal.warnings.extend(bamboo_effectiveness_warnings(
+                cash,
+                &proposal.patch,
+                &row.params,
+            ));
+            proposal.warnings.extend(book_warnings);
+        }
+        let mut body = proposal_json(&proposal, &row.params, Vec::new());
+        let tool_trace = traces.lock().map(|g| g.clone()).unwrap_or_default();
+        let trade = tool_trace.iter().rev().find_map(|t| {
+            if t.get("name").and_then(|v| v.as_str()) == Some("propose_trade") {
+                state
+                    .db
+                    .with_conn(|conn| {
+                        // latest proposed for this session
+                        conn.query_row(
+                            "SELECT id FROM coach_trade_proposals
+                             WHERE session_id = ?1 AND status = 'proposed'
+                             ORDER BY created_at DESC LIMIT 1",
+                            [&session_id],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(anyhow::Error::from)
+                    })
+                    .ok()
+                    .flatten()
+                    .and_then(|pid| {
+                        state
+                            .db
+                            .with_conn(|conn| crate::coach::load_proposal(conn, &pid))
+                            .ok()
+                            .flatten()
+                    })
+            } else {
+                None
+            }
+        });
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("toolTrace".into(), json!(tool_trace));
+            obj.insert("trade".into(), json!(trade));
+            obj.insert("status".into(), json!("done"));
+        }
+        let payload = json!({
+            "proposal": body.get("diff").cloned(),
+            "needMoreContext": body.get("needMoreContext"),
+            "clarifyingQuestions": body.get("clarifyingQuestions"),
+            "warnings": body.get("warnings"),
+            "patch": body.get("patch"),
+            "rationale": body.get("rationale"),
+            "current": body.get("current"),
+            "diff": body.get("diff"),
+            "toolTrace": tool_trace,
+            "trade": trade,
+        });
+        state
+            .db
+            .with_conn(|conn| {
+                crate::coach::append_message(
+                    conn,
+                    &session_id,
+                    "assistant",
+                    proposal.summary.as_str(),
+                    Some(&payload),
+                )
+            })
+            .map_err(|e| e.to_string())?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("sessionId".into(), json!(session_id));
+        }
+        Ok(body)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn coach_execute_trade(
+    proposal_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Value, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
+        let result = crate::coach::confirm_and_execute(&state.db, &settings, &proposal_id)
+            .map_err(|e| e.to_string())?;
+        let note = if result.get("ok") == Some(&json!(true)) {
+            format!(
+                "Trade confirmed: filled ({}).",
+                result
+                    .get("riskPolicyResult")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ok")
+            )
+        } else {
+            format!(
+                "Trade confirmed but not filled: {}.",
+                result
+                    .get("riskPolicyResult")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| result.get("error").and_then(|v| v.as_str()))
+                    .unwrap_or("blocked")
+            )
+        };
+        let session_id: Option<String> = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT session_id FROM coach_trade_proposals WHERE id = ?1",
+                    [&proposal_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(anyhow::Error::from)
+            })
+            .ok()
+            .flatten();
+        if let Some(sid) = session_id {
+            let payload = json!({
+                "tradeResult": result,
+                "proposalId": proposal_id,
+            });
+            let _ = state.db.with_conn(|conn| {
+                crate::coach::append_message(conn, &sid, "assistant", &note, Some(&payload))
+            });
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn coach_cancel_trade(
+    proposal_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    crate::coach::cancel_proposal(&state.db, &proposal_id).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1231,5 +1609,84 @@ mod tests {
         assert!((proposal.patch.max_daily_drawdown_pct.unwrap() - 0.15).abs() < EPS);
         assert!(proposal.patch.stop_loss_pct.is_some());
         assert!(proposal.patch.take_profit_pct.is_some());
+    }
+
+    #[test]
+    fn greeting_does_not_force_slider_patch() {
+        let current = sample_current();
+        let intent = extract_coach_intent("hi", &[]);
+        assert!(intent.greeting);
+        assert!(!intent.should_decide());
+        let mut proposal = CoachProposal {
+            need_more_context: false,
+            clarifying_questions: vec![],
+            summary: "Hey — what do you want to look at?".into(),
+            patch: StrategyPatch::default(),
+            rationale: BTreeMap::new(),
+            warnings: vec![],
+        };
+        apply_forced_decision(&mut proposal, &current, &intent);
+        assert!(proposal.patch.is_empty());
+        assert!(proposal.summary.contains("Hey"));
+    }
+
+    #[test]
+    fn price_question_not_poisoned_by_assistant_slider_recap() {
+        let current = sample_current();
+        let history = vec![
+            CoachChatTurn {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            CoachChatTurn {
+                role: "assistant".into(),
+                content: "Hello! Cash ₦5485. Strategy: stop loss of 10% and take profit of 20%. Max daily drawdown of 5%. Need more?".into(),
+            },
+        ];
+        let intent = extract_coach_intent("what's the current price for MTNN", &history);
+        assert!(intent.research);
+        assert!(!intent.should_decide());
+        assert!(intent.already_asked);
+        let mut proposal = CoachProposal {
+            need_more_context: false,
+            clarifying_questions: vec![],
+            summary: "MTNN last ₦805 as-of 2026-08-18.".into(),
+            patch: StrategyPatch::default(),
+            rationale: BTreeMap::new(),
+            warnings: vec![],
+        };
+        apply_forced_decision(&mut proposal, &current, &intent);
+        assert!(proposal.patch.is_empty());
+        assert!(proposal.summary.contains("MTNN"));
+        assert!(!proposal.summary.contains("drop tolerance"));
+    }
+
+    #[test]
+    fn movers_question_does_not_force_slider_patch() {
+        let intent = extract_coach_intent("which stocks were the big movers today?", &[]);
+        assert!(intent.research);
+        assert!(!intent.should_decide());
+        let intent_q = extract_coach_intent("?", &[]);
+        assert!(!intent_q.should_decide());
+    }
+
+    #[test]
+    fn research_strips_accidental_llm_patch() {
+        let current = sample_current();
+        let intent = extract_coach_intent("what's the current price for MTNN", &[]);
+        let mut proposal = CoachProposal {
+            need_more_context: false,
+            clarifying_questions: vec![],
+            summary: "MTNN last ₦805.".into(),
+            patch: StrategyPatch {
+                stop_loss_pct: Some(0.04),
+                ..StrategyPatch::default()
+            },
+            rationale: BTreeMap::new(),
+            warnings: vec![],
+        };
+        apply_forced_decision(&mut proposal, &current, &intent);
+        assert!(proposal.patch.is_empty());
+        assert_eq!(proposal.summary, "MTNN last ₦805.");
     }
 }

@@ -40,7 +40,7 @@ export type AppSettings = z.infer<typeof AppSettingsSchema>;
 
 export const AgentToolCallSchema = z.object({
   type: z.literal('tool'),
-  name: z.enum(['memory_search', 'memory_upsert']),
+  name: z.string().min(1),
   arguments: z.record(z.unknown()),
 });
 export type AgentToolCall = z.infer<typeof AgentToolCallSchema>;

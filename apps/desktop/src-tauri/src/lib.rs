@@ -4,6 +4,7 @@ mod bamboo;
 mod broker;
 mod cache;
 mod calendar;
+mod coach;
 mod commands;
 mod db;
 mod execution;
@@ -253,6 +254,13 @@ pub fn run() {
             commands::update_strategy,
             strategy_coach::strategy_coach_propose,
             strategy_coach::strategy_coach_apply,
+            strategy_coach::coach_list_sessions,
+            strategy_coach::coach_get_session,
+            strategy_coach::coach_new_session,
+            strategy_coach::coach_delete_session,
+            strategy_coach::coach_turn,
+            strategy_coach::coach_execute_trade,
+            strategy_coach::coach_cancel_trade,
             commands::export_database,
             commands::app_data_dir,
             commands::reset_local_data,

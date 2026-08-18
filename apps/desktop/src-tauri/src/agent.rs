@@ -16,9 +16,8 @@ use crate::net_policy::validate_llm_base_url;
 use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
-const AGENT_IPC_TIMEOUT: Duration = Duration::from_secs(90);
-/// Max memory tool IPC messages per portfolio_signals request.
-/// One LLM turn can emit multiple tools; keep this above the worker's tool budget.
+const AGENT_IPC_TIMEOUT: Duration = Duration::from_secs(180);
+/// Max memory/coach tool IPC messages per request.
 const MAX_TOOL_CALLS: u32 = 8;
 
 pub fn parse_ipc_line(line: &str) -> Result<Value> {
@@ -49,7 +48,7 @@ impl AgentBridge {
     }
 
     pub fn ping_sync(&self) -> Result<Value> {
-        self.call(json!({ "op": "ping" }), None)
+        self.call(json!({ "op": "ping" }), None, None)
     }
 
     pub async fn ping(&self) -> Result<Value> {
@@ -58,7 +57,7 @@ impl AgentBridge {
 
     pub fn test_llm_sync(&self, settings: &AppSettings) -> Result<Value> {
         let llm = self.build_llm_config(settings)?;
-        self.call(json!({ "op": "test_llm", "llm": llm }), None)
+        self.call(json!({ "op": "test_llm", "llm": llm }), None, None)
     }
 
     pub async fn test_llm(&self, settings: &AppSettings) -> Result<Value> {
@@ -75,6 +74,7 @@ impl AgentBridge {
         self.call(
             json!({ "op": "portfolio_signals", "context": context, "llm": llm }),
             Some((db.clone(), settings.clone())),
+            None,
         )
     }
 
@@ -89,23 +89,35 @@ impl AgentBridge {
 
     pub fn symbol_signal_sync(&self, settings: &AppSettings, context: Value) -> Result<Value> {
         let llm = self.build_llm_config(settings)?;
-        self.call(json!({ "op": "symbol_signal", "context": context, "llm": llm }), None)
+        self.call(json!({ "op": "symbol_signal", "context": context, "llm": llm }), None, None)
     }
 
     pub async fn symbol_signal(&self, settings: &AppSettings, context: Value) -> Result<Value> {
         self.symbol_signal_sync(settings, context)
     }
 
-    pub fn strategy_coach_sync(&self, settings: &AppSettings, context: Value) -> Result<Value> {
+    pub fn strategy_coach_sync(
+        &self,
+        settings: &AppSettings,
+        context: Value,
+        db: &Database,
+        traces: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
+    ) -> Result<Value> {
         let llm = self.build_llm_config(settings)?;
         self.call(
             json!({ "op": "strategy_coach", "context": context, "llm": llm }),
-            None,
+            Some((db.clone(), settings.clone())),
+            traces,
         )
     }
 
-    pub async fn strategy_coach(&self, settings: &AppSettings, context: Value) -> Result<Value> {
-        self.strategy_coach_sync(settings, context)
+    pub async fn strategy_coach(
+        &self,
+        settings: &AppSettings,
+        context: Value,
+        db: &Database,
+    ) -> Result<Value> {
+        self.strategy_coach_sync(settings, context, db, None)
     }
 
     fn build_llm_config(&self, settings: &AppSettings) -> Result<Value> {
@@ -130,6 +142,7 @@ impl AgentBridge {
         &self,
         mut payload: Value,
         tools: Option<(Database, AppSettings)>,
+        traces: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
     ) -> Result<Value> {
         let id = Uuid::new_v4().to_string();
         if let Some(obj) = payload.as_object_mut() {
@@ -176,11 +189,20 @@ impl AgentBridge {
                                 "error": "tool budget exhausted — finish without more tools",
                             })
                         } else if let Some((db, settings)) = tools.as_ref() {
-                            memory::handle_tool(db, settings, &api_key, name, &args)
-                                .unwrap_or_else(|e| json!({ "ok": false, "error": e.to_string() }))
+                            dispatch_agent_tool(db, settings, &api_key, name, &args)
                         } else {
-                            json!({ "ok": false, "error": "memory tools unavailable" })
+                            json!({ "ok": false, "error": "tools unavailable" })
                         };
+                        if let Some(buf) = traces.as_ref() {
+                            if let Ok(mut g) = buf.lock() {
+                                g.push(json!({
+                                    "name": name,
+                                    "args": crate::coach::redact_args(&args),
+                                    "ok": result.get("ok") != Some(&json!(false)),
+                                    "summary": crate::coach::summarize_tool_result(name, &result),
+                                }));
+                            }
+                        }
                         let reply = json!({
                             "type": "tool_result",
                             "name": name,
@@ -215,6 +237,25 @@ impl AgentBridge {
                 Err(anyhow!("Agent worker timed out and was restarted"))
             }
         }
+    }
+}
+
+fn dispatch_agent_tool(
+    db: &Database,
+    settings: &AppSettings,
+    api_key: &str,
+    name: &str,
+    args: &Value,
+) -> Value {
+    let mapped = if name == "search_memory" {
+        "memory_search"
+    } else {
+        name
+    };
+    match mapped {
+        "memory_search" | "memory_upsert" => memory::handle_tool(db, settings, api_key, mapped, args)
+            .unwrap_or_else(|e| json!({ "ok": false, "error": e.to_string() })),
+        _ => crate::coach::handle_tool(db, settings, mapped, args),
     }
 }
 

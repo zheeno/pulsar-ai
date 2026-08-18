@@ -82,7 +82,7 @@ async function handleRequest(line: string): Promise<void> {
         break;
       }
       case 'strategy_coach': {
-        const result = await generateStrategyCoach(req.context, req.llm);
+        const result = await generateStrategyCoach(req.context, req.llm, callTool);
         respond({ id: req.id, ok: true, data: result });
         break;
       }

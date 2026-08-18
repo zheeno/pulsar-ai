@@ -77,7 +77,7 @@ export const StrategyCoachPatchSchema = z.object({
 export type StrategyCoachPatch = z.infer<typeof StrategyCoachPatchSchema>;
 
 export const LlmStrategyCoachOutputSchema = z.object({
-  needMoreContext: z.boolean(),
+  needMoreContext: z.boolean().default(false),
   clarifyingQuestions: z.array(z.string()).default([]),
   summary: z.string(),
   patch: StrategyCoachPatchSchema.default({}),
@@ -98,7 +98,7 @@ export const NGX_TIMEZONE = 'Africa/Lagos';
 
 export const PROMPT_VERSION = 'v1.0.0';
 export const PORTFOLIO_PROMPT_VERSION = 'v2.4.0';
-export const STRATEGY_COACH_PROMPT_VERSION = 'v1.2.0';
+export const STRATEGY_COACH_PROMPT_VERSION = 'v2.1.0';
 
 export * from './types';
 export * from './desktop';

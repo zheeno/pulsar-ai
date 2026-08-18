@@ -15,6 +15,8 @@ import { buildStrategyCoachPrompt } from './prompt/strategy-coach';
 const MAX_TOOL_ROUNDS = 3;
 /** Prompt allows 1 search + 2 upserts; hard-cap total invocations across rounds. */
 const MAX_TOOL_CALLS = 3;
+const COACH_TOOL_ROUNDS = 8;
+const COACH_TOOL_CALLS = 8;
 
 export type ToolCaller = (
   name: string,
@@ -61,18 +63,99 @@ function memoryTools(callTool: ToolCaller): any[] {
   ];
 }
 
-async function forceSignalsJson(
-  config: LlmConfig,
-  messages: BaseMessage[],
-): Promise<string> {
-  messages.push(
-    new HumanMessage(
-      'Tool budget exhausted. Do not call tools. Return the JSON signals object now.',
+function coachTools(callTool: ToolCaller): any[] {
+  const t = (
+    name: string,
+    description: string,
+    schema: z.ZodTypeAny,
+  ) =>
+    new DynamicStructuredTool({
+      name,
+      description,
+      schema: schema as any,
+      func: async (input: Record<string, unknown>) =>
+        JSON.stringify(await callTool(name, input ?? {})),
+    } as any);
+
+  return [
+    t('get_account_snapshot', 'Cash, equity, venue, live/sandbox, Bamboo floor.', z.object({})),
+    t('get_holdings', 'Open lots with avg cost, last, unrealized PnL.', z.object({})),
+    t('get_recent_trades', 'Recent fills.', z.object({ limit: z.number().int().optional() })),
+    t('get_strategy_params', 'Current Settings sliders.', z.object({})),
+    t(
+      'list_universe_quotes',
+      'Cached quotes for active NGX names: price, percent change, volume, as-of.',
+      z.object({ limit: z.number().int().optional() }),
     ),
-  );
-  const finalModel = createChatModel(config);
-  const finalResponse = await finalModel.invoke(messages);
-  return contentToText(finalResponse.content);
+    t(
+      'get_symbol_quote',
+      'One symbol live/cached quote.',
+      z.object({ symbol: z.string().min(1) }),
+    ),
+    t(
+      'get_price_history',
+      'Close series for a symbol.',
+      z.object({ symbol: z.string().min(1), days: z.number().int().optional() }),
+    ),
+    t(
+      'get_indicators',
+      'RSI/SMA from local history. Never invent RSI if this fails.',
+      z.object({ symbol: z.string().min(1) }),
+    ),
+    t(
+      'search_memory',
+      'Search on-device memories.',
+      z.object({
+        query: z.string().min(1),
+        symbol: z.string().optional(),
+        k: z.number().int().optional(),
+      }),
+    ),
+    t(
+      'get_news',
+      'Headlines for a symbol or the market. May be unavailable — never fabricate.',
+      z.object({ symbol: z.string().optional(), query: z.string().optional() }),
+    ),
+    t(
+      'run_symbol_screen',
+      'Top movers from cached quotes.',
+      z.object({ kind: z.string().optional() }),
+    ),
+    t(
+      'explain_blocked_reason',
+      'Last BLOCKED_* for a symbol.',
+      z.object({ symbol: z.string().min(1) }),
+    ),
+    t('get_cycle_status', 'Scheduler / live / halt-buys flags.', z.object({})),
+    t(
+      'propose_strategy_patch',
+      'Preview a slider patch. Does not save.',
+      z.object({ patch: z.record(z.number()).optional() }).passthrough(),
+    ),
+    t(
+      'propose_trade',
+      'Create a trade proposal card. Does not place an order.',
+      z.object({
+        symbol: z.string().min(1),
+        side: z.enum(['BUY', 'SELL']),
+        quantity: z.number().optional(),
+        notional: z.number().optional(),
+        rationale: z.string().optional(),
+        sessionId: z.string().optional(),
+      }),
+    ),
+    t(
+      'execute_trade',
+      'Refused. User must Confirm in the UI.',
+      z.object({ proposalId: z.string().optional() }),
+    ),
+    t(
+      'apply_strategy_patch',
+      'Refused. User must Apply selected in the UI.',
+      z.object({}).passthrough(),
+    ),
+    ...memoryTools(callTool),
+  ];
 }
 
 async function invokeWithRetry(
@@ -80,25 +163,37 @@ async function invokeWithRetry(
   prompt: string,
   validate: (parsed: unknown) => unknown,
   callTool?: ToolCaller,
+  opts?: {
+    tools?: (c: ToolCaller) => any[];
+    maxRounds?: number;
+    maxCalls?: number;
+    forceHint?: string;
+  },
 ): Promise<{ output: unknown; prompt: string; rawResponse: string; modelName: string }> {
   const modelName = `${config.provider}:${config.model}`;
   let rawResponse = '';
+  const maxRounds = opts?.maxRounds ?? MAX_TOOL_ROUNDS;
+  const maxCalls = opts?.maxCalls ?? MAX_TOOL_CALLS;
+  const makeTools = opts?.tools ?? memoryTools;
+  const forceHint =
+    opts?.forceHint ??
+    'Tool budget exhausted. Do not call tools. Return the JSON signals object now.';
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       if (callTool) {
-        const tools = memoryTools(callTool);
+        const tools = makeTools(callTool);
         const bound = createChatModel(config).bindTools(tools);
         const messages: BaseMessage[] = [new HumanMessage(prompt)];
         let toolCallsUsed = 0;
-        for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+        for (let round = 0; round <= maxRounds; round++) {
           const response = await bound.invoke(messages);
           const toolCalls = response.tool_calls as
             | { name: string; args?: Record<string, unknown>; id?: string }[]
             | undefined;
           if (toolCalls && toolCalls.length > 0) {
-            const budgetLeft = MAX_TOOL_CALLS - toolCallsUsed;
-            if (budgetLeft <= 0 || round === MAX_TOOL_ROUNDS) {
+            const budgetLeft = maxCalls - toolCallsUsed;
+            if (budgetLeft <= 0 || round === maxRounds) {
               messages.push(response as BaseMessage);
               for (const tc of toolCalls) {
                 messages.push(
@@ -111,7 +206,10 @@ async function invokeWithRetry(
                   }),
                 );
               }
-              rawResponse = await forceSignalsJson(config, messages);
+              messages.push(new HumanMessage(forceHint));
+              const finalModel = createChatModel(config);
+              const finalResponse = await finalModel.invoke(messages);
+              rawResponse = contentToText(finalResponse.content);
               const parsed = parseJson(rawResponse);
               const validated = validate(parsed);
               return { output: validated, prompt, rawResponse, modelName };
@@ -138,8 +236,11 @@ async function invokeWithRetry(
                 }),
               );
             }
-            if (toolCallsUsed >= MAX_TOOL_CALLS || toolCalls.length > budgetLeft) {
-              rawResponse = await forceSignalsJson(config, messages);
+            if (toolCallsUsed >= maxCalls || toolCalls.length > budgetLeft) {
+              messages.push(new HumanMessage(forceHint));
+              const finalModel = createChatModel(config);
+              const finalResponse = await finalModel.invoke(messages);
+              rawResponse = contentToText(finalResponse.content);
               const parsed = parseJson(rawResponse);
               const validated = validate(parsed);
               return { output: validated, prompt, rawResponse, modelName };
@@ -192,9 +293,22 @@ export async function generateSymbolSignal(
 export async function generateStrategyCoach(
   context: Record<string, unknown>,
   llm: LlmConfig,
+  callTool?: ToolCaller,
 ) {
   const prompt = buildStrategyCoachPrompt(context);
-  return invokeWithRetry(llm, prompt, (parsed) => LlmStrategyCoachOutputSchema.parse(parsed));
+  return invokeWithRetry(
+    llm,
+    prompt,
+    (parsed) => LlmStrategyCoachOutputSchema.parse(parsed),
+    callTool,
+    {
+      tools: coachTools,
+      maxRounds: COACH_TOOL_ROUNDS,
+      maxCalls: COACH_TOOL_CALLS,
+      forceHint:
+        'Tool budget exhausted. Do not call tools. Return the JSON copilot object (summary/patch) now. Do not invent prices.',
+    },
+  );
 }
 
 export async function testLlmConnection(llm: LlmConfig): Promise<string> {

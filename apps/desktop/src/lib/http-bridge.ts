@@ -6,6 +6,7 @@
 const SETTINGS_KEY = 'pulsar.browser.settings';
 const SECRETS_KEY = 'pulsar.browser.secrets';
 const STORE_KEY = 'pulsar.browser.store';
+const COACH_KEY = 'pulsar.browser.coach';
 
 try {
   localStorage.removeItem(SECRETS_KEY);
@@ -393,6 +394,26 @@ function saveStore(store: MockStore) {
   localStorage.setItem(STORE_KEY, JSON.stringify(store));
 }
 
+type CoachStore = {
+  sessions: { id: string; title: string; createdAt: string; updatedAt: string }[];
+  transcripts: Record<string, Record<string, unknown>[]>;
+  proposals: Record<string, Record<string, unknown>>;
+};
+
+function loadCoachStore(): CoachStore {
+  try {
+    const raw = localStorage.getItem(COACH_KEY);
+    if (raw) return JSON.parse(raw) as CoachStore;
+  } catch {
+    /* ignore */
+  }
+  return { sessions: [], transcripts: {}, proposals: {} };
+}
+
+function saveCoachStore(store: CoachStore) {
+  localStorage.setItem(COACH_KEY, JSON.stringify(store));
+}
+
 export async function httpInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   switch (command) {
     case 'ping':
@@ -704,6 +725,142 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       delete store.strategy.allowed_symbols;
       saveStore(store);
       return store.strategy as T;
+    }
+
+    case 'coach_list_sessions': {
+      return loadCoachStore().sessions as T;
+    }
+
+    case 'coach_new_session': {
+      const store = loadCoachStore();
+      const session = {
+        id: `c-${Date.now()}`,
+        title: 'New chat',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messages: [] as Record<string, unknown>[],
+      };
+      store.sessions.unshift({ id: session.id, title: session.title, createdAt: session.createdAt, updatedAt: session.updatedAt });
+      store.transcripts[session.id] = session.messages;
+      saveCoachStore(store);
+      return { ...session } as T;
+    }
+
+    case 'coach_get_session': {
+      const store = loadCoachStore();
+      const id = String(args?.id || store.sessions[0]?.id || '');
+      if (!id) {
+        const created = await httpInvoke('coach_new_session');
+        return created as T;
+      }
+      const meta = store.sessions.find((s) => s.id === id) || store.sessions[0];
+      return {
+        ...meta,
+        messages: store.transcripts[meta.id] || [],
+      } as T;
+    }
+
+    case 'coach_delete_session': {
+      const store = loadCoachStore();
+      const id = String(args?.id || '');
+      store.sessions = store.sessions.filter((s) => s.id !== id);
+      delete store.transcripts[id];
+      saveCoachStore(store);
+      return undefined as T;
+    }
+
+    case 'coach_turn': {
+      const message = String(args?.message || '').trim();
+      if (!message) throw new Error('Message is required');
+      let store = loadCoachStore();
+      let sessionId = String(args?.sessionId || store.sessions[0]?.id || '');
+      if (!sessionId) {
+        const created = (await httpInvoke<{ id: string }>('coach_new_session')) as { id: string };
+        sessionId = created.id;
+        store = loadCoachStore();
+      }
+      const msgs = store.transcripts[sessionId] || [];
+      msgs.push({ id: `u-${Date.now()}`, role: 'user', text: message, createdAt: new Date().toISOString() });
+      const lower = message.toLowerCase();
+      let summary = 'Browser mock Coach — use the Tauri app for live tools.';
+      let toolTrace: { name: string; ok: boolean; summary: string }[] = [];
+      let trade: Record<string, unknown> | null = null;
+      let extra: Record<string, unknown> = {};
+      if (lower.includes('news')) {
+        toolTrace = [{ name: 'get_news', ok: false, summary: 'unavailable' }];
+        summary = 'NGX news is not wired in this mock. No headlines were invented.';
+      } else if (lower.includes('moving') || lower.includes('quote')) {
+        toolTrace = [{ name: 'list_universe_quotes', ok: true, summary: '2 quotes' }];
+        summary = 'GTCO ₦46.20 (+1.2% as-of mock). MTNN ₦225.00. Figures are mock store data.';
+      } else if (lower.includes('history') || lower.includes('doing')) {
+        toolTrace = [{ name: 'get_price_history', ok: true, summary: 'GTCO' }];
+        summary = 'GTCO recent closes come from the mock book, not a live Pulse call.';
+      } else if (/\bbuy\b|\bsell\b/.test(lower)) {
+        toolTrace = [{ name: 'propose_trade', ok: true, summary: 'proposal (not placed)' }];
+        trade = {
+          id: `p-${Date.now()}`,
+          symbol: 'GTCO',
+          side: lower.includes('sell') ? 'SELL' : 'BUY',
+          quantity: 100,
+          preview: { price: 46.2, estimatedCost: 4620, warnings: ['Browser mock — not sent to a broker'] },
+          status: 'proposed',
+        };
+        store.proposals[String(trade.id)] = trade;
+        summary = 'Proposed a GTCO order card. Confirm in the UI to submit — this chat did not place it.';
+      } else {
+        extra = mockStrategyCoachPropose(message, loadStore()) as Record<string, unknown>;
+        summary = String(extra.summary || summary);
+        toolTrace = [{ name: 'get_strategy_params', ok: true, summary: 'ok' }];
+      }
+      const payload = { toolTrace, trade, warnings: extra.warnings || [], diff: extra.diff || [], ...extra };
+      msgs.push({
+        id: `a-${Date.now()}`,
+        role: 'assistant',
+        text: summary,
+        payload,
+        createdAt: new Date().toISOString(),
+      });
+      store.transcripts[sessionId] = msgs;
+      const meta = store.sessions.find((s) => s.id === sessionId);
+      if (meta && msgs.filter((m) => m.role === 'user').length === 1) {
+        meta.title = message.slice(0, 72);
+        meta.updatedAt = new Date().toISOString();
+      }
+      saveCoachStore(store);
+      return { summary, toolTrace, trade, sessionId, ...extra, warnings: extra.warnings || [], diff: extra.diff || [] } as T;
+    }
+
+    case 'coach_execute_trade': {
+      const store = loadCoachStore();
+      const id = String(args?.proposalId || '');
+      const p = store.proposals[id];
+      if (!p) throw new Error('Unknown trade proposal');
+      if (p.status !== 'proposed') throw new Error('Proposal is not awaiting confirm');
+      p.status = 'blocked';
+      p.result = { ok: false, riskPolicyResult: 'BLOCKED_BROKER', error: 'Browser mock cannot place orders' };
+      const sid = store.sessions[0]?.id;
+      if (sid && store.transcripts[sid]) {
+        store.transcripts[sid].push({
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          text: 'Trade confirmed but not filled: BLOCKED_BROKER.',
+          payload: { tradeResult: p.result, proposalId: id },
+          createdAt: new Date().toISOString(),
+        });
+      }
+      saveCoachStore(store);
+      return p.result as T;
+    }
+
+    case 'coach_cancel_trade': {
+      const store = loadCoachStore();
+      const id = String(args?.proposalId || '');
+      const p = store.proposals[id];
+      if (!p) throw new Error('Unknown trade proposal');
+      if (p.status !== 'proposed') throw new Error('Proposal is not awaiting confirm');
+      p.status = 'cancelled';
+      saveCoachStore(store);
+      return undefined as T;
     }
 
     case 'strategy_coach_propose': {
