@@ -276,6 +276,20 @@ async function invokeCoachMessages(
   throw new Error('LLM invoke failed after retries');
 }
 
+async function finishSignalJson(
+  config: LlmConfig,
+  messages: BaseMessage[],
+  validate: (parsed: unknown) => unknown,
+  forceHint: string,
+  reasoning: boolean,
+): Promise<{ output: unknown; rawResponse: string }> {
+  const toInvoke = reasoning ? [...messages, new HumanMessage(forceHint)] : messages;
+  const finalModel = createChatModel(config, { reasoning });
+  const finalResponse = await finalModel.invoke(toInvoke);
+  const rawResponse = contentToText(finalResponse.content);
+  return { output: validate(parseJson(rawResponse)), rawResponse };
+}
+
 async function invokeWithRetry(
   config: LlmConfig,
   prompt: string,
@@ -286,6 +300,7 @@ async function invokeWithRetry(
     maxRounds?: number;
     maxCalls?: number;
     forceHint?: string;
+    reasoning?: boolean;
   },
 ): Promise<{ output: unknown; prompt: string; rawResponse: string; modelName: string }> {
   const modelName = `${config.provider}:${config.model}`;
@@ -293,15 +308,16 @@ async function invokeWithRetry(
   const maxRounds = opts?.maxRounds ?? MAX_TOOL_ROUNDS;
   const maxCalls = opts?.maxCalls ?? MAX_TOOL_CALLS;
   const makeTools = opts?.tools ?? memoryTools;
+  const useReasoning = Boolean(opts?.reasoning);
   const forceHint =
     opts?.forceHint ??
-    'Tool budget exhausted. Do not call tools. Return the JSON signals object now.';
+    'Do not call tools. Return the JSON signals object now.';
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       if (callTool) {
         const tools = makeTools(callTool);
-        const bound = createChatModel(config).bindTools(tools);
+        const bound = createChatModel(config, { reasoning: false }).bindTools(tools);
         const messages: BaseMessage[] = [new HumanMessage(prompt)];
         let toolCallsUsed = 0;
         for (let round = 0; round <= maxRounds; round++) {
@@ -325,12 +341,19 @@ async function invokeWithRetry(
                 );
               }
               messages.push(new HumanMessage(forceHint));
-              const finalModel = createChatModel(config);
-              const finalResponse = await finalModel.invoke(messages);
-              rawResponse = contentToText(finalResponse.content);
-              const parsed = parseJson(rawResponse);
-              const validated = validate(parsed);
-              return { output: validated, prompt, rawResponse, modelName };
+              const finished = await finishSignalJson(
+                config,
+                messages,
+                validate,
+                forceHint,
+                useReasoning,
+              );
+              return {
+                output: finished.output,
+                prompt,
+                rawResponse: finished.rawResponse,
+                modelName,
+              };
             }
             messages.push(response as BaseMessage);
             for (const tc of toolCalls.slice(0, budgetLeft)) {
@@ -356,14 +379,37 @@ async function invokeWithRetry(
             }
             if (toolCallsUsed >= maxCalls || toolCalls.length > budgetLeft) {
               messages.push(new HumanMessage(forceHint));
-              const finalModel = createChatModel(config);
-              const finalResponse = await finalModel.invoke(messages);
-              rawResponse = contentToText(finalResponse.content);
-              const parsed = parseJson(rawResponse);
-              const validated = validate(parsed);
-              return { output: validated, prompt, rawResponse, modelName };
+              const finished = await finishSignalJson(
+                config,
+                messages,
+                validate,
+                forceHint,
+                useReasoning,
+              );
+              return {
+                output: finished.output,
+                prompt,
+                rawResponse: finished.rawResponse,
+                modelName,
+              };
             }
             continue;
+          }
+          messages.push(response as BaseMessage);
+          if (useReasoning) {
+            const finished = await finishSignalJson(
+              config,
+              messages,
+              validate,
+              forceHint,
+              true,
+            );
+            return {
+              output: finished.output,
+              prompt,
+              rawResponse: finished.rawResponse,
+              modelName,
+            };
           }
           rawResponse = contentToText(response.content);
           const parsed = parseJson(rawResponse);
@@ -372,7 +418,7 @@ async function invokeWithRetry(
         }
       }
 
-      const model = createChatModel(config);
+      const model = createChatModel(config, { reasoning: useReasoning });
       const response = await model.invoke(prompt);
       rawResponse = contentToText(response.content);
       const parsed = parseJson(rawResponse);
@@ -397,6 +443,7 @@ export async function generatePortfolioSignals(
     prompt,
     (parsed) => LlmPortfolioSignalOutputSchema.parse(parsed),
     callTool,
+    { reasoning: true },
   );
 }
 
@@ -405,7 +452,9 @@ export async function generateSymbolSignal(
   llm: LlmConfig,
 ) {
   const prompt = buildSignalPrompt(context);
-  return invokeWithRetry(llm, prompt, (parsed) => LlmSignalOutputSchema.parse(parsed));
+  return invokeWithRetry(llm, prompt, (parsed) => LlmSignalOutputSchema.parse(parsed), undefined, {
+    reasoning: true,
+  });
 }
 
 export async function generateStrategyCoach(
