@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { Fragment, useEffect, useId, useRef, useState } from 'react';
 import bambooLogo from '../assets/bamboo.webp';
 import wealthLogo from '../assets/wealth.webp';
 import { IconLogout, IconSpinner } from '../components/Icons';
@@ -72,6 +72,8 @@ type StrategyRecord = {
   max_daily_drawdown_pct: number;
   position_size_pct?: number;
   cycle_budget_pct: number;
+  time_stop_hours?: number;
+  partial_tp_fraction?: number;
 };
 
 type StrategyDraft = {
@@ -81,6 +83,16 @@ type StrategyDraft = {
   maxDailyDrawdownPct: number;
   stopLossPct: number;
   takeProfitPct: number;
+  timeStopHours: number;
+  partialTpPct: number;
+};
+
+type JournalRow = {
+  bucket: string;
+  n: number;
+  hitRate: number;
+  avgPnl?: number | null;
+  avgReturnPct?: number | null;
 };
 
 const BROKER_LOGOS: Record<string, string> = {
@@ -121,6 +133,8 @@ function draftFromStrategy(s: StrategyRecord): StrategyDraft {
     maxDailyDrawdownPct: toPct(s.max_daily_drawdown_pct, 1, 100),
     stopLossPct: toPct(s.stop_loss_pct, 1, 25),
     takeProfitPct: toPct(s.take_profit_pct ?? 0.1, 2, 40),
+    timeStopHours: clamp(Math.round(s.time_stop_hours ?? 24), 0, 168),
+    partialTpPct: clamp(Math.round((s.partial_tp_fraction ?? 1) * 100), 10, 100),
   };
 }
 
@@ -228,8 +242,16 @@ export default function SettingsPage() {
   const maxDdId = useId();
   const stopLossId = useId();
   const takeProfitId = useId();
+  const timeStopId = useId();
+  const partialTpId = useId();
   const autoCycleId = useId();
   const cycleIntervalId = useId();
+  const haltBuysId = useId();
+  const flattenId = useId();
+  const launchId = useId();
+  const maxActionsId = useId();
+  const maxNotionalId = useId();
+  const retainLogsId = useId();
   const firstFieldRef = useRef<HTMLSelectElement>(null);
 
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -252,6 +274,14 @@ export default function SettingsPage() {
   const [autoCycleEnabled, setAutoCycleEnabled] = useState(false);
   const [autoCycleMinutes, setAutoCycleMinutes] = useState(30);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
+  const [haltNewBuys, setHaltNewBuys] = useState(false);
+  const [flattenArmed, setFlattenArmed] = useState(false);
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [appDownAck, setAppDownAck] = useState(false);
+  const [maxLiveActions, setMaxLiveActions] = useState(10);
+  const [maxLiveNotional, setMaxLiveNotional] = useState(500_000);
+  const [retainRawLlmLogs, setRetainRawLlmLogs] = useState(false);
+  const [journal, setJournal] = useState<JournalRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [strategyBusy, setStrategyBusy] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
@@ -279,6 +309,18 @@ export default function SettingsPage() {
     setAutoCycleEnabled(!!s.autoCycleEnabled);
     setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
     setLiveTradingEnabled(!!s.liveTradingEnabled);
+    setHaltNewBuys(!!s.haltNewBuys);
+    setFlattenArmed(!!s.flattenOnDrawdownArmed);
+    setLaunchAtLogin(!!s.launchAtLogin);
+    setMaxLiveActions(clamp(Math.round(s.maxLiveActions || 10), 1, 40));
+    setMaxLiveNotional(clamp(Math.round(s.maxLiveNotional || 500_000), 1_000, 50_000_000));
+    setRetainRawLlmLogs(!!s.retainRawLlmLogs);
+    if (s.launchAtLogin) setAppDownAck(true);
+    try {
+      setJournal(await api<JournalRow[]>('confidence_journal'));
+    } catch {
+      setJournal([]);
+    }
     setSelectedBroker(s.selectedBroker || 'wealth');
     try {
       setBrokers(await api<BrokerListItem[]>('broker_list'));
@@ -399,6 +441,8 @@ export default function SettingsPage() {
           maxDailyDrawdownPct: strategyDraft.maxDailyDrawdownPct / 100,
           stopLossPct: strategyDraft.stopLossPct / 100,
           takeProfitPct: strategyDraft.takeProfitPct / 100,
+          timeStopHours: strategyDraft.timeStopHours,
+          partialTpFraction: strategyDraft.partialTpPct / 100,
         },
       });
       setStrategyDraft(draftFromStrategy(updated));
@@ -471,12 +515,20 @@ export default function SettingsPage() {
     toast.info('Saving automation…');
     try {
       const minutes = clamp(autoCycleMinutes, 5, 120);
+      const actions = clamp(maxLiveActions, 1, 40);
+      const notional = clamp(maxLiveNotional, 1_000, 50_000_000);
       await api('settings_set', {
         settings: {
           ...settings,
           autoCycleEnabled,
           autoCycleIntervalMinutes: minutes,
           liveTradingEnabled,
+          haltNewBuys,
+          flattenOnDrawdownArmed: flattenArmed,
+          launchAtLogin,
+          maxLiveActions: actions,
+          maxLiveNotional: notional,
+          retainRawLlmLogs,
         },
       });
       setSettings({
@@ -484,8 +536,16 @@ export default function SettingsPage() {
         autoCycleEnabled,
         autoCycleIntervalMinutes: minutes,
         liveTradingEnabled,
+        haltNewBuys,
+        flattenOnDrawdownArmed: flattenArmed,
+        launchAtLogin,
+        maxLiveActions: actions,
+        maxLiveNotional: notional,
+        retainRawLlmLogs,
       });
       setAutoCycleMinutes(minutes);
+      setMaxLiveActions(actions);
+      setMaxLiveNotional(notional);
       if (autoCycleEnabled) {
         toast.success(
           `Automatic cycles enabled every ${minutes} minutes during market hours.`,
@@ -791,7 +851,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={maxDdId}
             label="Max daily drawdown"
-            hint="If today’s equity drop reaches this level, new buys are blocked for the rest of the day. Set to 100% to leave buys unrestricted by session loss."
+            hint="If today’s equity (session-open vs now, or vs prior close) drops this far, new buys are blocked (`BLOCKED_DRAWDOWN`). 100% turns that BUY brake off. Protective sells still run. Flatten-on-drawdown is a separate, default-off arm below."
             value={strategyDraft.maxDailyDrawdownPct}
             min={1}
             max={100}
@@ -802,7 +862,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={stopLossId}
             label="Stop loss"
-            hint="Sell an open position when last price is this far below average cost. Checked continuously while the app is open (about every 30s during market hours), not only on trading cycles."
+            hint="Sell an open position when last price is this far below average cost. Polled about every 30s during market hours while this app stays open. Quitting Pulsar stops the risk monitor — stop-loss, take-profit, and time-stop will not fill until you reopen."
             value={strategyDraft.stopLossPct}
             min={1}
             max={25}
@@ -813,13 +873,36 @@ export default function SettingsPage() {
           <ParamSlider
             id={takeProfitId}
             label="Take profit"
-            hint="Sell an open position when last price is this far above average cost. Checked continuously while the app is open (about every 30s during market hours), not only on trading cycles."
+            hint="Sell an open position when last price is this far above average cost. Same in-app risk monitor as stop-loss: it does not run after you quit."
             value={strategyDraft.takeProfitPct}
             min={2}
             max={40}
             format={(v) => `${v}%`}
             disabled={strategyBusy}
             onChange={(v) => setStrategyDraft({ ...strategyDraft, takeProfitPct: v })}
+          />
+          <ParamSlider
+            id={timeStopId}
+            label="Time-stop"
+            hint="If a holding is still in-band (neither SL nor TP) after this many hours, sell the lot to recycle cash under the broker minimum. 0 hours turns time-stop off. Does not flatten on drawdown."
+            value={strategyDraft.timeStopHours}
+            min={0}
+            max={168}
+            format={(v) => (v === 0 ? 'Off' : `${v} h`)}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, timeStopHours: v })}
+          />
+          <ParamSlider
+            id={partialTpId}
+            label="Partial take-profit"
+            hint="Share of the lot to sell when take-profit hits. 100% exits the full position; 50% scales out half and leaves the rest running."
+            value={strategyDraft.partialTpPct}
+            min={10}
+            max={100}
+            step={5}
+            format={(v) => `${v}%`}
+            disabled={strategyBusy}
+            onChange={(v) => setStrategyDraft({ ...strategyDraft, partialTpPct: v })}
           />
         </div>
 
@@ -834,14 +917,16 @@ export default function SettingsPage() {
       <section className="panel" aria-labelledby="automation-heading">
         <h2 id="automation-heading">Automation</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
-          Control whether Pulsar runs ingest → signals → execution cycles on a timer during NGX market hours.
+          Pulsar is not a headless daemon. Closing this window stops cycle scheduling and the risk monitor
+          (stop-loss / take-profit / time-stop). Auto-cycle off with live trading on still submits those
+          protective sells while the app remains open; it only stops timed ingest → signal cycles.
         </p>
 
         <div className="toggle-row">
           <div className="toggle-row__copy">
             <label className="toggle-row__label" htmlFor={autoCycleId}>Run cycles automatically</label>
             <p className="toggle-row__hint">
-              When on, the app schedules full trading cycles in the background. When off, cycles only run when you trigger them from Home.
+              When on, the app schedules full trading cycles during NGX hours. When off, cycles only run from Home — protective exits still run if live trading is on and the app is open.
             </p>
           </div>
           <button
@@ -861,8 +946,7 @@ export default function SettingsPage() {
           <div className="toggle-row__copy">
             <label className="toggle-row__label">Enable live trading</label>
             <p className="toggle-row__hint">
-              When on, Pulsar submits real broker orders for scheduled cycles, manual cycles, stop-loss, and
-              take-profit — no per-cycle confirmation. Turn off anytime to generate signals only.
+              When on, Pulsar submits real broker orders for cycles and protective exits — no per-cycle confirmation. Turn off to generate signals only (this also stops live SL/TP fills). Prefer Halt new buys if you want to keep exits.
             </p>
           </div>
           <button
@@ -877,11 +961,86 @@ export default function SettingsPage() {
           </button>
         </div>
 
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label" htmlFor={haltBuysId}>Halt new buys (keep exits)</label>
+            <p className="toggle-row__hint">
+              Protective-only: block new BUY capacity and live BUY submits, but still execute stop-loss, take-profit, and time-stop sells. Use this instead of turning live trading off when you want to freeze entries.
+            </p>
+          </div>
+          <button
+            id={haltBuysId}
+            type="button"
+            role="switch"
+            aria-checked={haltNewBuys}
+            className={`toggle ${haltNewBuys ? 'is-on' : ''}`}
+            disabled={cycleBusy}
+            onClick={() => setHaltNewBuys((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label" htmlFor={flattenId}>Arm flatten on drawdown</label>
+            <p className="toggle-row__hint">
+              Default off. When armed, a session drawdown at the strategy cap queues a full SELL of every lot (audited in memory). This is not the same as the BUY-only drawdown brake, and it will not arm itself from PnL.
+            </p>
+          </div>
+          <button
+            id={flattenId}
+            type="button"
+            role="switch"
+            aria-checked={flattenArmed}
+            className={`toggle ${flattenArmed ? 'is-on' : ''}`}
+            disabled={cycleBusy}
+            onClick={() => setFlattenArmed((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
+
+        <label className="toggle-row" style={{ alignItems: 'flex-start', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={appDownAck}
+            onChange={(e) => {
+              setAppDownAck(e.target.checked);
+              if (!e.target.checked) setLaunchAtLogin(false);
+            }}
+            style={{ marginTop: 4 }}
+          />
+          <span className="toggle-row__hint" style={{ margin: 0 }}>
+            I understand that quitting Pulsar stops stop-loss polling. Launch at login only reopens the app; it is not a watchdog.
+          </span>
+        </label>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label" htmlFor={launchId}>Launch at login (macOS)</label>
+            <p className="toggle-row__hint">
+              Optional. Gated until you acknowledge the app-down warning above. Packaged macOS builds register a login item; unpackaged debug runs store the flag only.
+            </p>
+          </div>
+          <button
+            id={launchId}
+            type="button"
+            role="switch"
+            aria-checked={launchAtLogin}
+            className={`toggle ${launchAtLogin ? 'is-on' : ''}`}
+            disabled={cycleBusy || !appDownAck}
+            onClick={() => setLaunchAtLogin((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
+
         <div className="param-slider-grid" style={{ marginTop: 20 }}>
           <ParamSlider
             id={cycleIntervalId}
             label="Cycle frequency"
-            hint="Minutes between automatic cycles while the market is open (or in the post-close window). Shorter intervals react faster but use more LLM calls."
+            hint="Minutes between automatic cycles while the market is open (or in the post-close window). Hard auto-cycle failures retry after about 60s instead of burning this full interval."
             value={autoCycleMinutes}
             min={5}
             max={120}
@@ -890,6 +1049,49 @@ export default function SettingsPage() {
             disabled={cycleBusy || !autoCycleEnabled}
             onChange={setAutoCycleMinutes}
           />
+          <ParamSlider
+            id={maxActionsId}
+            label="Max live actions"
+            hint="Cap on live submits per cycle. At most 30% of this budget may be spent retrying 24h-old unexecuted orders so new signals and protective sells are not starved."
+            value={maxLiveActions}
+            min={1}
+            max={40}
+            format={(v) => `${v}`}
+            disabled={cycleBusy}
+            onChange={setMaxLiveActions}
+          />
+          <ParamSlider
+            id={maxNotionalId}
+            label="Max live notional"
+            hint="Per-order notional cap in naira for live submits. Bamboo still parks buys below ₦5,000."
+            value={maxLiveNotional}
+            min={5_000}
+            max={5_000_000}
+            step={5_000}
+            format={(v) => formatNaira(v)}
+            disabled={cycleBusy}
+            onChange={setMaxLiveNotional}
+          />
+        </div>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label" htmlFor={retainLogsId}>Retain raw LLM logs</label>
+            <p className="toggle-row__hint">
+              Store cycle LLM transcripts in the local database for audits. Off by default.
+            </p>
+          </div>
+          <button
+            id={retainLogsId}
+            type="button"
+            role="switch"
+            aria-checked={retainRawLlmLogs}
+            className={`toggle ${retainRawLlmLogs ? 'is-on' : ''}`}
+            disabled={cycleBusy}
+            onClick={() => setRetainRawLlmLogs((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
         </div>
 
         <div className="btn-row">
@@ -898,6 +1100,28 @@ export default function SettingsPage() {
             {cycleBusy ? 'Saving…' : 'Save automation'}
           </button>
         </div>
+      </section>
+
+      <section className="panel" aria-labelledby="journal-heading">
+        <h2 id="journal-heading">Confidence journal</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Closed-lot hit rate and average PnL by signal confidence bucket. Filled from outcome labels on fill/close — empty until live or sandbox closes exist.
+        </p>
+        {journal.length === 0 ? (
+          <p className="muted" style={{ fontSize: 13 }}>No closed lots labeled yet.</p>
+        ) : (
+          <dl className="summary-row" style={{ marginTop: 16 }}>
+            {journal.map((row) => (
+              <Fragment key={row.bucket}>
+                <dt>{row.bucket}</dt>
+                <dd>
+                  n={row.n} hit={(row.hitRate * 100).toFixed(0)}%
+                  {row.avgPnl != null ? ` avg PnL ₦${Math.round(row.avgPnl).toLocaleString('en-NG')}` : ''}
+                </dd>
+              </Fragment>
+            ))}
+          </dl>
+        )}
       </section>
 
       <section className="panel">

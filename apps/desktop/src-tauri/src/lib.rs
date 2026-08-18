@@ -11,9 +11,11 @@ mod http_client;
 mod indicators;
 mod ingest;
 mod intents;
+mod launch_at_login;
 mod memory;
 mod net_policy;
 mod ngx;
+mod outcomes;
 mod portfolio;
 mod rate_limit;
 mod risk_exits;
@@ -223,6 +225,8 @@ pub fn run() {
             commands::ping,
             commands::settings_get,
             commands::settings_set,
+            commands::confidence_journal,
+            commands::list_cycle_audits,
             commands::logout,
             commands::test_pulse_login,
             commands::test_llm,

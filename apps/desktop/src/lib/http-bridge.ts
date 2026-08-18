@@ -66,6 +66,9 @@ function defaultSettings(): Settings {
     maxLiveNotional: 500_000,
     maxLiveActions: 10,
     retainRawLlmLogs: false,
+    haltNewBuys: false,
+    flattenOnDrawdownArmed: false,
+    launchAtLogin: false,
   };
 }
 
@@ -115,6 +118,8 @@ function defaultStore(): MockStore {
       max_daily_drawdown_pct: 0.03,
       position_size_pct: 0.05,
       cycle_budget_pct: 0.2,
+      time_stop_hours: 24,
+      partial_tp_fraction: 1,
       is_active: true,
     },
     memories: [],
@@ -679,6 +684,8 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
           minConfidenceToTrade?: number;
           maxDailyDrawdownPct?: number;
           cycleBudgetPct?: number;
+          timeStopHours?: number;
+          partialTpFraction?: number;
         };
       };
       const s = payload.strategy || {};
@@ -691,6 +698,8 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         min_confidence_to_trade: s.minConfidenceToTrade ?? store.strategy.min_confidence_to_trade,
         max_daily_drawdown_pct: s.maxDailyDrawdownPct ?? store.strategy.max_daily_drawdown_pct,
         cycle_budget_pct: s.cycleBudgetPct ?? store.strategy.cycle_budget_pct ?? 0.2,
+        time_stop_hours: s.timeStopHours ?? store.strategy.time_stop_hours ?? 24,
+        partial_tp_fraction: s.partialTpFraction ?? store.strategy.partial_tp_fraction ?? 1,
       };
       delete store.strategy.allowed_symbols;
       saveStore(store);
@@ -754,6 +763,12 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         message: 'Strategy parameters were saved. Settings sliders now show the new values.',
       } as T;
     }
+
+    case 'confidence_journal':
+      return [] as T;
+
+    case 'list_cycle_audits':
+      return [] as T;
 
     case 'memory_list': {
       return [...(loadStore().memories || [])].reverse() as T;

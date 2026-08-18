@@ -26,6 +26,8 @@ pub fn slider_bounds(field: &str) -> Option<(f64, f64)> {
         "max_daily_drawdown_pct" => Some((0.01, 1.0)),
         "stop_loss_pct" => Some((0.01, 0.25)),
         "take_profit_pct" => Some((0.02, 0.40)),
+        "time_stop_hours" => Some((0.0, 168.0)),
+        "partial_tp_fraction" => Some((0.1, 1.0)),
         _ => None,
     }
 }
@@ -38,6 +40,8 @@ pub fn field_label(field: &str) -> &'static str {
         "max_daily_drawdown_pct" => "Max daily drawdown",
         "stop_loss_pct" => "Stop loss",
         "take_profit_pct" => "Take profit",
+        "time_stop_hours" => "Time-stop hours",
+        "partial_tp_fraction" => "Partial take-profit",
         _ => "Parameter",
     }
 }
@@ -51,6 +55,20 @@ pub struct StrategyParams {
     pub min_confidence_to_trade: f64,
     pub max_daily_drawdown_pct: f64,
     pub cycle_budget_pct: f64,
+    /// Hours a lot may stay in-band before a time-stop SELL. 0 = off.
+    #[serde(default = "default_time_stop_hours")]
+    pub time_stop_hours: f64,
+    /// Fraction of the lot to sell on take-profit (1.0 = full lot).
+    #[serde(default = "default_partial_tp_fraction")]
+    pub partial_tp_fraction: f64,
+}
+
+fn default_time_stop_hours() -> f64 {
+    24.0
+}
+
+fn default_partial_tp_fraction() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -185,6 +203,8 @@ pub fn merge_patch(current: &StrategyParams, patch: &StrategyPatch) -> StrategyP
             .max_daily_drawdown_pct
             .unwrap_or(current.max_daily_drawdown_pct),
         cycle_budget_pct: patch.cycle_budget_pct.unwrap_or(current.cycle_budget_pct),
+        time_stop_hours: current.time_stop_hours,
+        partial_tp_fraction: current.partial_tp_fraction,
     }
 }
 
@@ -207,6 +227,13 @@ pub fn validate_strategy_params(strategy: &StrategyParams) -> Result<(), String>
     if let Some(tp) = strategy.take_profit_pct {
         validate_ratio("takeProfitPct", tp)?;
     }
+    if !(0.0..=168.0).contains(&strategy.time_stop_hours) || !strategy.time_stop_hours.is_finite() {
+        return Err("timeStopHours must be between 0 and 168".into());
+    }
+    if !(0.1..=1.0).contains(&strategy.partial_tp_fraction) || !strategy.partial_tp_fraction.is_finite()
+    {
+        return Err("partialTpFraction must be between 0.1 and 1.0".into());
+    }
     Ok(())
 }
 
@@ -219,6 +246,8 @@ pub fn persist_strategy_params(conn: &Connection, strategy: &StrategyParams) -> 
             min_confidence_to_trade = ?4,
             max_daily_drawdown_pct = ?5,
             cycle_budget_pct = ?6,
+            time_stop_hours = ?7,
+            partial_tp_fraction = ?8,
             allowed_symbols = NULL
          WHERE is_active = 1",
         rusqlite::params![
@@ -228,6 +257,8 @@ pub fn persist_strategy_params(conn: &Connection, strategy: &StrategyParams) -> 
             strategy.min_confidence_to_trade,
             strategy.max_daily_drawdown_pct,
             strategy.cycle_budget_pct,
+            strategy.time_stop_hours,
+            strategy.partial_tp_fraction,
         ],
     )?;
     if updated == 0 {
@@ -256,7 +287,7 @@ pub fn read_active_strategy(conn: &Connection) -> Result<StrategyRow> {
     Ok(conn.query_row(
         "SELECT id, name, max_position_pct, max_daily_trades, stop_loss_pct, take_profit_pct,
                 min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct,
-                cycle_budget_pct, is_active
+                cycle_budget_pct, is_active, time_stop_hours, partial_tp_fraction
          FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
         [],
         |row| {
@@ -273,6 +304,8 @@ pub fn read_active_strategy(conn: &Connection) -> Result<StrategyRow> {
                     min_confidence_to_trade: row.get(6)?,
                     max_daily_drawdown_pct: row.get(7)?,
                     cycle_budget_pct: row.get(9)?,
+                    time_stop_hours: row.get::<_, Option<f64>>(11)?.unwrap_or(24.0),
+                    partial_tp_fraction: row.get::<_, Option<f64>>(12)?.unwrap_or(1.0),
                 },
             })
         },
@@ -296,6 +329,8 @@ fn strategy_row_json(row: &StrategyRow) -> Value {
         "max_daily_drawdown_pct": row.params.max_daily_drawdown_pct,
         "position_size_pct": row.position_size_pct,
         "cycle_budget_pct": row.params.cycle_budget_pct,
+        "time_stop_hours": row.params.time_stop_hours,
+        "partial_tp_fraction": row.params.partial_tp_fraction,
         "is_active": row.is_active,
     })
 }
@@ -995,6 +1030,8 @@ mod tests {
             min_confidence_to_trade: 0.65,
             max_daily_drawdown_pct: 0.03,
             cycle_budget_pct: 0.20,
+            time_stop_hours: 24.0,
+            partial_tp_fraction: 1.0,
         }
     }
 

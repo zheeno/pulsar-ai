@@ -12,6 +12,46 @@ use crate::settings::get_settings;
 use crate::signals::run_cycle;
 
 const SCHEDULER_POLL_SECS: u64 = 30;
+/// After a hard auto-cycle failure, wait this long before retrying (not the full interval).
+pub const FAIL_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Whether the scheduler should start a cycle now.
+pub fn cycle_due(
+    last_success_at: Option<Instant>,
+    last_fail_at: Option<Instant>,
+    interval: Duration,
+    now: Instant,
+    fail_backoff: Duration,
+) -> bool {
+    if let Some(fail) = last_fail_at {
+        if now.saturating_duration_since(fail) < fail_backoff {
+            return false;
+        }
+    }
+    match last_success_at {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= interval,
+    }
+}
+
+/// Hard failures must not consume the success interval timer.
+pub fn record_cycle_outcome(
+    last_success_at: &mut Option<Instant>,
+    last_fail_at: &mut Option<Instant>,
+    now: Instant,
+    ran: Result<bool, ()>,
+) {
+    match ran {
+        Ok(true) => {
+            *last_success_at = Some(now);
+            *last_fail_at = None;
+        }
+        Ok(false) => {}
+        Err(()) => {
+            *last_fail_at = Some(now);
+        }
+    }
+}
 
 pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
     let app_cycle = app.clone();
@@ -19,7 +59,8 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(SCHEDULER_POLL_SECS));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut last_cycle_at: Option<Instant> = None;
+        let mut last_success_at: Option<Instant> = None;
+        let mut last_fail_at: Option<Instant> = None;
 
         loop {
             ticker.tick().await;
@@ -38,10 +79,14 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
 
             let interval =
                 Duration::from_secs(u64::from(settings.auto_cycle_interval_minutes.clamp(5, 120)) * 60);
-            if let Some(last) = last_cycle_at {
-                if last.elapsed() < interval {
-                    continue;
-                }
+            if !cycle_due(
+                last_success_at,
+                last_fail_at,
+                interval,
+                Instant::now(),
+                FAIL_BACKOFF,
+            ) {
+                continue;
             }
 
             let calendar = TradingCalendar::default();
@@ -51,21 +96,23 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
 
             let app2 = app_cycle.clone();
             let state2 = state_cycle.clone();
+            let now = Instant::now();
             match tokio::task::spawn_blocking(move || run_scheduled_cycle(&app2, &state2)).await {
                 Ok(Ok(true)) => {
                     tracing::info!(target: "scheduler", "auto cycle completed");
-                    last_cycle_at = Some(Instant::now());
+                    record_cycle_outcome(&mut last_success_at, &mut last_fail_at, now, Ok(true));
                 }
                 Ok(Ok(false)) => {
                     tracing::info!(target: "scheduler", "auto cycle skipped (already running)");
+                    record_cycle_outcome(&mut last_success_at, &mut last_fail_at, now, Ok(false));
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(target: "scheduler", error = %e, "auto cycle failed");
-                    last_cycle_at = Some(Instant::now());
+                    record_cycle_outcome(&mut last_success_at, &mut last_fail_at, now, Err(()));
                 }
                 Err(e) => {
                     tracing::warn!(target: "scheduler", error = %e, "auto cycle task join failed");
-                    last_cycle_at = Some(Instant::now());
+                    record_cycle_outcome(&mut last_success_at, &mut last_fail_at, now, Err(()));
                 }
             }
         }
@@ -158,5 +205,70 @@ fn run_scheduled_cycle(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result
             let _ = app.emit("cycle:complete", payload);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_failure_does_not_set_success_timer() {
+        let mut success = None;
+        let mut fail = None;
+        let t0 = Instant::now();
+        record_cycle_outcome(&mut success, &mut fail, t0, Err(()));
+        assert!(success.is_none());
+        assert!(fail.is_some());
+    }
+
+    #[test]
+    fn success_clears_fail_backoff() {
+        let mut success = None;
+        let mut fail = Some(Instant::now());
+        let t0 = Instant::now();
+        record_cycle_outcome(&mut success, &mut fail, t0, Ok(true));
+        assert!(success.is_some());
+        assert!(fail.is_none());
+    }
+
+    #[test]
+    fn skip_does_not_advance_timers() {
+        let mut success = Some(Instant::now());
+        let mut fail = None;
+        let before = success;
+        record_cycle_outcome(&mut success, &mut fail, Instant::now(), Ok(false));
+        assert_eq!(success, before);
+        assert!(fail.is_none());
+    }
+
+    #[test]
+    fn fail_backoff_blocks_then_allows() {
+        let t0 = Instant::now();
+        let fail = Some(t0);
+        let interval = Duration::from_secs(1800);
+        assert!(!cycle_due(None, fail, interval, t0, FAIL_BACKOFF));
+        assert!(cycle_due(
+            None,
+            fail,
+            interval,
+            t0 + FAIL_BACKOFF,
+            FAIL_BACKOFF
+        ));
+        let success = Some(t0);
+        assert!(!cycle_due(
+            success,
+            None,
+            interval,
+            t0 + Duration::from_secs(60),
+            FAIL_BACKOFF
+        ));
+        assert!(cycle_due(
+            success,
+            None,
+            interval,
+            t0 + interval,
+            FAIL_BACKOFF
+        ));
     }
 }

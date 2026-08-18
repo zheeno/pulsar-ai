@@ -250,6 +250,63 @@ pub fn reject_abandoned_created(conn: &Connection, venue: Option<&str>) -> Resul
     Ok(n)
 }
 
+/// Stale `submitted` with no broker id never reached the venue — free cash/slots.
+pub const STALE_SUBMITTED_MINUTES: i64 = 3;
+/// Aged `unknown` that never resolved — fail-closed reject to unfreeze the venue.
+pub const AGED_UNKNOWN_MINUTES: i64 = 10;
+
+pub fn reject_stale_submitted_without_ref(conn: &Connection, venue: Option<&str>) -> Result<usize> {
+    let cutoff = format!("-{STALE_SUBMITTED_MINUTES} minutes");
+    let n = match venue {
+        Some(v) => conn.execute(
+            "UPDATE order_intents SET state = 'rejected',
+                last_error = COALESCE(last_error, 'stale submitted without broker id'),
+                updated_at = datetime('now')
+             WHERE state = 'submitted' AND venue = ?1
+               AND external_order_ref IS NULL
+               AND external_order_id IS NULL
+               AND COALESCE(updated_at, created_at) <= datetime('now', ?2)",
+            rusqlite::params![v, cutoff],
+        )?,
+        None => conn.execute(
+            "UPDATE order_intents SET state = 'rejected',
+                last_error = COALESCE(last_error, 'stale submitted without broker id'),
+                updated_at = datetime('now')
+             WHERE state = 'submitted'
+               AND external_order_ref IS NULL
+               AND external_order_id IS NULL
+               AND COALESCE(updated_at, created_at) <= datetime('now', ?1)",
+            rusqlite::params![cutoff],
+        )?,
+    };
+    Ok(n)
+}
+
+/// Unknown intents older than the policy window stop reserving cash and
+/// no longer trip `BLOCKED_AMBIGUOUS_ORDERS`.
+pub fn reject_aged_unknown(conn: &Connection, venue: Option<&str>) -> Result<usize> {
+    let cutoff = format!("-{AGED_UNKNOWN_MINUTES} minutes");
+    let n = match venue {
+        Some(v) => conn.execute(
+            "UPDATE order_intents SET state = 'rejected',
+                last_error = COALESCE(last_error, 'aged unknown — expired by reconcile policy'),
+                updated_at = datetime('now')
+             WHERE state = 'unknown' AND venue = ?1
+               AND COALESCE(updated_at, created_at) <= datetime('now', ?2)",
+            rusqlite::params![v, cutoff],
+        )?,
+        None => conn.execute(
+            "UPDATE order_intents SET state = 'rejected',
+                last_error = COALESCE(last_error, 'aged unknown — expired by reconcile policy'),
+                updated_at = datetime('now')
+             WHERE state = 'unknown'
+               AND COALESCE(updated_at, created_at) <= datetime('now', ?1)",
+            rusqlite::params![cutoff],
+        )?,
+    };
+    Ok(n)
+}
+
 pub fn find_duplicate(
     conn: &Connection,
     symbol: &str,
@@ -356,5 +413,48 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(pending_buy_notional_on(&conn, Some("bamboo")).unwrap(), 0.0);
         assert!(load_open_intents_on(&conn, Some("bamboo")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_submitted_without_ref_releases_cash() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO order_intents (id, client_order_id, symbol, side, requested_qty, requested_notional, venue, state, created_at, updated_at)
+             VALUES ('s', 'c5', 'UACN', 'BUY', 1, 6000, 'bamboo', 'submitted', datetime('now', '-10 minutes'), datetime('now', '-10 minutes'))",
+            [],
+        )
+        .unwrap();
+        assert!(pending_buy_notional_on(&conn, Some("bamboo")).unwrap() > 0.0);
+        let n = reject_stale_submitted_without_ref(&conn, Some("bamboo")).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(pending_buy_notional_on(&conn, Some("bamboo")).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn fresh_submitted_without_ref_is_kept() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO order_intents (id, client_order_id, symbol, side, requested_qty, requested_notional, venue, state)
+             VALUES ('s2', 'c6', 'UACN', 'BUY', 1, 6000, 'bamboo', 'submitted')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(reject_stale_submitted_without_ref(&conn, Some("bamboo")).unwrap(), 0);
+        assert!(pending_buy_notional_on(&conn, Some("bamboo")).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn aged_unknown_clears_ambiguous_gate() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO order_intents (id, client_order_id, symbol, side, requested_qty, venue, state, external_order_ref, created_at, updated_at)
+             VALUES ('u', 'c7', 'GTCO', 'SELL', 6, 'wealth', 'unknown', '999', datetime('now', '-20 minutes'), datetime('now', '-20 minutes'))",
+            [],
+        )
+        .unwrap();
+        assert!(ambiguous_pending_on(&conn, Some("wealth")).unwrap());
+        let n = reject_aged_unknown(&conn, Some("wealth")).unwrap();
+        assert_eq!(n, 1);
+        assert!(!ambiguous_pending_on(&conn, Some("wealth")).unwrap());
     }
 }

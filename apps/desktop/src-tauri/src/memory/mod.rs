@@ -137,8 +137,8 @@ pub fn insert_memory(
     source: &str,
     embedding: Option<&[u8]>,
 ) -> Result<String> {
-    let kind = if kind == "symbol_lesson" {
-        "symbol_lesson"
+    let kind = if kind == "symbol_lesson" || kind == "freeform" {
+        kind
     } else {
         "freeform"
     };

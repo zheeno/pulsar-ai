@@ -574,14 +574,14 @@ impl ExecutionService {
         skip_buy_reason: Option<&str>,
     ) -> Result<bool> {
         let loaded = db.with_conn(|conn| {
-            let signal: Option<(String, String, f64)> = conn
+            let signal: Option<(String, String, f64, String)> = conn
                 .query_row(
-                    "SELECT symbol, action, confidence FROM signals WHERE id = ?1",
+                    "SELECT symbol, action, confidence, technical_snapshot FROM signals WHERE id = ?1",
                     [signal_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .ok();
-            let Some((symbol, action, confidence)) = signal else {
+            let Some((symbol, action, confidence, snapshot)) = signal else {
                 return Ok(None);
             };
             if !is_valid_ticker(&symbol) {
@@ -597,10 +597,10 @@ impl ExecutionService {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
             let param_set = Self::load_param_set(conn, &portfolio.2)?;
-            Ok(Some((symbol, action, confidence, portfolio, param_set)))
+            Ok(Some((symbol, action, confidence, snapshot, portfolio, param_set)))
         })?;
 
-        let Some((symbol, action, confidence, portfolio, param_set)) = loaded else {
+        let Some((symbol, action, confidence, snapshot, portfolio, param_set)) = loaded else {
             return Ok(false);
         };
 
@@ -611,6 +611,16 @@ impl ExecutionService {
             confidence,
         };
         let fee_pct = settings.simulated_fee_pct.max(0.0);
+        if settings.halt_new_buys && action == "BUY" {
+            db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_NOT_EXECUTED' WHERE id = ?1 AND executed = 0",
+                    [signal_id],
+                )?;
+                Ok(())
+            })?;
+            return Ok(false);
+        }
 
         // BUY already failed Pass A qualify — risk_policy_result was written in the planner.
         // Capital-constrained cycles must not call the broker for BUYs at all.
@@ -692,6 +702,17 @@ impl ExecutionService {
                     buy_target_notional,
                     min_order_notional_for_venue(client.id().as_str()),
                 );
+                if result == "APPROVED" && action == "SELL" {
+                    let frac = sell_fraction_from_snapshot(&snapshot);
+                    quantity = crate::risk_exits::sell_qty_for_exit(quantity, frac);
+                    if quantity < 1.0 {
+                        conn.execute(
+                            "UPDATE signals SET risk_policy_result = 'BLOCKED_NO_POSITION' WHERE id = ?1",
+                            [signal_id],
+                        )?;
+                        return Ok(None);
+                    }
+                }
                 conn.execute(
                     "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
                     rusqlite::params![result, signal_id],
@@ -964,6 +985,26 @@ impl ExecutionService {
                 )?;
                 if order.status == "executed" {
                     conn.execute("UPDATE signals SET executed = 1 WHERE id = ?1", [signal_id])?;
+                    let avg_cost = if action == "SELL" {
+                        snap.holdings
+                            .iter()
+                            .find(|h| h.symbol.eq_ignore_ascii_case(&symbol))
+                            .and_then(|h| h.buy_price)
+                    } else {
+                        None
+                    };
+                    let px = fill_price.unwrap_or(broker_quote);
+                    let _ = crate::outcomes::record_executed_fill(
+                        conn,
+                        signal_id,
+                        &symbol,
+                        &action,
+                        quantity,
+                        px,
+                        fee.fee,
+                        client.id().as_str(),
+                        avg_cost,
+                    );
                 }
                 Ok(())
             })?;
@@ -1004,7 +1045,7 @@ impl ExecutionService {
                     |row| row.get(0),
                 )
                 .unwrap_or(0.0);
-            let (result, quantity) = RiskPolicyService::evaluate(
+            let (result, mut quantity) = RiskPolicyService::evaluate(
                 &input,
                 &param_set,
                 portfolio.1,
@@ -1021,6 +1062,15 @@ impl ExecutionService {
             )?;
             if result != "APPROVED" || quantity <= 0.0 {
                 return Ok(false);
+            }
+            if action == "SELL" {
+                quantity = crate::risk_exits::sell_qty_for_exit(
+                    quantity,
+                    sell_fraction_from_snapshot(&snapshot),
+                );
+                if quantity < 1.0 {
+                    return Ok(false);
+                }
             }
             let current_price = prices.get(&symbol).copied().unwrap_or(0.0);
             if current_price <= 0.0 {
@@ -1059,6 +1109,17 @@ impl ExecutionService {
         let (fill_price, slippage_bps) = fill_sim.simulate_fill(side, current_price);
         let notional = fill_price * quantity;
         let fee = fill_sim.calculate_fee(notional);
+
+        let avg_cost_for_close: Option<f64> = if side == "SELL" {
+            conn.query_row(
+                "SELECT avg_cost FROM sandbox_positions WHERE portfolio_id = ?1 AND symbol = ?2",
+                rusqlite::params![portfolio_id, symbol],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            None
+        };
 
         if side == "BUY" {
             let total_cost = notional + fee;
@@ -1117,6 +1178,17 @@ impl ExecutionService {
             "INSERT INTO sandbox_trades (id, portfolio_id, signal_id, symbol, side, quantity, fill_price, simulated_fee, simulated_slippage_bps, resulting_cash_balance)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![trade_id, portfolio_id, signal_id, symbol, side, quantity, fill_price, fee, slippage_bps, cash_balance],
+        )?;
+        crate::outcomes::record_executed_fill(
+            conn,
+            signal_id,
+            symbol,
+            side,
+            quantity,
+            fill_price,
+            fee,
+            "sandbox",
+            avg_cost_for_close,
         )?;
         Ok(())
         })();
@@ -1346,7 +1418,8 @@ impl ExecutionService {
         let venue = session.id().as_str().to_string();
         let _ = db.with_conn(|conn| {
             let _ = crate::intents::reject_unsubmitted_unknown(conn);
-            crate::intents::reject_abandoned_created(conn, Some(&venue))
+            let _ = crate::intents::reject_abandoned_created(conn, Some(&venue));
+            crate::intents::reject_stale_submitted_without_ref(conn, Some(&venue))
         });
         let open = db.with_conn(|conn| crate::intents::load_open_intents_on(conn, Some(&venue)))?;
         for intent in open {
@@ -1384,13 +1457,32 @@ impl ExecutionService {
                 }
             }
         }
+        let _ = db.with_conn(|conn| crate::intents::reject_aged_unknown(conn, Some(&venue)));
         Ok(())
     }
+}
+
+pub const RETRY_SLOT_FRACTION: f64 = 0.30;
+
+fn sell_fraction_from_snapshot(snapshot: &str) -> f64 {
+    serde_json::from_str::<serde_json::Value>(snapshot)
+        .ok()
+        .and_then(|v| v.get("sellFraction").and_then(|x| x.as_f64()))
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(1.0)
+}
+
+/// Cap how many of `max_live_actions` may be 24h retries (≤30%, at least 1).
+pub fn retry_slot_cap(max_live_actions: usize) -> usize {
+    let n = max_live_actions.max(1);
+    let cap = ((n as f64) * RETRY_SLOT_FRACTION).floor() as usize;
+    cap.max(1).min(n)
 }
 
 /// Unexecuted BUY/SELL signals from recent cycles that should be retried on the next live run.
 /// Affordability (`BLOCKED_CASH`) BUYs are never retried — they re-hit the broker while broke.
 /// Pass `allow_buys = false` when the cycle is capital-constrained so queued BUYs stay parked.
+/// `limit` should already be `retry_slot_cap(max_live_actions)`.
 pub fn retryable_unexecuted_signal_ids(
     conn: &Connection,
     hours: i64,
@@ -1510,13 +1602,21 @@ pub fn classify_live_execution_error(msg: &str) -> &'static str {
 }
 
 pub fn live_drawdown_pct(conn: &Connection, venue: &str, current_equity: f64) -> Result<f64> {
-    // Missing equity history must not fail-closed: that blocked every live
-    // BUY/SELL on the first day (no prior-day row) and left BLOCKED_OTHER.
-    // Drawdown still applies once a prior-day point exists. SELLs ignore the
-    // numeric drawdown in evaluate(); BUYs use it as the daily breaker.
+    // Session-open = first equity point today. Also consider prior calendar-day
+    // close so overnight gaps still trip the BUY brake. Missing history is
+    // fail-open (0) so day-one is not fail-closed with no points at all.
     if current_equity <= 0.0 || !current_equity.is_finite() {
         return Ok(0.0);
     }
+    let session_open: Option<f64> = conn
+        .query_row(
+            "SELECT total_equity FROM equity_curve_points
+             WHERE venue = ?1 AND date(recorded_at) = date('now')
+             ORDER BY recorded_at ASC LIMIT 1",
+            [venue],
+            |row| row.get(0),
+        )
+        .optional()?;
     let prior: Option<f64> = conn
         .query_row(
             "SELECT total_equity FROM equity_curve_points
@@ -1526,10 +1626,13 @@ pub fn live_drawdown_pct(conn: &Connection, venue: &str, current_equity: f64) ->
             |row| row.get(0),
         )
         .optional()?;
-    let Some(prior) = prior.filter(|p| *p > 0.0 && p.is_finite()) else {
-        return Ok(0.0);
+    let vs = |base: Option<f64>| -> f64 {
+        match base.filter(|p| *p > 0.0 && p.is_finite()) {
+            Some(b) => ((b - current_equity) / b).max(0.0),
+            None => 0.0,
+        }
     };
-    Ok(((prior - current_equity) / prior).max(0.0))
+    Ok(vs(session_open).max(vs(prior)))
 }
 
 #[cfg(test)]
@@ -2013,6 +2116,53 @@ mod tests {
         .unwrap();
         let pct = live_drawdown_pct(&conn, "wealth", 9_000.0).unwrap();
         assert!((pct - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn intra_session_drawdown_without_prior_day() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE equity_curve_points (
+                venue TEXT, recorded_at TEXT, total_equity REAL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO equity_curve_points (venue, recorded_at, total_equity)
+             VALUES ('bamboo', datetime('now', '-2 hours'), 10_000.0)",
+            [],
+        )
+        .unwrap();
+        let pct = live_drawdown_pct(&conn, "bamboo", 8_500.0).unwrap();
+        assert!((pct - 0.15).abs() < 1e-9);
+        let buy = RiskPolicyService::evaluate(
+            &SignalInput {
+                id: "s".into(),
+                symbol: "GTCO".into(),
+                action: "BUY".into(),
+                confidence: 0.9,
+            },
+            &test_param_set(),
+            8_500.0,
+            &[],
+            &{
+                let mut m = std::collections::HashMap::new();
+                m.insert("GTCO".into(), 50.0);
+                m
+            },
+            pct,
+            0.0,
+            Some(5_000.0),
+            5_000.0,
+        );
+        assert_eq!(buy.0, "BLOCKED_DRAWDOWN");
+    }
+
+    #[test]
+    fn retry_slot_cap_is_thirty_percent() {
+        assert_eq!(retry_slot_cap(10), 3);
+        assert_eq!(retry_slot_cap(1), 1);
+        assert_eq!(retry_slot_cap(40), 12);
     }
 
     #[test]

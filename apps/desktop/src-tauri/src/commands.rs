@@ -81,9 +81,29 @@ pub fn settings_set(payload: SettingsUpdate, state: State<'_, Arc<AppState>>) ->
         }
     }
 
+    if settings.launch_at_login != current.launch_at_login {
+        crate::launch_at_login::apply(settings.launch_at_login).map_err(|e| e.to_string())?;
+    }
+
     state
         .db
         .with_conn(|conn| save_settings(conn, &settings))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn confidence_journal(state: State<'_, Arc<AppState>>) -> Result<Vec<serde_json::Value>, String> {
+    state
+        .db
+        .with_conn(crate::outcomes::confidence_journal)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_cycle_audits(state: State<'_, Arc<AppState>>) -> Result<Vec<serde_json::Value>, String> {
+    state
+        .db
+        .with_conn(|conn| crate::signals::list_recent_cycle_audits(conn, 30))
         .map_err(|e| e.to_string())
 }
 

@@ -41,8 +41,17 @@ pub struct AppSettings {
     pub max_live_notional: f64,
     /// Max live actions per cycle (backend cap).
     pub max_live_actions: u32,
-    /// When true, store encrypted raw LLM transcripts in the OS keychain-backed blob.
+    /// When true, store truncated-or-full LLM transcripts in signal_llm_logs.
     pub retain_raw_llm_logs: bool,
+    /// Halt new BUYs while still executing protective SELLs (SL/TP/time-stop).
+    #[serde(default)]
+    pub halt_new_buys: bool,
+    /// When true AND session drawdown hits the strategy cap, sell all lots (audit).
+    #[serde(default)]
+    pub flatten_on_drawdown_armed: bool,
+    /// Optional OS login-item (macOS). Gated behind the app-down warning in Settings.
+    #[serde(default)]
+    pub launch_at_login: bool,
 }
 
 impl Default for AppSettings {
@@ -72,6 +81,9 @@ impl Default for AppSettings {
             max_live_notional: 500_000.0,
             max_live_actions: 10,
             retain_raw_llm_logs: false,
+            halt_new_buys: false,
+            flatten_on_drawdown_armed: false,
+            launch_at_login: false,
         }
     }
 }
@@ -127,6 +139,9 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
                 settings.max_live_actions = value.parse::<u32>().unwrap_or(10).clamp(1, 40)
             }
             "retain_raw_llm_logs" => settings.retain_raw_llm_logs = value == "true",
+            "halt_new_buys" => settings.halt_new_buys = value == "true",
+            "flatten_on_drawdown_armed" => settings.flatten_on_drawdown_armed = value == "true",
+            "launch_at_login" => settings.launch_at_login = value == "true",
             _ => {}
         }
     }
@@ -246,6 +261,33 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
         conn,
         "retain_raw_llm_logs",
         if settings.retain_raw_llm_logs {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    set_setting(
+        conn,
+        "halt_new_buys",
+        if settings.halt_new_buys {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    set_setting(
+        conn,
+        "flatten_on_drawdown_armed",
+        if settings.flatten_on_drawdown_armed {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    set_setting(
+        conn,
+        "launch_at_login",
+        if settings.launch_at_login {
             "true"
         } else {
             "false"
@@ -417,6 +459,14 @@ mod tests {
         let mut s = AppSettings::default();
         s.live_trading_enabled = true;
         s
+    }
+
+    #[test]
+    fn protective_flags_default_off() {
+        let s = AppSettings::default();
+        assert!(!s.flatten_on_drawdown_armed);
+        assert!(!s.halt_new_buys);
+        assert!(!s.launch_at_login);
     }
 
     #[test]

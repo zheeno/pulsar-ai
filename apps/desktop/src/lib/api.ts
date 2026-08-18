@@ -79,6 +79,9 @@ export interface AppSettings {
   maxLiveNotional?: number;
   maxLiveActions?: number;
   retainRawLlmLogs?: boolean;
+  haltNewBuys?: boolean;
+  flattenOnDrawdownArmed?: boolean;
+  launchAtLogin?: boolean;
 }
 
 export interface PortfolioData {

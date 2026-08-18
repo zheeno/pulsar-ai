@@ -26,6 +26,7 @@ pub struct HeldLot {
     pub quantity: f64,
     pub avg_cost: f64,
     pub last_price: Option<f64>,
+    pub opened_at: Option<String>,
 }
 
 impl HeldLot {
@@ -38,8 +39,24 @@ impl HeldLot {
                 quantity: h.quantity,
                 avg_cost: h.buy_price.unwrap_or(0.0),
                 last_price: if h.price > 0.0 { Some(h.price) } else { None },
+                opened_at: None,
             })
             .collect()
+    }
+
+    pub fn hours_held(&self) -> Option<f64> {
+        let raw = self.opened_at.as_deref()?;
+        let parsed = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f"))
+            .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw).map(|d| d.naive_utc()))
+            .ok()?;
+        let now = chrono::Utc::now().naive_utc();
+        let secs = (now - parsed).num_seconds() as f64;
+        if secs.is_finite() && secs > 0.0 {
+            Some(secs / 3600.0)
+        } else {
+            None
+        }
     }
 }
 
@@ -87,11 +104,14 @@ impl SignalGenerationService {
             return Ok(None);
         };
 
-        let lots = if venue != "sandbox" {
+        let mut lots = if venue != "sandbox" {
             live_holdings_owned.clone().unwrap_or_default()
         } else {
             Self::sandbox_lots(conn, pid.as_deref())?
         };
+        if venue != "sandbox" {
+            Self::attach_live_opened_at(conn, &mut lots);
+        }
         let held_symbols: std::collections::HashSet<String> =
             lots.iter().map(|l| l.symbol.to_uppercase()).collect();
 
@@ -102,7 +122,13 @@ impl SignalGenerationService {
         let queued_buy_symbols = Self::queued_unexecuted_buy_symbols(conn)?;
         let pending_unexecuted = Self::pending_unexecuted_for_prompt(conn)?;
 
-        let universe_rows = Self::build_universe(conn, &held_symbols, &recent_set)?;
+        let mut universe_rows = Self::build_universe(conn, &held_symbols, &recent_set)?;
+        universe_rows.retain(|row| {
+            keep_unheld_for_llm(
+                held_symbols.contains(&row.symbol.to_uppercase()),
+                IndicatorService::is_overbought(conn, &row.symbol).unwrap_or(false),
+            )
+        });
         if universe_rows.is_empty() {
             return Ok(None);
         }
@@ -160,12 +186,17 @@ impl SignalGenerationService {
                 .last_price
                 .filter(|p| *p > 0.0)
                 .or_else(|| Self::last_db_price(conn, &lot.symbol));
-            let assessment = crate::risk_exits::assess_position_exit(
+            let assessment = crate::risk_exits::assess_position_exit_full(
                 &lot.symbol,
                 lot.avg_cost,
                 last,
-                param_set.stop_loss_pct,
-                param_set.take_profit_pct,
+                crate::risk_exits::ExitParams {
+                    stop_loss_pct: param_set.stop_loss_pct,
+                    take_profit_pct: param_set.take_profit_pct,
+                    time_stop_hours: param_set.time_stop_hours,
+                    partial_tp_fraction: param_set.partial_tp_fraction,
+                },
+                lot.hours_held(),
             );
 
             positions_json.push(json!({
@@ -193,6 +224,7 @@ impl SignalGenerationService {
                     exit.kind.model_name(),
                     &exit.rationale,
                     exit.confidence,
+                    exit.sell_fraction,
                 )? {
                     signal_ids.push(id);
                 }
@@ -212,17 +244,6 @@ impl SignalGenerationService {
             .ok()
         };
 
-        let daily_drawdown = if let Some(ref id) = portfolio_db_id {
-            conn.query_row(
-                "SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = ?1 ORDER BY snapshot_date DESC LIMIT 1",
-                [id],
-                |row| row.get::<_, f64>(0),
-            )
-            .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
         let positions_for_risk: Vec<(String, f64, f64)> = lots
             .iter()
             .map(|l| (l.symbol.clone(), l.quantity, l.avg_cost))
@@ -239,6 +260,18 @@ impl SignalGenerationService {
             })
             .sum();
         let total_equity = cash + market_value;
+        let daily_drawdown = if venue != "sandbox" {
+            crate::execution::live_drawdown_pct(conn, &venue, total_equity).unwrap_or(0.0)
+        } else if let Some(ref id) = portfolio_db_id {
+            conn.query_row(
+                "SELECT drawdown_pct FROM daily_performance_snapshot WHERE portfolio_id = ?1 ORDER BY snapshot_date DESC LIMIT 1",
+                [id],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap_or(0.0)
+        } else {
+            0.0
+        };
         let risk_params = param_set.to_param_set();
 
         let min_n = crate::execution::min_order_notional_for_venue(&venue);
@@ -260,6 +293,7 @@ impl SignalGenerationService {
             &seen,
             min_n,
             remaining_budget,
+            settings.halt_new_buys,
         );
 
         let min_buy_signals = MIN_BUY_TARGET.min(capacity.max_buy_signals);
@@ -669,13 +703,14 @@ impl SignalGenerationService {
         model_name: &str,
         rationale: &str,
         confidence: f64,
+        sell_fraction: f64,
     ) -> Result<Option<String>> {
         let pick = json!({
             "action": "SELL",
             "confidence": confidence,
             "rationale": rationale,
         });
-        Self::persist_signal(
+        let id = Self::persist_signal(
             conn,
             &pick,
             symbol,
@@ -684,7 +719,15 @@ impl SignalGenerationService {
             model_name,
             PORTFOLIO_PROMPT_VERSION,
             false,
-        )
+        )?;
+        if let Some(ref sid) = id {
+            let snap = json!({ "sellFraction": sell_fraction.clamp(0.1, 1.0) });
+            conn.execute(
+                "UPDATE signals SET technical_snapshot = ?1 WHERE id = ?2",
+                rusqlite::params![snap.to_string(), sid],
+            )?;
+        }
+        Ok(id)
     }
 
     pub(crate) fn get_active_param_set(
@@ -702,11 +745,14 @@ impl SignalGenerationService {
                 position_size_pct: row.get(6)?,
                 cycle_budget_pct: row.get(7)?,
                 max_daily_drawdown_pct: row.get(8)?,
+                time_stop_hours: row.get::<_, Option<f64>>(9)?.unwrap_or(24.0),
+                partial_tp_fraction: row.get::<_, Option<f64>>(10)?.unwrap_or(1.0),
             })
         };
         let cols = "s.id, s.max_daily_trades, s.stop_loss_pct, s.take_profit_pct,
                     s.min_confidence_to_trade, s.max_position_pct, s.position_size_pct,
-                    s.cycle_budget_pct, s.max_daily_drawdown_pct";
+                    s.cycle_budget_pct, s.max_daily_drawdown_pct,
+                    s.time_stop_hours, s.partial_tp_fraction";
         if let Some(pid) = portfolio_id {
             let row: Option<ParamSetRow> = conn
                 .query_row(
@@ -729,7 +775,8 @@ impl SignalGenerationService {
             &format!(
                 "SELECT id, max_daily_trades, stop_loss_pct, take_profit_pct,
                         min_confidence_to_trade, max_position_pct, position_size_pct,
-                        cycle_budget_pct, max_daily_drawdown_pct
+                        cycle_budget_pct, max_daily_drawdown_pct,
+                        time_stop_hours, partial_tp_fraction
                  FROM strategy_param_sets WHERE is_active = 1 LIMIT 1"
             ),
             [],
@@ -799,7 +846,10 @@ impl SignalGenerationService {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT symbol, quantity, avg_cost FROM sandbox_positions WHERE portfolio_id = ?1 AND quantity > 0",
+            "SELECT p.symbol, p.quantity, p.avg_cost,
+                    (SELECT MIN(t.executed_at) FROM sandbox_trades t
+                      WHERE t.portfolio_id = p.portfolio_id AND t.symbol = p.symbol AND t.side = 'BUY')
+             FROM sandbox_positions p WHERE p.portfolio_id = ?1 AND p.quantity > 0",
         )?;
         let rows = stmt.query_map([&pid], |row| {
             Ok(HeldLot {
@@ -807,9 +857,28 @@ impl SignalGenerationService {
                 quantity: row.get(1)?,
                 avg_cost: row.get(2)?,
                 last_price: None,
+                opened_at: row.get(3)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub(crate) fn attach_live_opened_at(conn: &Connection, lots: &mut [HeldLot]) {
+        for lot in lots {
+            if lot.opened_at.is_some() {
+                continue;
+            }
+            lot.opened_at = conn
+                .query_row(
+                    "SELECT MIN(created_at) FROM broker_orders
+                     WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY'
+                       AND LOWER(status) IN ('executed', 'filled')",
+                    [&lot.symbol],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten();
+        }
     }
 
     pub(crate) fn last_db_price(conn: &Connection, symbol: &str) -> Option<f64> {
@@ -1048,6 +1117,8 @@ pub(crate) struct ParamSetRow {
     pub position_size_pct: f64,
     pub cycle_budget_pct: f64,
     pub max_daily_drawdown_pct: f64,
+    pub time_stop_hours: f64,
+    pub partial_tp_fraction: f64,
 }
 
 impl ParamSetRow {
@@ -1078,6 +1149,7 @@ fn compute_trade_capacity(
     seen: &std::collections::HashSet<String>,
     min_order_notional: f64,
     remaining_budget: f64,
+    halt_new_buys: bool,
 ) -> TradeCapacity {
     let drawdown_ok = daily_drawdown < param_set.max_daily_drawdown_pct;
     let capital_reason =
@@ -1104,7 +1176,8 @@ fn compute_trade_capacity(
             }
         })
     };
-    let buy_allowed = drawdown_ok && can_afford && cash > 0.0 && capital_reason.is_none();
+    let buy_allowed =
+        drawdown_ok && can_afford && cash > 0.0 && capital_reason.is_none() && !halt_new_buys;
     let sell_allowed = held_symbols.iter().any(|s| !seen.contains(s));
     let max_buy_signals = if buy_allowed {
         crate::execution::max_buys_for_min_notional(
@@ -1166,6 +1239,103 @@ fn compute_trade_capacity(
         skip_reason,
         capital_reason,
     }
+}
+
+fn keep_unheld_for_llm(held: bool, overbought: bool) -> bool {
+    held || !overbought
+}
+
+pub fn list_recent_cycle_audits(conn: &Connection, limit: i64) -> Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT cycle_id, summary, blocked_histogram, cash, executed_ids, created_at, detail
+         FROM cycle_audits ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit.max(1)], |row| {
+        Ok(json!({
+            "cycleId": row.get::<_, Option<String>>(0)?,
+            "summary": row.get::<_, String>(1)?,
+            "blockedHistogram": row.get::<_, Option<String>>(2)?,
+            "cash": row.get::<_, Option<f64>>(3)?,
+            "executedIds": row.get::<_, Option<String>>(4)?,
+            "createdAt": row.get::<_, String>(5)?,
+            "detail": row.get::<_, Option<String>>(6)?,
+        }))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub(crate) fn persist_cycle_audit(
+    conn: &Connection,
+    cycle_id: Option<&str>,
+    generated_count: usize,
+    executed: i64,
+    trading_mode: &str,
+    universe_size: usize,
+    warning: Option<&str>,
+    signal_ids: &[String],
+    cash: Option<f64>,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM cycle_audits WHERE expires_at < datetime('now')",
+        [],
+    )?;
+    let mut hist: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut executed_ids: Vec<String> = Vec::new();
+    for id in signal_ids {
+        let result: String = conn
+            .query_row(
+                "SELECT COALESCE(risk_policy_result, 'UNSET') FROM signals WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "UNSET".into());
+        *hist.entry(result).or_insert(0) += 1;
+        let done: i64 = conn
+            .query_row(
+                "SELECT COALESCE(executed, 0) FROM signals WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if done == 1 {
+            executed_ids.push(id.clone());
+        }
+    }
+    let histogram = serde_json::to_string(&hist).unwrap_or_else(|_| "{}".into());
+    let executed_json = serde_json::to_string(&executed_ids).unwrap_or_else(|_| "[]".into());
+    let summary = format!(
+        "signals={} executed={} venue={} universe={}{}",
+        generated_count,
+        executed,
+        trading_mode,
+        universe_size,
+        warning.map(|w| format!(" warn={w}")).unwrap_or_default()
+    );
+    let detail = json!({
+        "blockedHistogram": hist,
+        "cash": cash,
+        "executedIds": executed_ids,
+        "signalIds": signal_ids,
+        "generated": generated_count,
+        "executed": executed,
+        "venue": trading_mode,
+        "universeSize": universe_size,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO cycle_audits (id, cycle_id, summary, expires_at, detail, blocked_histogram, cash, executed_ids)
+         VALUES (?1, ?2, ?3, datetime('now', '+90 days'), ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            Uuid::new_v4().to_string(),
+            cycle_id.unwrap_or(""),
+            summary,
+            detail,
+            histogram,
+            cash,
+            executed_json,
+        ],
+    )?;
+    Ok(())
 }
 
 fn redact_audit(s: &str, max: usize) -> String {
@@ -1429,6 +1599,18 @@ pub async fn run_cycle(
                     holdings: b.holdings,
                     stocks_present: true,
                 });
+                if let Some(ref snap) = live_snap {
+                    let mv = snap.holdings.iter().map(|h| h.current_value).sum::<f64>();
+                    let _ = db.with_conn(|conn| {
+                        crate::portfolio::EquityCurveService::insert_point(
+                            conn,
+                            venue,
+                            snap.balance + mv,
+                            snap.balance,
+                            mv,
+                        )
+                    });
+                }
                 (cash, venue, holdings)
             } else {
                 (None, "sandbox", Vec::new())
@@ -1459,7 +1641,7 @@ pub async fn run_cycle(
             crate::execution::retryable_unexecuted_signal_ids(
                 conn,
                 24,
-                settings.max_live_actions.max(1) as usize,
+                crate::execution::retry_slot_cap(settings.max_live_actions.max(1) as usize),
                 !generated.buys_disabled,
             )
         })?;
@@ -1547,27 +1729,17 @@ pub async fn run_cycle(
     }
 
     let _ = db.with_conn(|conn| {
-        conn.execute(
-            "DELETE FROM cycle_audits WHERE expires_at < datetime('now')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO cycle_audits (id, cycle_id, summary, expires_at)
-             VALUES (?1, ?2, ?3, datetime('now', '+14 days'))",
-            rusqlite::params![
-                uuid::Uuid::new_v4().to_string(),
-                cycle_id.unwrap_or(""),
-                format!(
-                    "signals={} executed={} venue={} universe={}{}",
-                    generated.signal_ids.len(),
-                    executed,
-                    trading_mode.as_str(),
-                    generated.universe_size,
-                    warnings.first().map(|w| format!(" warn={w}")).unwrap_or_default()
-                )
-            ],
-        )?;
-        Ok(())
+        persist_cycle_audit(
+            conn,
+            cycle_id,
+            generated.signal_ids.len(),
+            executed,
+            trading_mode.as_str(),
+            generated.universe_size,
+            warnings.first().map(String::as_str),
+            &signal_ids,
+            cash_for_agent,
+        )
     });
 
     Ok(json!({
@@ -1762,6 +1934,8 @@ mod tests {
             position_size_pct: 0.05,
             cycle_budget_pct: 0.20,
             max_daily_drawdown_pct: 0.05,
+            time_stop_hours: 24.0,
+            partial_tp_fraction: 1.0,
         }
     }
 
@@ -1793,6 +1967,7 @@ mod tests {
             &HashSet::new(),
             0.0,
             remaining_for(0.0, 0.0),
+            false,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1825,6 +2000,7 @@ mod tests {
             &HashSet::new(),
             0.0,
             remaining_for(1_000_000.0, 0.0),
+            false,
         );
         assert!(!cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1859,6 +2035,7 @@ mod tests {
             &HashSet::new(),
             0.0,
             remaining_for(1_000_000.0, 0.0),
+            false,
         );
         assert!(!cap.skip_llm);
         assert!(cap.buy_allowed);
@@ -1894,6 +2071,7 @@ mod tests {
             &HashSet::new(),
             0.0,
             remaining_for(200.0, 0.0),
+            false,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -1928,6 +2106,7 @@ mod tests {
             &HashSet::new(),
             crate::execution::BAMBOO_MIN_ORDER_NOTIONAL,
             remaining_for(16_750.0, crate::execution::BAMBOO_MIN_ORDER_NOTIONAL),
+            false,
         );
         assert!(cap.buy_allowed);
         assert_eq!(cap.max_buy_signals, 1);
@@ -1961,6 +2140,7 @@ mod tests {
             &HashSet::new(),
             min_n,
             remaining_for(cash, min_n),
+            false,
         );
         assert!(!cap.buy_allowed);
         assert!(cap.buys_disabled);
@@ -1995,6 +2175,7 @@ mod tests {
             &HashSet::new(),
             min_n,
             remaining,
+            false,
         );
         assert!(cap.buy_allowed);
         assert!(!cap.buys_disabled);
@@ -2029,6 +2210,7 @@ mod tests {
             &HashSet::new(),
             min_n,
             remaining_for(cash, min_n),
+            false,
         );
         assert!(!cap.skip_llm);
         assert!(cap.buys_disabled);
@@ -2068,5 +2250,98 @@ mod tests {
         let set = SignalGenerationService::queued_unexecuted_buy_symbols(&conn).unwrap();
         assert!(set.contains("UACN"));
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn pre_llm_filter_keeps_held_overbought_drops_unheld() {
+        assert!(!keep_unheld_for_llm(false, true));
+        assert!(keep_unheld_for_llm(true, true));
+        assert!(keep_unheld_for_llm(false, false));
+    }
+
+    #[test]
+    fn capacity_halts_buys_when_protective_only() {
+        let row = sample_param_row();
+        let risk = row.to_param_set();
+        let universe = vec![UniverseRow {
+            symbol: "GTCO".into(),
+            sector: None,
+            price: Some(50.0),
+            change_percent: Some(1.0),
+            volume: Some(1000),
+        }];
+        let held = held(&["GTCO"]);
+        let cap = compute_trade_capacity(
+            &row,
+            &risk,
+            1_000_000.0,
+            1_000_000.0,
+            0.0,
+            0.0015,
+            &universe,
+            &[("GTCO".into(), 100.0, 40.0)],
+            &held,
+            &HashSet::new(),
+            0.0,
+            remaining_for(1_000_000.0, 0.0),
+            true,
+        );
+        assert!(!cap.buy_allowed);
+        assert!(cap.sell_allowed);
+        assert!(cap.buys_disabled);
+    }
+
+    #[test]
+    fn cycle_audit_persists_histogram_cash_and_90d_ttl() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE signals (
+                id TEXT PRIMARY KEY, risk_policy_result TEXT, executed INTEGER
+             );
+             CREATE TABLE cycle_audits (
+                id TEXT PRIMARY KEY, cycle_id TEXT, summary TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL, detail TEXT, blocked_histogram TEXT,
+                cash REAL, executed_ids TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, risk_policy_result, executed) VALUES ('a', 'BLOCKED_CASH', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO signals (id, risk_policy_result, executed) VALUES ('b', 'APPROVED', 1)",
+            [],
+        )
+        .unwrap();
+        persist_cycle_audit(
+            &conn,
+            Some("cyc-1"),
+            2,
+            1,
+            "live",
+            40,
+            Some("warn"),
+            &["a".into(), "b".into()],
+            Some(4_200.0),
+        )
+        .unwrap();
+        let (hist, cash, ids, ttl): (String, f64, String, i64) = conn
+            .query_row(
+                "SELECT blocked_histogram, cash, executed_ids,
+                        CAST((julianday(expires_at) - julianday(created_at)) AS INTEGER)
+                 FROM cycle_audits LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(hist.contains("BLOCKED_CASH"));
+        assert!((cash - 4_200.0).abs() < 1e-9);
+        assert!(ids.contains("b"));
+        assert!(ttl >= 80);
+        let listed = list_recent_cycle_audits(&conn, 5).unwrap();
+        assert_eq!(listed.len(), 1);
     }
 }
