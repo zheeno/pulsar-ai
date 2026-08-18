@@ -1,5 +1,5 @@
 {
-  "name": "ngx-ai-trading-assistant",
+  "name": "pulsar-ai",
   "version": "1.0.0",
   "private": true,
   "workspaces": [
@@ -8,30 +8,21 @@
   ],
   "scripts": {
     "build": "turbo run build",
-    "dev": "turbo run dev",
+    "dev": "npm run desktop:ui",
     "test": "turbo run test",
     "lint": "turbo run lint",
-    "db:migrate": "node scripts/migrate.js",
-    "db:seed": "node scripts/seed.js",
-    "ngx-pulse:session-test": "node scripts/ngx-pulse-session-test.js",
-    "docker:up": "docker compose up -d",
-    "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f",
-    "deploy": "bash deploy/deploy.sh",
-    "deploy:nginx": "bash deploy/setup-nginx.sh",
-    "deploy:build": "docker compose -p pulsar -f docker-compose.prod.yml build",
-    "deploy:up": "docker compose -p pulsar -f docker-compose.prod.yml up -d",
-    "deploy:down": "docker compose -p pulsar -f docker-compose.prod.yml down",
-    "deploy:restart": "docker compose -p pulsar -f docker-compose.prod.yml restart",
-    "deploy:ps": "docker compose -p pulsar -f docker-compose.prod.yml ps",
-    "deploy:logs": "docker compose -p pulsar -f docker-compose.prod.yml logs -f",
-    "deploy:logs:api": "docker compose -p pulsar -f docker-compose.prod.yml logs -f api",
-    "deploy:logs:web": "docker compose -p pulsar -f docker-compose.prod.yml logs -f web"
+    "desktop:dev": "npm run agent:build && node scripts/run-with-cargo.mjs npm run desktop:dev -w @ngx/desktop",
+    "desktop:ui": "npm run dev -w @ngx/desktop",
+    "desktop:build": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs current",
+    "desktop:build:mac": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs mac",
+    "desktop:build:win": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs win",
+    "desktop:prepare": "node scripts/prepare-desktop-resources.mjs",
+    "agent:build": "npm run build -w @ngx/agent && node scripts/prepare-desktop-resources.mjs",
+    "agent:ping": "node scripts/test-agent-ping.js"
   },
   "devDependencies": {
     "turbo": "^2.3.3",
-    "typescript": "^5.7.2",
-    "pg": "^8.13.1"
+    "typescript": "^5.7.2"
   },
   "packageManager": "npm@10.9.7"
 }

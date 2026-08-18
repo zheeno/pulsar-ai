@@ -1,93 +1,47 @@
-# NGX AI Trading Assistant
+# Pulsar AI — local-first NGX trading assistant (Tauri + LangChain)
 
-AI-powered NGX trading assistant with mock execution sandbox.
+## Structure
 
-## Quick Start (local development)
+```
+apps/desktop     Tauri 2 + Vite React UI
+packages/agent   LangChain stdio worker (BYOK LLM)
+packages/shared  Shared Zod types / contracts
+```
+
+## Prerequisites
+
+- Node.js 20+
+- Rust stable (`rustup`)
+- macOS: Xcode Command Line Tools (needed to compile Tauri)
+
+## Quick start
 
 ```bash
-docker compose up -d
 npm install
-npm run db:migrate && npm run db:seed
-cp .env.example .env
-npm run dev
+npm run agent:build
 ```
 
-- API: http://localhost:3001
-- Dashboard: http://localhost:3000
-- Login: admin@ngx.local / admin123
-
-## Architecture
-
-NestJS modular monolith (API) + Next.js dashboard + Postgres + Redis + BullMQ.
-
-## Production Deployment (Docker + host nginx + Certbot)
-
-Uses **host nginx** as the reverse proxy (no nginx container). Docker runs only the app stack.
-
-### Prerequisites
-
-- Ubuntu server with **host nginx** already installed
-- Ports 80 and 443 available to host nginx
-- DNS A records pointing to server IP:
-  - `pulsar.antimony.com.ng`
-  - `pulsar-api.antimony.com.ng`
-- Certbot: `sudo apt install certbot python3-certbot-nginx`
-
-### Deploy
+**UI only (no Xcode CLT)** — browser preview with local mock data:
 
 ```bash
-git pull
-cp .env.production.example .env
-# Edit .env: CERTBOT_EMAIL, optional API keys
-chmod +x deploy/deploy.sh deploy/setup-nginx.sh
-./deploy/deploy.sh
+npm run desktop:ui
+# → http://localhost:1420
 ```
 
-The deploy script will:
-1. Install Docker if needed
-2. Build and start Postgres, Redis, API (127.0.0.1:3954 → container :3001), Web (127.0.0.1:3955 → container :3000)
-3. Install nginx site configs from `deploy/nginx/host/`
-4. Obtain SSL certificates via host Certbot (`certbot --nginx`)
-
-### Manual nginx setup (if needed)
+**Full desktop app** (requires Xcode CLT):
 
 ```bash
-sudo cp deploy/nginx/host/pulsar-web.conf /etc/nginx/sites-available/pulsar.antimony.com.ng.conf
-sudo cp deploy/nginx/host/pulsar-api.conf /etc/nginx/sites-available/pulsar-api.antimony.com.ng.conf
-sudo ln -sf /etc/nginx/sites-available/pulsar.antimony.com.ng.conf /etc/nginx/sites-enabled/
-sudo ln -sf /etc/nginx/sites-available/pulsar-api.antimony.com.ng.conf /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-sudo certbot --nginx -d pulsar.antimony.com.ng -d pulsar-api.antimony.com.ng
+npm run desktop:dev
 ```
 
-### URLs
+## Configuration
 
-- Dashboard: https://pulsar.antimony.com.ng
-- API: https://pulsar-api.antimony.com.ng/api/health
-- Login: `admin@ngx.local` / `admin123`
+Copy `.env.example` for optional agent/dev overrides. In the desktop app, NGX Pulse and LLM credentials are entered in Settings and stored in the OS keychain (not `.env`).
 
-### Management
+See [apps/desktop/README.md](apps/desktop/README.md).
 
-```bash
-# App logs
-docker compose -p pulsar -f docker-compose.prod.yml logs -f
+## Security notes
 
-# Restart API
-docker compose -p pulsar -f docker-compose.prod.yml restart api
-
-# Redeploy after code changes
-docker compose -p pulsar -f docker-compose.prod.yml up -d --build
-
-# Reload nginx after config changes
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-### Cloudflare
-
-If domains are proxied, use SSL mode **Full** after Certbot issues the origin certificate.
-
-## Testing
-
-```bash
-FORCE_INGEST=true npm run test --workspace=@ngx/api
-```
+- NGX Pulse Supabase **anon** keys are public client credentials. Never put a Supabase **service-role** key in `.env`, `tauri.conf.json`, or compiled config.
+- Browser mock mode (`npm run desktop:ui`) does not persist credentials.
+- Release signing, SBOM, and updater verification: [docs/release-security.md](docs/release-security.md).

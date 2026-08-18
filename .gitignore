@@ -8,3 +8,8 @@ dist/
 coverage/
 .DS_Store
 .env.prod.test
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/resources/
+apps/desktop/src-tauri/app-icon.png
+*.rdb
+dump.rdb

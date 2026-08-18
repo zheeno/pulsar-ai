@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Pulsar AI">
+  <defs>
+    <linearGradient id="pulsar-core" x1="18" y1="14" x2="48" y2="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7dd3fc"/>
+      <stop offset="55%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="pulsar-wave" x1="12" y1="32" x2="52" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22c55e" stop-opacity="0.15"/>
+      <stop offset="35%" stop-color="#22c55e"/>
+      <stop offset="70%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.2"/>
+    </linearGradient>
+    <radialGradient id="pulsar-glow" cx="32" cy="32" r="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.28"/>
+      <stop offset="70%" stop-color="#38bdf8" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- App tile -->
+  <rect width="64" height="64" rx="16" fill="#0f172a"/>
+  <rect x="1" y="1" width="62" height="62" rx="15" fill="none" stroke="#334155" stroke-opacity="0.9"/>
+  <circle cx="32" cy="32" r="22" fill="url(#pulsar-glow)"/>
+
+  <!-- Pulse rings (radar / pulsar emission) -->
+  <circle cx="32" cy="32" r="20" fill="none" stroke="#38bdf8" stroke-opacity="0.18" stroke-width="1.25"/>
+  <circle cx="32" cy="32" r="14.5" fill="none" stroke="#38bdf8" stroke-opacity="0.32" stroke-width="1.35"/>
+  <circle cx="32" cy="32" r="9" fill="none" stroke="#7dd3fc" stroke-opacity="0.45" stroke-width="1.4"/>
+
+  <!-- Market pulse / radio burst waveform -->
+  <path
+    d="M11 36.5
+       C15 36.5 16.5 34 18.5 30.5
+       C20.8 26.2 22.2 20 25.2 20
+       C28.4 20 29.2 28.5 32 32
+       C34.6 35.2 36.1 42.5 39.2 42.5
+       C42.2 42.5 43.6 34.8 46.2 30.2
+       C48.4 26.4 50.2 27.5 53 27.5"
+    fill="none"
+    stroke="url(#pulsar-wave)"
+    stroke-width="2.4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Pulsar core -->
+  <circle cx="32" cy="32" r="4.2" fill="url(#pulsar-core)"/>
+  <circle cx="32" cy="32" r="1.7" fill="#f8fafc"/>
+</svg>
