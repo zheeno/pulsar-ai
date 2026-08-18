@@ -11,7 +11,7 @@ import {
 } from 'recharts';
 import { IconSpinner } from '../components/Icons';
 import { api } from '../lib/api';
-import { formatNaira } from '../lib/format';
+import { formatNaira, tradeCashImpact } from '../lib/format';
 import { useToast } from '../lib/toast';
 
 type PricePoint = {
@@ -299,19 +299,27 @@ export default function SymbolDetailPage() {
                     <th>Side</th>
                     <th>Qty</th>
                     <th>Fill</th>
+                    <th>Spent / Proceeds</th>
                     <th>Fee</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {data.trades.map((t) => (
-                    <tr key={t.id}>
-                      <td className="muted" style={{ fontSize: 12 }}>{t.executedAt}</td>
-                      <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
-                      <td className="mono">{Number(t.quantity).toLocaleString()}</td>
-                      <td className="mono">{formatNaira(t.fillPrice)}</td>
-                      <td className="mono">{formatNaira(t.simulatedFee)}</td>
-                    </tr>
-                  ))}
+                  {data.trades.map((t) => {
+                    const cash = tradeCashImpact(t.side, t.quantity, t.fillPrice, t.simulatedFee);
+                    return (
+                      <tr key={t.id}>
+                        <td className="muted" style={{ fontSize: 12 }}>{t.executedAt}</td>
+                        <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
+                        <td className="mono">{Number(t.quantity).toLocaleString()}</td>
+                        <td className="mono">{formatNaira(t.fillPrice)}</td>
+                        <td className="mono">
+                          <div>{formatNaira(cash.amount)}</div>
+                          <div className="muted" style={{ fontSize: 11 }}>{cash.label}</div>
+                        </td>
+                        <td className="mono">{formatNaira(t.simulatedFee)}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             )}

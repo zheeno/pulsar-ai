@@ -11,6 +11,7 @@ import Dashboard from './pages/Dashboard';
 import Signals from './pages/Signals';
 import Trades from './pages/Trades';
 import Memory from './pages/Memory';
+import Coach from './pages/Coach';
 import Settings from './pages/Settings';
 import Onboarding from './pages/Onboarding';
 import SymbolDetail from './pages/SymbolDetail';
@@ -120,6 +121,7 @@ function AppRoutes() {
           <Route path="/trades" element={<Trades />} />
           <Route path="/symbol/:symbol" element={<SymbolDetail />} />
           <Route path="/memory" element={<Memory />} />
+          <Route path="/coach" element={<Coach />} />
           <Route path="/settings" element={<Settings />} />
         </Route>
       </Routes>

@@ -1,6 +1,11 @@
 import { useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { IconSpinner } from '../components/Icons';
+import {
+  draftFromLlmTemperature,
+  LlmTemperatureControl,
+  llmTemperatureFromDraft,
+} from '../components/LlmTemperatureControl';
 import pulsarLogoFull from '../assets/pulsar-logo-full.svg';
 import { api, type AppSettings } from '../lib/api';
 import { useToast } from '../lib/toast';
@@ -28,6 +33,8 @@ export default function OnboardingWizard({ onComplete }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [pulsePassword, setPulsePassword] = useState('');
   const [llmApiKey, setLlmApiKey] = useState('');
+  const [useProviderDefault, setUseProviderDefault] = useState(true);
+  const [llmTemperature, setLlmTemperature] = useState(0.7);
   const [busy, setBusy] = useState(false);
   const [pulseOk, setPulseOk] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -36,6 +43,9 @@ export default function OnboardingWizard({ onComplete }: Props) {
     api<AppSettings>('settings_get')
       .then((s) => {
         setSettings(s);
+        const tempDraft = draftFromLlmTemperature(s.llmTemperature ?? null);
+        setUseProviderDefault(tempDraft.useProviderDefault);
+        setLlmTemperature(tempDraft.temperature);
         if (s.onboardingComplete) {
           onComplete?.();
           navigate('/', { replace: true });
@@ -113,6 +123,7 @@ export default function OnboardingWizard({ onComplete }: Props) {
           pulseConfigured: false,
           llmConfigured: false,
           onboardingComplete: false,
+          llmTemperature: llmTemperatureFromDraft(useProviderDefault, llmTemperature),
         },
         llmApiKey: llmApiKey.trim(),
       });
@@ -227,6 +238,13 @@ export default function OnboardingWizard({ onComplete }: Props) {
               disabled={busy}
               value={settings.llmModel || ''}
               onChange={(e) => setSettings({ ...settings, llmModel: e.target.value })}
+            />
+            <LlmTemperatureControl
+              useProviderDefault={useProviderDefault}
+              temperature={llmTemperature}
+              disabled={busy}
+              onUseProviderDefaultChange={setUseProviderDefault}
+              onTemperatureChange={setLlmTemperature}
             />
             <label className="label" htmlFor={keyId}>API key</label>
             <input

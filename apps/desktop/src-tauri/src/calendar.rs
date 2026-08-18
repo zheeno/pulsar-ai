@@ -5,6 +5,10 @@ const NGX_HOLIDAYS: &[&str] = &[
     "2025-10-01", "2025-12-25", "2025-12-26",
     "2026-01-01", "2026-04-03", "2026-04-06", "2026-05-01", "2026-06-12",
     "2026-10-01", "2026-12-25", "2026-12-26",
+    "2027-01-01", "2027-03-26", "2027-03-29", "2027-05-01", "2027-06-12",
+    "2027-10-01", "2027-12-25", "2027-12-26",
+    "2028-01-01", "2028-04-14", "2028-04-17", "2028-05-01", "2028-06-12",
+    "2028-10-01", "2028-12-25", "2028-12-26",
 ];
 
 pub struct TradingCalendar {
@@ -67,3 +71,20 @@ impl TradingCalendar {
 
 use chrono::Datelike;
 use chrono::Timelike;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holidays_cover_2027_and_2028() {
+        let cal = TradingCalendar::default();
+        assert!(cal.holidays.contains("2027-01-01"));
+        assert!(cal.holidays.contains("2027-12-25"));
+        assert!(cal.holidays.contains("2028-10-01"));
+        let ny = chrono::DateTime::parse_from_rfc3339("2027-01-01T10:00:00+01:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!cal.is_trading_day(Some(ny)));
+    }
+}

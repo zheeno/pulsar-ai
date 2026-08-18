@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::http_client::http_client;
 use crate::secrets::{
-    delete_secret, get_secret, set_secret, SECRET_BAMBOO_NGN_WALLET_ID, SECRET_BAMBOO_PASSWORD,
+    delete_secret, get_secret, load_stored_session, set_secret, SessionRestoreKind,
+    SECRET_BAMBOO_NGN_WALLET_ID, SECRET_BAMBOO_PASSWORD, SECRET_BAMBOO_REFRESH_TOKEN,
     SECRET_BAMBOO_TOKEN, SECRET_BAMBOO_TOKEN_EXPIRES, SECRET_BAMBOO_TRANSACTION_PIN,
     SECRET_BAMBOO_USER_ID,
 };
@@ -65,21 +66,32 @@ pub struct BambooClient {
 
 impl BambooClient {
     pub fn from_settings(settings: &AppSettings) -> Self {
-        let token = get_secret(SECRET_BAMBOO_TOKEN).ok().flatten();
-        let expires = get_secret(SECRET_BAMBOO_TOKEN_EXPIRES)
-            .ok()
-            .flatten()
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&Utc));
-        let session = match (token, expires) {
-            (Some(access_token), Some(expires_at)) if !access_token.is_empty() => {
-                Some(SessionToken {
-                    access_token,
-                    expires_at,
+        let session = load_stored_session(SECRET_BAMBOO_TOKEN, SECRET_BAMBOO_TOKEN_EXPIRES).map(
+            |stored| SessionToken {
+                access_token: stored.access_token,
+                expires_at: stored.expires_at,
+            },
+        );
+        tracing::info!(
+            target: "bamboo",
+            hydrated = session.is_some(),
+            kind = ?session
+                .as_ref()
+                .map(|s| {
+                    if crate::secrets::token_unexpired(s.expires_at) {
+                        SessionRestoreKind::Valid
+                    } else {
+                        SessionRestoreKind::Expired
+                    }
                 })
-            }
-            _ => None,
-        };
+                .unwrap_or(SessionRestoreKind::Missing),
+            expires_at = session
+                .as_ref()
+                .map(|s| s.expires_at.to_rfc3339())
+                .unwrap_or_default(),
+            connected_flag = settings.bamboo_connected,
+            "bamboo session hydrate from vault"
+        );
         Self {
             http: http_client().expect("http client"),
             base_url: BAMBOO_BASE_URL.to_string(),
@@ -101,9 +113,25 @@ impl BambooClient {
                 .is_some_and(|t| !t.is_empty())
     }
 
+    pub(crate) fn session_restore_kind(&self) -> SessionRestoreKind {
+        if let Some(tok) = self.tokens.lock().unwrap().as_ref() {
+            if crate::secrets::token_unexpired(tok.expires_at) {
+                return SessionRestoreKind::Valid;
+            }
+            return SessionRestoreKind::Expired;
+        }
+        crate::secrets::stored_session_kind(SECRET_BAMBOO_TOKEN, SECRET_BAMBOO_TOKEN_EXPIRES)
+    }
+
+    /// Restore an expired/missing token using stored credentials when possible.
+    pub async fn ensure_session(&self) -> Result<()> {
+        self.access_token().await.map(|_| ())
+    }
+
     pub fn clear_local_secrets() {
         let _ = delete_secret(SECRET_BAMBOO_TOKEN);
         let _ = delete_secret(SECRET_BAMBOO_TOKEN_EXPIRES);
+        let _ = delete_secret(SECRET_BAMBOO_REFRESH_TOKEN);
         let _ = delete_secret(SECRET_BAMBOO_PASSWORD);
         let _ = delete_secret(SECRET_BAMBOO_USER_ID);
         let _ = delete_secret(SECRET_BAMBOO_NGN_WALLET_ID);
@@ -163,20 +191,34 @@ impl BambooClient {
                 .unwrap_or_else(|| format!("Bamboo login failed ({status})"));
             return Err(anyhow!(msg));
         }
-        let token = extract_login_token(&text).ok_or_else(|| anyhow!("Bamboo login missing token"))?;
-        self.persist_token(&token, phone, Some(password))?;
+        let auth = extract_login_auth(&text).ok_or_else(|| anyhow!("Bamboo login missing token"))?;
+        self.persist_token(
+            &auth.token,
+            phone,
+            Some(password),
+            auth.expires_at,
+            auth.refresh_token.as_deref(),
+        )?;
         Ok(())
     }
 
-    fn persist_token(&self, token: &str, phone: &str, password: Option<&str>) -> Result<()> {
+    fn persist_token(
+        &self,
+        token: &str,
+        phone: &str,
+        password: Option<&str>,
+        api_expires: Option<DateTime<Utc>>,
+        refresh_token: Option<&str>,
+    ) -> Result<()> {
         let claims = decode_jwt_payload(token).unwrap_or(Value::Null);
-        let exp = claims
-            .get("exp")
-            .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| Utc::now().timestamp() + 3600);
-        let expires_at = Utc
-            .timestamp_opt(exp, 0)
-            .single()
+        let expires_at = api_expires
+            .or_else(|| crate::secrets::jwt_expiry(token))
+            .or_else(|| {
+                claims
+                    .get("exp")
+                    .and_then(|v| v.as_i64())
+                    .and_then(|exp| Utc.timestamp_opt(exp, 0).single())
+            })
             .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
         if let Some(sub) = claims.get("sub").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             let _ = set_secret(SECRET_BAMBOO_USER_ID, sub);
@@ -185,6 +227,9 @@ impl BambooClient {
         }
         set_secret(SECRET_BAMBOO_TOKEN, token)?;
         set_secret(SECRET_BAMBOO_TOKEN_EXPIRES, &expires_at.to_rfc3339())?;
+        if let Some(refresh) = refresh_token.filter(|s| !s.is_empty()) {
+            let _ = set_secret(SECRET_BAMBOO_REFRESH_TOKEN, refresh);
+        }
         if let Some(pw) = password {
             set_secret(SECRET_BAMBOO_PASSWORD, pw)?;
         }
@@ -196,38 +241,49 @@ impl BambooClient {
             target: "bamboo",
             phone = %phone,
             expires_at = %expires_at.to_rfc3339(),
+            has_refresh = refresh_token.is_some_and(|s| !s.is_empty()),
             "bamboo auth persisted"
         );
         Ok(())
     }
 
-    async fn access_token(&self) -> Result<String> {
+    fn restore_valid_token(&self) -> Option<String> {
         {
             let guard = self.tokens.lock().unwrap();
             if let Some(tok) = guard.as_ref() {
-                if tok.expires_at > Utc::now() + chrono::Duration::seconds(30) {
-                    return Ok(tok.access_token.clone());
+                if crate::secrets::token_unexpired(tok.expires_at) {
+                    return Some(tok.access_token.clone());
                 }
             }
         }
-        if let Ok(Some(stored)) = get_secret(SECRET_BAMBOO_TOKEN) {
-            if !stored.is_empty() {
-                let expires = get_secret(SECRET_BAMBOO_TOKEN_EXPIRES)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|d| d.with_timezone(&Utc));
-                if let Some(exp) = expires {
-                    if exp > Utc::now() + chrono::Duration::seconds(30) {
-                        *self.tokens.lock().unwrap() = Some(SessionToken {
-                            access_token: stored.clone(),
-                            expires_at: exp,
-                        });
-                        return Ok(stored);
-                    }
-                }
+        if let Some(stored) = load_stored_session(SECRET_BAMBOO_TOKEN, SECRET_BAMBOO_TOKEN_EXPIRES) {
+            let valid = crate::secrets::token_unexpired(stored.expires_at);
+            *self.tokens.lock().unwrap() = Some(SessionToken {
+                access_token: stored.access_token.clone(),
+                expires_at: stored.expires_at,
+            });
+            if valid {
+                tracing::info!(
+                    target: "bamboo",
+                    expires_at = %stored.expires_at.to_rfc3339(),
+                    "bamboo access token restored from vault"
+                );
+                return Some(stored.access_token);
             }
+            tracing::info!(
+                target: "bamboo",
+                expires_at = %stored.expires_at.to_rfc3339(),
+                "bamboo stored token expired; will relogin"
+            );
         }
+        None
+    }
+
+    async fn access_token(&self) -> Result<String> {
+        if let Some(token) = self.restore_valid_token() {
+            return Ok(token);
+        }
+        tracing::info!(target: "bamboo", "bamboo silent password relogin");
         self.relogin().await?;
         self.tokens
             .lock()
@@ -320,6 +376,7 @@ impl BambooClient {
         let base = WealthProfileStatus {
             ok: false,
             connected: settings.bamboo_connected && self.has_session(),
+            has_session: self.has_session(),
             email: settings.bamboo_phone.clone(),
             trading_profile: None,
             trading_verified: false,
@@ -331,8 +388,15 @@ impl BambooClient {
             message: "Bamboo account not connected.".into(),
             display_name: None,
         };
-        if !settings.bamboo_connected || !self.has_session() {
+        if !settings.bamboo_connected {
             return base;
+        }
+        if let Err(e) = self.ensure_session().await {
+            return WealthProfileStatus {
+                connected: false,
+                message: format!("Bamboo session expired — reconnect in Settings. {e}"),
+                ..base
+            };
         }
 
         let profile = match self
@@ -403,6 +467,7 @@ impl BambooClient {
                 base_url: self.base_url.clone(),
                 message: "Bamboo account is restricted. Live orders are blocked.".into(),
                 display_name,
+                has_session: true,
             };
         }
 
@@ -431,11 +496,12 @@ impl BambooClient {
                 "Bamboo connected. NGX trading requires CSCS ready_for_trading.".into()
             },
             display_name,
+            has_session: true,
         }
     }
 
     pub async fn resolve_trading_mode(&self, settings: &AppSettings) -> TradingMode {
-        if !settings.bamboo_connected || !self.has_session() {
+        if !settings.bamboo_connected || self.ensure_session().await.is_err() {
             return TradingMode::Sandbox;
         }
         let status = self.profile_status(settings).await;
@@ -507,28 +573,50 @@ impl BambooClient {
     pub async fn resolve_quote(&self, symbol: &str) -> Result<f64> {
         let target = symbol.to_uppercase();
         let q = urlencoding_encode(&target);
-        let _ = self
+        let search = self
             .request_json(
                 reqwest::Method::GET,
                 &format!("/api/lsx/ng/stocks?query={q}"),
                 None,
                 &[],
             )
-            .await;
-        let raw = self
+            .await
+            .ok();
+        let search_px = search
+            .as_ref()
+            .and_then(|v| extract_stock_quote(v, &target));
+
+        let detail = match self
             .request_json(
                 reqwest::Method::GET,
                 &format!("/api/lsx/ng/stocks/{target}"),
                 None,
                 &[],
             )
-            .await?;
-        let root = raw.get("data").unwrap_or(&raw);
-        json_f64_field(root, "market_price")
-            .or_else(|| json_f64_field(root, "price"))
-            .or_else(|| json_f64_field(root, "close_price"))
-            .filter(|p| *p > 0.0)
-            .ok_or_else(|| anyhow!("Bamboo quote missing for {symbol}"))
+            .await
+        {
+            Ok(raw) => extract_stock_quote(&raw, &target),
+            Err(e) => {
+                tracing::warn!(
+                    target: "bamboo",
+                    symbol = %target,
+                    error = %e,
+                    "bamboo stock detail failed; using search quote if any"
+                );
+                None
+            }
+        };
+
+        if let Some(px) = detail.or(search_px) {
+            tracing::info!(
+                target: "bamboo",
+                symbol = %target,
+                price = px,
+                "bamboo quote resolved"
+            );
+            return Ok(px);
+        }
+        Err(anyhow!("Bamboo quote missing for {symbol}"))
     }
 
     pub async fn calculate_fee(
@@ -543,6 +631,7 @@ impl BambooClient {
         } else {
             "BUY"
         };
+        let qty = ngx_whole_shares(quantity)?;
         let raw = self
             .request_json(
                 reqwest::Method::POST,
@@ -551,37 +640,56 @@ impl BambooClient {
                     "type": "MARKET",
                     "symbol": symbol.to_uppercase(),
                     "side": side,
-                    "quantity": quantity,
+                    "quantity": qty,
                     "price": price,
                     "currency": "NGN",
                 })),
                 &[("currency", "NGN")],
             )
             .await?;
-        Ok(parse_fee_quote(&raw, symbol, side, quantity, price))
+        Ok(parse_fee_quote(&raw, symbol, side, qty as f64, price))
     }
 
     pub async fn get_order(&self, order_id: &str) -> Result<crate::broker::BrokerOrder> {
         let encoded = urlencoding_encode(order_id);
-        let raw = self
-            .request_json(
-                reqwest::Method::GET,
-                &format!("/api/lsx/ng/order/{encoded}/status"),
-                None,
-                &[],
-            )
-            .await?;
-        Ok(parse_broker_order(&raw, order_id))
+        let status_path = format!("/api/lsx/ng/order/{encoded}/status");
+        match self
+            .request_json(reqwest::Method::GET, &status_path, None, &[])
+            .await
+        {
+            Ok(raw) => Ok(parse_broker_order(&raw, order_id)),
+            Err(e) if is_missing_resource(&e.to_string()) => {
+                match self
+                    .request_json(
+                        reqwest::Method::GET,
+                        &format!("/api/lsx/ng/order/{encoded}"),
+                        None,
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(raw) => Ok(parse_broker_order(&raw, order_id)),
+                    Err(_) => Ok(pending_broker_order(order_id, 0.0, None)),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn place_and_await_fill(
         &self,
         calc: &BambooFeeQuote,
     ) -> Result<crate::broker::BrokerOrder> {
-        if calc.available_quantity <= 0.0 {
+        if calc.side.eq_ignore_ascii_case("BUY") && calc.available_quantity <= 0.0 {
             anyhow::bail!("Bamboo available_quantity is 0");
         }
-        let cash = self.ngn_cash().await.unwrap_or(0.0);
+        if calc.side.eq_ignore_ascii_case("BUY") && calc.total_price + 1e-9 < 5_000.0 {
+            anyhow::bail!(
+                "Bamboo minimum order is ₦5000 (got ₦{:.2})",
+                calc.total_price
+            );
+        }
+        let cash = self.ngn_cash().await?;
         if calc.side.eq_ignore_ascii_case("BUY") && calc.total_price > cash {
             anyhow::bail!(
                 "Insufficient Bamboo cash (need ₦{:.2}, have ₦{:.2})",
@@ -590,11 +698,13 @@ impl BambooClient {
             );
         }
         let wallet_id = self.ensure_ngn_wallet_id().await?;
+        let pin = bamboo_transaction_pin()?;
+        let qty = ngx_whole_shares(calc.quantity)?;
         let mut body = serde_json::json!({
             "symbol": calc.symbol.to_uppercase(),
             "side": calc.side,
             "order_type": "MARKET",
-            "quantity": calc.quantity,
+            "quantity": qty,
             "price": calc.price,
             "price_per_share": calc.price_per_share,
             "fee": calc.fee,
@@ -602,6 +712,7 @@ impl BambooClient {
             "source_wallet_id": wallet_id,
             "currency": "NGN",
             "type": "MARKET",
+            "transaction_pin": pin,
         });
         if let Some(op) = calc.order_price {
             body["order_price"] = serde_json::json!(op);
@@ -610,13 +721,6 @@ impl BambooClient {
             body["order_value"] = Value::String(v.clone());
         } else {
             body["order_value"] = Value::String(format!("{:.2}", calc.total_price));
-        }
-        if let Some(pin) = get_secret(SECRET_BAMBOO_TRANSACTION_PIN)
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty())
-        {
-            body["transaction_pin"] = Value::String(pin);
         }
 
         let placed = self
@@ -627,23 +731,11 @@ impl BambooClient {
                 &[("currency", "NGN")],
             )
             .await?;
-        let order_id = placed
-            .get("order_id")
-            .or_else(|| placed.get("id"))
-            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_i64().map(|n| n.to_string())))
+        let order_id = extract_order_id(&placed)
             .ok_or_else(|| anyhow!("Bamboo place missing order_id"))?;
 
         let mut order = self.get_order(&order_id).await.unwrap_or_else(|_| {
-            crate::broker::BrokerOrder {
-                id: order_id.clone(),
-                numeric_id: None,
-                stock_id: None,
-                status: "pending".into(),
-                quantity: calc.quantity,
-                quote_price: Some(calc.price_per_share),
-                unit_price: Some(calc.price_per_share),
-                rejection_reason: None,
-            }
+            pending_broker_order(&order_id, qty as f64, Some(calc.price_per_share))
         });
         if order.status == "executed" || order.status == "rejected" {
             return Ok(order);
@@ -666,8 +758,23 @@ impl BambooSyncService {
         db: &crate::db::Database,
         client: &BambooClient,
     ) -> Result<CachedWealthBook> {
+        let previous = Self::load(db).ok().flatten();
         let snap = client.get_portfolio().await?;
-        let cash = client.ngn_cash().await.unwrap_or(0.0);
+        let cash = match client.ngn_cash().await {
+            Ok(c) => c,
+            Err(e) => match previous.as_ref().map(|b| b.brokerage_balance) {
+                Some(cached) if cached > 0.0 => {
+                    tracing::warn!(
+                        target: "bamboo",
+                        error = %e,
+                        cached,
+                        "Bamboo NGN cash fetch failed; keeping cached balance"
+                    );
+                    cached
+                }
+                _ => return Err(e),
+            },
+        };
         db.with_conn(|conn| persist_snapshot(conn, &snap, cash))?;
         db.with_conn(load_snapshot)?
             .ok_or_else(|| anyhow!("Bamboo cache empty after persist"))
@@ -740,7 +847,7 @@ fn persist_snapshot(
     }
 }
 
-fn load_snapshot(conn: &rusqlite::Connection) -> Result<Option<CachedWealthBook>> {
+pub(crate) fn load_snapshot(conn: &rusqlite::Connection) -> Result<Option<CachedWealthBook>> {
     let account: Option<(f64, f64, f64, String)> = conn
         .query_row(
             "SELECT brokerage_balance, stock_value, profit, synced_at FROM bamboo_account WHERE id = 1",
@@ -844,6 +951,12 @@ pub fn parse_ngn_cash(raw: &Value) -> Option<f64> {
     json_f64_field(row, "wallet_balance").or_else(|| json_f64_field(row, "balance"))
 }
 
+/// Prefer a live wallet read. A fetch failure must not be stored as ₦0 (that
+/// skips the LLM on the next cycle while the account still has cash).
+pub fn pick_ngn_cash(fetched: Option<f64>, previous: Option<f64>) -> Option<f64> {
+    fetched.or_else(|| previous.filter(|c| *c > 0.0))
+}
+
 pub fn map_order_status(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "successful" | "success" | "filled" | "executed" | "complete" | "completed" => "executed",
@@ -851,6 +964,14 @@ pub fn map_order_status(raw: &str) -> &'static str {
         "cancelled" | "canceled" => "cancelled",
         _ => "pending",
     }
+}
+
+fn bamboo_transaction_pin() -> Result<String> {
+    get_secret(SECRET_BAMBOO_TRANSACTION_PIN)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("Bamboo transaction PIN missing — add it in Settings"))
 }
 
 fn parse_fee_quote(
@@ -861,18 +982,27 @@ fn parse_fee_quote(
     price: f64,
 ) -> BambooFeeQuote {
     let root = raw.get("data").unwrap_or(raw);
-    let qty = json_f64_field(root, "quantity").unwrap_or(quantity);
+    let qty = json_f64_field(root, "quantity")
+        .unwrap_or(quantity)
+        .floor()
+        .max(0.0);
     let pps = json_f64_field(root, "price_per_share")
         .or_else(|| json_f64_field(root, "price"))
         .unwrap_or(price);
     let fee = json_f64_field(root, "fee").unwrap_or(0.0);
     let total = json_f64_field(root, "total_price").unwrap_or(qty * pps + fee);
+    let requested = qty.max(quantity).max(0.0);
+    // 0/missing available_quantity is not "no shares" — treating it as 0 made
+    // live BUYs walk qty down one share at a time (hundreds of calculate calls).
+    let available_quantity = json_f64_field(root, "available_quantity")
+        .filter(|q| *q >= 1.0)
+        .unwrap_or(requested);
     BambooFeeQuote {
         fee,
         quantity: qty,
         price_per_share: pps,
         total_price: total,
-        available_quantity: json_f64_field(root, "available_quantity").unwrap_or(0.0),
+        available_quantity,
         symbol: root
             .get("symbol")
             .and_then(|v| v.as_str())
@@ -929,6 +1059,47 @@ fn parse_ngn_wallet_id(raw: &Value) -> Option<i64> {
         .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
 }
 
+struct BambooLoginAuth {
+    token: String,
+    expires_at: Option<DateTime<Utc>>,
+    refresh_token: Option<String>,
+}
+
+fn json_expiry_value(v: &Value) -> Option<DateTime<Utc>> {
+    if let Some(s) = v.as_str() {
+        return crate::secrets::parse_expiry_datetime(s);
+    }
+    v.as_i64()
+        .or_else(|| v.as_f64().map(|f| f as i64))
+        .and_then(|n| crate::secrets::parse_expiry_datetime(&n.to_string()))
+}
+
+fn extract_login_auth(text: &str) -> Option<BambooLoginAuth> {
+    let token = extract_login_token(text)?;
+    let body = serde_json::from_str::<Value>(text).ok();
+    let expires_at = body.as_ref().and_then(|b| {
+        b.get("expiration_time")
+            .or_else(|| b.get("expirationTime"))
+            .or_else(|| b.get("expires_at"))
+            .or_else(|| b.get("expiresAt"))
+            .or_else(|| b.pointer("/data/expiration_time"))
+            .and_then(json_expiry_value)
+    });
+    let refresh_token = body.as_ref().and_then(|b| {
+        b.get("refresh_token")
+            .or_else(|| b.get("refreshToken"))
+            .or_else(|| b.pointer("/data/refresh_token"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    Some(BambooLoginAuth {
+        token,
+        expires_at,
+        refresh_token,
+    })
+}
+
 fn extract_login_token(text: &str) -> Option<String> {
     let trimmed = text.trim().trim_matches('"');
     if trimmed.starts_with("eyJ") && trimmed.contains('.') {
@@ -972,9 +1143,151 @@ fn is_auth_error_body(text: &str) -> bool {
 fn extract_error_message(body: &Value) -> Option<String> {
     body.get("message")
         .or_else(|| body.get("error"))
-        .and_then(|v| v.as_str())
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        }))
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            body.pointer("/errors/0")
+                .and_then(|v| v.as_str().map(str::to_string).or_else(|| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                }))
+        })
+}
+
+fn is_missing_resource(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("missing required resource") || m.contains("bamboo api error 404")
+}
+
+fn ngx_whole_shares(quantity: f64) -> Result<i64> {
+    if !quantity.is_finite() || quantity < 1.0 {
+        anyhow::bail!("Only whole share trading is possible");
+    }
+    let n = quantity.floor() as i64;
+    if n < 1 {
+        anyhow::bail!("Only whole share trading is possible");
+    }
+    Ok(n)
+}
+
+fn quote_price_of(obj: &Value) -> Option<f64> {
+    json_f64_field(obj, "market_price")
+        .or_else(|| json_f64_field(obj, "price"))
+        .or_else(|| json_f64_field(obj, "close_price"))
+        .or_else(|| json_f64_field(obj, "last_price"))
+        .or_else(|| json_f64_field(obj, "naira_price"))
+        .or_else(|| json_f64_field(obj, "prev_close_price"))
+        .or_else(|| json_f64_field(obj, "open_price"))
+        .filter(|p| *p > 0.0)
+}
+
+fn quote_symbol_of(obj: &Value) -> Option<String> {
+    ["symbol", "ticker", "code"]
+        .into_iter()
+        .find_map(|k| obj.get(k).and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+}
+
+fn find_matching_quote(v: &Value, want: &str, depth: usize) -> Option<f64> {
+    if depth == 0 {
+        return None;
+    }
+    match v {
+        Value::Object(_) => {
+            if quote_symbol_of(v)
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(want))
+            {
+                if let Some(px) = quote_price_of(v) {
+                    return Some(px);
+                }
+            }
+            if let Some(obj) = v.as_object() {
+                for child in obj.values() {
+                    if let Some(px) = find_matching_quote(child, want, depth - 1) {
+                        return Some(px);
+                    }
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                if let Some(px) = find_matching_quote(child, want, depth - 1) {
+                    return Some(px);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_stock_quote(raw: &Value, symbol: &str) -> Option<f64> {
+    let want = symbol.trim().to_uppercase();
+    if let Some(px) = find_matching_quote(raw, &want, 8) {
+        return Some(px);
+    }
+    let root = raw.get("data").or_else(|| raw.get("stock")).unwrap_or(raw);
+    if let Some(s) = quote_symbol_of(root) {
+        if !s.eq_ignore_ascii_case(&want) {
+            return None;
+        }
+    }
+    quote_price_of(root).or_else(|| root.get("stock").and_then(quote_price_of))
+}
+
+fn json_id_string(v: &Value) -> Option<String> {
+    v.as_str()
         .map(str::to_string)
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_order_id(placed: &Value) -> Option<String> {
+    const KEYS: &[&str] = &["order_id", "orderId", "id"];
+    for root in [placed, placed.get("data").unwrap_or(placed)] {
+        for key in KEYS {
+            if let Some(id) = root.get(*key).and_then(json_id_string) {
+                if id != "0" {
+                    return Some(id);
+                }
+            }
+        }
+        if let Some(id) = root
+            .pointer("/order/order_id")
+            .or_else(|| root.pointer("/order/id"))
+            .and_then(json_id_string)
+        {
+            if id != "0" {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn pending_broker_order(
+    order_id: &str,
+    quantity: f64,
+    price: Option<f64>,
+) -> crate::broker::BrokerOrder {
+    crate::broker::BrokerOrder {
+        id: order_id.to_string(),
+        numeric_id: None,
+        stock_id: None,
+        status: "pending".into(),
+        quantity,
+        quote_price: price,
+        unit_price: price,
+        rejection_reason: None,
+    }
 }
 
 fn json_f64_field(obj: &Value, key: &str) -> Option<f64> {
@@ -1052,6 +1365,14 @@ mod tests {
     }
 
     #[test]
+    fn pick_ngn_cash_keeps_cache_when_fetch_fails() {
+        assert_eq!(pick_ngn_cash(None, Some(16_750.0)), Some(16_750.0));
+        assert_eq!(pick_ngn_cash(Some(0.0), Some(16_750.0)), Some(0.0));
+        assert_eq!(pick_ngn_cash(None, Some(0.0)), None);
+        assert_eq!(pick_ngn_cash(Some(4_900.0), Some(16_750.0)), Some(4_900.0));
+    }
+
+    #[test]
     fn maps_order_status_strings() {
         assert_eq!(map_order_status("Successful"), "executed");
         assert_eq!(map_order_status("Filled"), "executed");
@@ -1059,6 +1380,109 @@ mod tests {
         assert_eq!(map_order_status("Pending"), "pending");
         assert_eq!(map_order_status("New"), "pending");
         assert_eq!(map_order_status("Cancelled"), "cancelled");
+    }
+
+    #[test]
+    fn quote_from_search_result_matches_symbol() {
+        let raw = serde_json::json!({
+            "result": [{
+                "symbol": "FLOURMILL",
+                "market_price": 42.5,
+                "price": 42.5
+            }]
+        });
+        assert_eq!(extract_stock_quote(&raw, "flourmill"), Some(42.5));
+    }
+
+    #[test]
+    fn quote_from_nested_data_stock() {
+        let raw = serde_json::json!({
+            "data": {
+                "stock": { "market_price": "88.10" }
+            }
+        });
+        assert_eq!(extract_stock_quote(&raw, "GTCO"), Some(88.10));
+    }
+
+    #[test]
+    fn quote_from_detail_close_price() {
+        let raw = serde_json::json!({
+            "data": {
+                "symbol": "DANGCEM",
+                "close_price": 330.5
+            }
+        });
+        assert_eq!(extract_stock_quote(&raw, "DANGCEM"), Some(330.5));
+    }
+
+    #[test]
+    fn quote_ignores_unrelated_search_hits() {
+        let raw = serde_json::json!({
+            "result": [
+                { "symbol": "GTCO", "market_price": 50.0 },
+                { "symbol": "ZENITHBANK", "market_price": 40.0 }
+            ]
+        });
+        assert_eq!(extract_stock_quote(&raw, "FLOURMILL"), None);
+    }
+
+    #[test]
+    fn ngx_quantity_is_whole_shares_json_integer() {
+        assert_eq!(ngx_whole_shares(10.9).unwrap(), 10);
+        assert_eq!(ngx_whole_shares(1.0).unwrap(), 1);
+        assert!(ngx_whole_shares(0.4).is_err());
+        let body = serde_json::json!({ "quantity": ngx_whole_shares(12.0).unwrap() });
+        assert_eq!(body["quantity"].as_i64(), Some(12));
+        assert!(body["quantity"].as_i64().is_some());
+    }
+
+    #[test]
+    fn fee_quote_floors_fractional_quantity() {
+        let raw = serde_json::json!({
+            "quantity": 3.7,
+            "price_per_share": 10.0,
+            "fee": 1.0,
+            "total_price": 38.0,
+            "available_quantity": 3.7,
+            "symbol": "GTCO",
+            "side": "BUY"
+        });
+        let q = parse_fee_quote(&raw, "GTCO", "BUY", 3.7, 10.0);
+        assert_eq!(q.quantity, 3.0);
+        assert_eq!(q.available_quantity, 3.7);
+    }
+
+    #[test]
+    fn fee_quote_zero_available_falls_back_to_requested() {
+        let raw = serde_json::json!({
+            "quantity": 252,
+            "price_per_share": 1.61,
+            "fee": 5.0,
+            "total_price": 411.0,
+            "available_quantity": 0,
+            "symbol": "DAARCOMM",
+            "side": "BUY"
+        });
+        let q = parse_fee_quote(&raw, "DAARCOMM", "BUY", 252.0, 1.61);
+        assert_eq!(q.quantity, 252.0);
+        assert_eq!(q.available_quantity, 252.0);
+    }
+
+    #[test]
+    fn order_id_from_nested_data() {
+        let placed = serde_json::json!({
+            "data": { "order_id": "BB.LAMB_abc" }
+        });
+        assert_eq!(extract_order_id(&placed).as_deref(), Some("BB.LAMB_abc"));
+        let top = serde_json::json!({ "order_id": "BB.LAMB_top" });
+        assert_eq!(extract_order_id(&top).as_deref(), Some("BB.LAMB_top"));
+    }
+
+    #[test]
+    fn missing_resource_is_detected() {
+        assert!(is_missing_resource("Missing required resource to complete request"));
+        assert!(is_missing_resource("Bamboo API error 404"));
+        assert!(!is_missing_resource("Only whole share trading is possible"));
     }
 
     #[test]
@@ -1074,5 +1498,111 @@ mod tests {
         let snap = parse_my_stocks(&raw);
         assert_eq!(snap.holdings[0].buy_price, Some(40.0));
         assert_eq!(snap.holdings[0].current_value, 92.0);
+    }
+
+    fn future_rfc3339() -> String {
+        (Utc::now() + chrono::Duration::hours(2)).to_rfc3339()
+    }
+
+    fn past_rfc3339() -> String {
+        (Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+    }
+
+    #[test]
+    fn login_json_keeps_expiration_time_over_jwt_exp() {
+        let jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjEwMH0.sig";
+        let body = serde_json::json!({
+            "jwt": jwt,
+            "refresh_token": "r1",
+            "expiration_time": "2026-08-17T21:00:00Z"
+        })
+        .to_string();
+        let auth = extract_login_auth(&body).unwrap();
+        assert_eq!(auth.token, jwt);
+        assert_eq!(auth.refresh_token.as_deref(), Some("r1"));
+        assert_eq!(auth.expires_at.unwrap().timestamp(), 1_787_000_400);
+    }
+
+    #[test]
+    fn hydrate_from_vault_after_restart() {
+        let _g = crate::secrets::vault_test_guard();
+        let dir = std::env::temp_dir().join(format!("pulsar-bamboo-hydrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::secrets::init(&dir);
+        crate::secrets::set_secret(SECRET_BAMBOO_TOKEN, "live-jwt").unwrap();
+        crate::secrets::set_secret(SECRET_BAMBOO_TOKEN_EXPIRES, &future_rfc3339()).unwrap();
+        crate::secrets::simulate_restart();
+        crate::secrets::preload();
+
+        let mut settings = AppSettings::default();
+        settings.bamboo_connected = true;
+        let client = BambooClient::from_settings(&settings);
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Valid);
+        assert_eq!(client.restore_valid_token().as_deref(), Some("live-jwt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_token_hydrates_and_needs_relogin() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[
+            (SECRET_BAMBOO_TOKEN, "old-jwt"),
+            (SECRET_BAMBOO_TOKEN_EXPIRES, &past_rfc3339()),
+        ]);
+        let mut settings = AppSettings::default();
+        settings.bamboo_connected = true;
+        let client = BambooClient::from_settings(&settings);
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Expired);
+        assert!(client.restore_valid_token().is_none());
+    }
+
+    #[test]
+    fn missing_vault_does_not_fake_session() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[]);
+        let mut settings = AppSettings::default();
+        settings.bamboo_connected = true;
+        let client = BambooClient::from_settings(&settings);
+        assert!(!client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Missing);
+        assert!(client.restore_valid_token().is_none());
+    }
+
+    #[test]
+    fn unix_expiry_and_clock_skew() {
+        let _g = crate::secrets::vault_test_guard();
+        let exp = Utc::now() + chrono::Duration::hours(1);
+        crate::secrets::seed_vault(&[
+            (SECRET_BAMBOO_TOKEN, "unix-jwt"),
+            (SECRET_BAMBOO_TOKEN_EXPIRES, &exp.timestamp().to_string()),
+        ]);
+        let client = BambooClient::from_settings(&AppSettings::default());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Valid);
+        assert_eq!(client.restore_valid_token().as_deref(), Some("unix-jwt"));
+
+        crate::secrets::seed_vault(&[
+            (SECRET_BAMBOO_TOKEN, "skew-jwt"),
+            (
+                SECRET_BAMBOO_TOKEN_EXPIRES,
+                &(Utc::now() + chrono::Duration::seconds(10)).to_rfc3339(),
+            ),
+        ]);
+        let client = BambooClient::from_settings(&AppSettings::default());
+        assert!(client.has_session());
+        assert_eq!(client.session_restore_kind(), SessionRestoreKind::Expired);
+        assert!(client.restore_valid_token().is_none());
+    }
+
+    #[test]
+    fn has_session_matches_restore_for_live_token() {
+        let _g = crate::secrets::vault_test_guard();
+        crate::secrets::seed_vault(&[
+            (SECRET_BAMBOO_TOKEN, "live"),
+            (SECRET_BAMBOO_TOKEN_EXPIRES, &future_rfc3339()),
+        ]);
+        let client = BambooClient::from_settings(&AppSettings::default());
+        assert_eq!(client.has_session(), client.restore_valid_token().is_some());
     }
 }

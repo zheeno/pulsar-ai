@@ -53,8 +53,34 @@ impl Database {
             .context("run bamboo cache migration")?;
         conn.execute_batch(include_str!("../../migrations/008_agent_memories.sql"))
             .context("run agent_memories migration")?;
+        Self::add_column_if_missing(
+            conn,
+            "strategy_param_sets",
+            "cycle_budget_pct",
+            "REAL NOT NULL DEFAULT 0.20",
+        )?;
         Self::add_column_if_missing(conn, "broker_orders", "external_order_ref", "TEXT")?;
         Self::add_column_if_missing(conn, "order_intents", "external_order_ref", "TEXT")?;
+        conn.execute_batch(include_str!("../../migrations/010_autonomy_p0.sql"))
+            .context("run signal_outcomes migration")?;
+        Self::add_column_if_missing(
+            conn,
+            "strategy_param_sets",
+            "time_stop_hours",
+            "REAL NOT NULL DEFAULT 24.0",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "strategy_param_sets",
+            "partial_tp_fraction",
+            "REAL NOT NULL DEFAULT 1.0",
+        )?;
+        Self::add_column_if_missing(conn, "cycle_audits", "detail", "TEXT")?;
+        Self::add_column_if_missing(conn, "cycle_audits", "blocked_histogram", "TEXT")?;
+        Self::add_column_if_missing(conn, "cycle_audits", "cash", "REAL")?;
+        Self::add_column_if_missing(conn, "cycle_audits", "executed_ids", "TEXT")?;
+        conn.execute_batch(include_str!("../../migrations/011_coach_sessions.sql"))
+            .context("run coach sessions migration")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
         Ok(())

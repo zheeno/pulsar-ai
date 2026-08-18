@@ -9,6 +9,7 @@ import {
   IconSettings,
   IconSignals,
   IconSpinner,
+  IconStrategy,
   IconTrades,
 } from './Icons';
 import pulsarLogo from '../assets/pulsar-logo.svg';
@@ -19,6 +20,7 @@ const links = [
   { href: '/signals', label: 'Signals', Icon: IconSignals },
   { href: '/trades', label: 'Trades', Icon: IconTrades },
   { href: '/memory', label: 'Memory', Icon: IconMemory },
+  { href: '/coach', label: 'Coach', Icon: IconStrategy },
   { href: '/settings', label: 'Settings', Icon: IconSettings },
 ];
 

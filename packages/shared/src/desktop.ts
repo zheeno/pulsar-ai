@@ -8,6 +8,7 @@ export const LlmConfigSchema = z.object({
   model: z.string().min(1),
   apiKey: z.string().min(1),
   baseUrl: z.string().url().nullish(),
+  temperature: z.number().min(0).max(2).nullable().optional(),
 });
 export type LlmConfig = z.infer<typeof LlmConfigSchema>;
 
@@ -32,7 +33,6 @@ export const AppSettingsSchema = z.object({
   autoCycleEnabled: z.boolean().default(false),
   autoCycleIntervalMinutes: z.number().int().min(5).max(120).default(30),
   liveTradingEnabled: z.boolean().default(false),
-  scheduledLiveAuthorized: z.boolean().default(false),
   maxLiveNotional: z.number().min(1000).max(50_000_000).default(500_000),
   maxLiveActions: z.number().int().min(1).max(40).default(10),
   retainRawLlmLogs: z.boolean().default(false),
@@ -41,7 +41,7 @@ export type AppSettings = z.infer<typeof AppSettingsSchema>;
 
 export const AgentToolCallSchema = z.object({
   type: z.literal('tool'),
-  name: z.enum(['memory_search', 'memory_upsert']),
+  name: z.string().min(1),
   arguments: z.record(z.unknown()),
 });
 export type AgentToolCall = z.infer<typeof AgentToolCallSchema>;
@@ -70,6 +70,12 @@ export const AgentRequestSchema = z.discriminatedUnion('op', [
   z.object({
     id: z.string(),
     op: z.literal('test_llm'),
+    llm: LlmConfigSchema,
+  }),
+  z.object({
+    id: z.string(),
+    op: z.literal('strategy_coach'),
+    context: z.record(z.unknown()),
     llm: LlmConfigSchema,
   }),
 ]);

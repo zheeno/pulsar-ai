@@ -5,7 +5,10 @@ function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-/** Map frontend camelCase args to Tauri command parameter names. */
+/**
+ * Tauri 2 IPC deserializes command args as camelCase (`session_id` → `sessionId`).
+ * Wrap payload-style commands; pass other keys in camelCase.
+ */
 function tauriArgs(command: string, args?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!args) return undefined;
 
@@ -19,8 +22,7 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
 
   if (command === 'cycle_run') {
     return {
-      confirmation_token: args.confirmationToken,
-      allow_bulk_liquidation: args.allowBulkLiquidation,
+      allowBulkLiquidation: args.allowBulkLiquidation,
     };
   }
 
@@ -30,6 +32,31 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
 
   if (command === 'memory_search') {
     return { query: args.query, symbol: args.symbol, k: args.k };
+  }
+
+  if (command === 'strategy_coach_propose') {
+    return { message: args.message, history: args.history };
+  }
+
+  if (command === 'coach_turn') {
+    return { sessionId: args.sessionId, message: args.message };
+  }
+
+  if (command === 'coach_get_session' || command === 'coach_delete_session') {
+    return { id: args.id };
+  }
+
+  if (command === 'coach_execute_trade' || command === 'coach_cancel_trade') {
+    return { proposalId: args.proposalId };
+  }
+
+  if (command === 'strategy_coach_apply') {
+    return {
+      selected: args.selected,
+      rationale: args.rationale,
+      summary: args.summary,
+      chatExcerpt: args.chatExcerpt,
+    };
   }
 
   return args;
@@ -50,6 +77,7 @@ export interface AppSettings {
   llmProvider: string;
   llmModel: string;
   llmBaseUrl?: string;
+  llmTemperature?: number | null;
   pulseConfigured: boolean;
   llmConfigured: boolean;
   onboardingComplete: boolean;
@@ -64,10 +92,12 @@ export interface AppSettings {
   bambooPhone?: string | null;
   bambooConnected?: boolean;
   liveTradingEnabled?: boolean;
-  scheduledLiveAuthorized?: boolean;
   maxLiveNotional?: number;
   maxLiveActions?: number;
   retainRawLlmLogs?: boolean;
+  haltNewBuys?: boolean;
+  flattenOnDrawdownArmed?: boolean;
+  launchAtLogin?: boolean;
 }
 
 export interface PortfolioData {

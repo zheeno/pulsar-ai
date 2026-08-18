@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { IconTrades } from '../components/Icons';
 import { api } from '../lib/api';
-import { formatNaira } from '../lib/format';
+import { formatNaira, tradeCashImpact } from '../lib/format';
 import { useToast } from '../lib/toast';
 
 interface Trade {
@@ -70,6 +70,7 @@ export default function TradesPage() {
                 <th>Side</th>
                 <th>Qty</th>
                 <th>Fill price</th>
+                <th>Spent / Proceeds</th>
                 <th>Fee</th>
                 <th>Venue</th>
                 <th>Cash after</th>
@@ -77,31 +78,38 @@ export default function TradesPage() {
               </tr>
             </thead>
             <tbody>
-              {trades.map((t) => (
-                <tr key={t.id}>
-                  <td className="mono">
-                    <Link className="symbol-link" to={`/symbol/${encodeURIComponent(t.symbol)}`}>
-                      {t.symbol}
-                    </Link>
-                  </td>
-                  <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
-                  <td className="mono">{Number(t.quantity).toLocaleString()}</td>
-                  <td className="mono">{formatNaira(Number(t.fill_price))}</td>
-                  <td className="mono">{formatNaira(Number(t.simulated_fee))}</td>
-                  <td>
-                    <span className={`status-pill ${t.venue === 'wealth' ? 'status-pill--ok' : 'status-pill--muted'}`}>
-                      {t.venue === 'wealth' ? 'Live' : 'Sandbox'}
-                      {t.status && t.status !== 'executed' ? ` · ${t.status}` : ''}
-                    </span>
-                  </td>
-                  <td className="mono">
-                    {t.resulting_cash_balance != null
-                      ? formatNaira(Number(t.resulting_cash_balance))
-                      : '—'}
-                  </td>
-                  <td className="muted" style={{ fontSize: 12 }}>{t.executed_at}</td>
-                </tr>
-              ))}
+              {trades.map((t) => {
+                const cash = tradeCashImpact(t.side, t.quantity, t.fill_price, t.simulated_fee);
+                return (
+                  <tr key={t.id}>
+                    <td className="mono">
+                      <Link className="symbol-link" to={`/symbol/${encodeURIComponent(t.symbol)}`}>
+                        {t.symbol}
+                      </Link>
+                    </td>
+                    <td className={t.side === 'BUY' ? 'text-ok' : 'text-bad'}>{t.side}</td>
+                    <td className="mono">{Number(t.quantity).toLocaleString()}</td>
+                    <td className="mono">{formatNaira(Number(t.fill_price))}</td>
+                    <td className="mono">
+                      <div>{formatNaira(cash.amount)}</div>
+                      <div className="muted" style={{ fontSize: 11 }}>{cash.label}</div>
+                    </td>
+                    <td className="mono">{formatNaira(Number(t.simulated_fee))}</td>
+                    <td>
+                      <span className={`status-pill ${t.venue === 'wealth' ? 'status-pill--ok' : 'status-pill--muted'}`}>
+                        {t.venue === 'wealth' ? 'Live' : 'Sandbox'}
+                        {t.status && t.status !== 'executed' ? ` · ${t.status}` : ''}
+                      </span>
+                    </td>
+                    <td className="mono">
+                      {t.resulting_cash_balance != null
+                        ? formatNaira(Number(t.resulting_cash_balance))
+                        : '—'}
+                    </td>
+                    <td className="muted" style={{ fontSize: 12 }}>{t.executed_at}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

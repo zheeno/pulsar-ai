@@ -65,6 +65,14 @@ impl IndicatorService {
             current_price,
         }))
     }
+
+    /// True when RSI14 is known and > 70. Missing history is not overbought (fail-open).
+    pub fn is_overbought(conn: &Connection, symbol: &str) -> Result<bool> {
+        Ok(Self::compute(conn, symbol)?
+            .and_then(|t| t.rsi14)
+            .map(|r| r > 70.0)
+            .unwrap_or(false))
+    }
 }
 
 fn sma(values: &[f64], period: usize) -> Option<f64> {
@@ -102,4 +110,27 @@ fn rsi(values: &[f64], period: usize) -> Option<f64> {
     }
     let rs = gains / losses;
     Some(100.0 - (100.0 / (1.0 + rs)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsi_overbought_threshold() {
+        let up: Vec<f64> = (0..20).map(|i| 50.0 + i as f64 * 5.0).collect();
+        assert!(rsi_export(&up, 14).unwrap() > 70.0);
+        let down: Vec<f64> = (0..20).map(|i| 150.0 - i as f64 * 5.0).collect();
+        assert!(rsi_export(&down, 14).unwrap() < 30.0);
+    }
+
+    #[test]
+    fn missing_history_is_not_overbought() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE price_history (symbol TEXT, trade_date TEXT, price REAL, volume INTEGER);",
+        )
+        .unwrap();
+        assert!(!IndicatorService::is_overbought(&conn, "GTCO").unwrap());
+    }
 }

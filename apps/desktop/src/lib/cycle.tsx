@@ -79,6 +79,31 @@ export function CycleProvider({ children }: { children: ReactNode }) {
           if (!cancelled) onComplete(event.payload || {});
         });
         unlisteners.push(u2);
+
+        const u3 = await listen<{
+          symbols?: string[];
+          label?: string;
+          executed?: number;
+          exits?: number;
+          executedLive?: boolean;
+          tradingMode?: string;
+        }>('risk-exit', (event) => {
+          if (cancelled) return;
+          const p = event.payload || {};
+          const symbols = (p.symbols ?? []).filter(Boolean);
+          const label = p.label || 'Risk exit';
+          const names = symbols.length ? symbols.join(', ') : 'position';
+          const executed = p.executed ?? 0;
+          if (executed > 0) {
+            toast.success(`${label} sold ${names}`, 'Risk exit');
+          } else if ((p.exits ?? 0) > 0) {
+            toast.info(
+              `${label} detected for ${names} (signal saved; live fill needs authorization).`,
+              'Risk exit',
+            );
+          }
+        });
+        unlisteners.push(u3);
       } catch {
         /* event API unavailable */
       }

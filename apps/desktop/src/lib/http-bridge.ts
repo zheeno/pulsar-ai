@@ -6,6 +6,7 @@
 const SETTINGS_KEY = 'pulsar.browser.settings';
 const SECRETS_KEY = 'pulsar.browser.secrets';
 const STORE_KEY = 'pulsar.browser.store';
+const COACH_KEY = 'pulsar.browser.coach';
 
 try {
   localStorage.removeItem(SECRETS_KEY);
@@ -48,7 +49,8 @@ function defaultSettings(): Settings {
   return {
     pulseBaseUrl: 'https://ngxpulse.ng/api',
     llmProvider: 'openai',
-    llmModel: 'gpt-4o-mini',
+    llmModel: 'gpt-5.6-luna',
+    llmTemperature: null,
     pulseConfigured: false,
     llmConfigured: false,
     onboardingComplete: false,
@@ -63,10 +65,12 @@ function defaultSettings(): Settings {
     bambooPhone: undefined,
     bambooConnected: false,
     liveTradingEnabled: false,
-    scheduledLiveAuthorized: false,
     maxLiveNotional: 500_000,
     maxLiveActions: 10,
     retainRawLlmLogs: false,
+    haltNewBuys: false,
+    flattenOnDrawdownArmed: false,
+    launchAtLogin: false,
   };
 }
 
@@ -115,6 +119,9 @@ function defaultStore(): MockStore {
       min_confidence_to_trade: 0.65,
       max_daily_drawdown_pct: 0.03,
       position_size_pct: 0.05,
+      cycle_budget_pct: 0.2,
+      time_stop_hours: 24,
+      partial_tp_fraction: 1,
       is_active: true,
     },
     memories: [],
@@ -153,6 +160,216 @@ function mockBrokerMeta() {
   };
 }
 
+const COACH_BOUNDS: Record<string, [number, number]> = {
+  max_position_pct: [0.01, 0.5],
+  cycle_budget_pct: [0.05, 1],
+  min_confidence_to_trade: [0.4, 0.95],
+  max_daily_drawdown_pct: [0.01, 1],
+  stop_loss_pct: [0.01, 0.25],
+  take_profit_pct: [0.02, 0.4],
+};
+
+const COACH_LABELS: Record<string, string> = {
+  max_position_pct: 'Max position',
+  cycle_budget_pct: 'Cycle cash budget',
+  min_confidence_to_trade: 'Min confidence',
+  max_daily_drawdown_pct: 'Max daily drawdown',
+  stop_loss_pct: 'Stop loss',
+  take_profit_pct: 'Take profit',
+};
+
+const COACH_DEFAULTS: Record<string, number> = {
+  max_position_pct: 0.1,
+  cycle_budget_pct: 0.2,
+  min_confidence_to_trade: 0.65,
+  max_daily_drawdown_pct: 0.03,
+  stop_loss_pct: 0.05,
+  take_profit_pct: 0.1,
+};
+
+function clampCoach(field: string, value: number): number {
+  const [min, max] = COACH_BOUNDS[field] || [0, 1];
+  return Math.min(max, Math.max(min, value));
+}
+
+function currentCoachParams(store: MockStore): Record<string, number> {
+  return {
+    max_position_pct: Number(store.strategy.max_position_pct ?? 0.1),
+    cycle_budget_pct: Number(store.strategy.cycle_budget_pct ?? 0.2),
+    min_confidence_to_trade: Number(store.strategy.min_confidence_to_trade ?? 0.65),
+    max_daily_drawdown_pct: Number(store.strategy.max_daily_drawdown_pct ?? 0.03),
+    stop_loss_pct: Number(store.strategy.stop_loss_pct ?? 0.05),
+    take_profit_pct: Number(store.strategy.take_profit_pct ?? 0.1),
+  };
+}
+
+function coachDiff(
+  current: Record<string, number>,
+  patch: Record<string, number>,
+  rationale: Record<string, string>,
+) {
+  return Object.entries(patch)
+    .filter(([, v]) => Number.isFinite(v))
+    .filter(([field, v]) => Math.abs(v - (current[field] ?? v)) >= 1e-9)
+    .map(([field, proposed]) => ({
+      field,
+      label: COACH_LABELS[field] || field,
+      current: current[field],
+      proposed,
+      currentPct: Math.round((current[field] ?? 0) * 100),
+      proposedPct: Math.round(proposed * 100),
+      rationale: rationale[field] || '',
+    }));
+}
+
+function mockCoachWarnings(cash: number, patch: Record<string, number>): string[] {
+  const warnings: string[] = [];
+  const keys = Object.keys(patch);
+  if (!keys.length) return warnings;
+  const buyRelated = ['max_position_pct', 'cycle_budget_pct', 'min_confidence_to_trade'].some(
+    (k) => patch[k] != null,
+  );
+  if (buyRelated && cash + 1e-9 < 5000) {
+    warnings.push('Cash is below ₦5000; Bamboo cannot place a BUY.');
+  }
+  if (Math.abs((patch.cycle_budget_pct ?? 0) - 1) < 1e-9 && patch.cycle_budget_pct != null) {
+    warnings.push('Cycle budget 100% means no extra cash cap beyond spendable cash.');
+  }
+  if (Math.abs((patch.max_daily_drawdown_pct ?? 0) - 1) < 1e-9 && patch.max_daily_drawdown_pct != null) {
+    warnings.push('Drawdown 100% means session-loss halt is off.');
+  }
+  return warnings;
+}
+
+function pct(ratio: number) {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+function mockStrategyCoachPropose(message: string, store: MockStore) {
+  const current = currentCoachParams(store);
+  const cash = Number(store.portfolio.cash_balance ?? 0);
+  const text = message.toLowerCase();
+  const tighten = /fear|loss|losses|scared|tight|conservative|risk off/.test(text);
+  const deploy = /idle|deploy|turnover|more trades|aggressive|put cash/.test(text);
+  const lock = /lock|take profit|\btp\b|gains|profit target/.test(text);
+  const reset = /reset|default|balanced|start over/.test(text);
+  const wantsChange = /change|adjust|update|set |make |tighten|loosen|raise|lower|increase|decrease/.test(text);
+  const decide = /you decide|your call|you should decide|appropriate response|you choose|you pick|don't have a strategy|dont have a strategy/.test(text);
+  const conversational =
+    /^(hi|hello|hey|yo)\b/.test(text.trim()) ||
+    /what do you think|how is|review|current strategy|look at my|assess|why|explain/.test(text);
+
+  if (conversational && !decide && !tighten && !deploy && !lock && !reset) {
+    return {
+      needMoreContext: false,
+      clarifyingQuestions: [],
+      summary: `Your sliders are max position ${pct(current.max_position_pct)}, cycle cash ${pct(current.cycle_budget_pct)}, min confidence ${pct(current.min_confidence_to_trade)}, stop ${pct(current.stop_loss_pct)}, take-profit ${pct(current.take_profit_pct)}. Cash on this book is ₦${Math.round(cash).toLocaleString('en-NG')}. Nothing has been saved — say if you want to tighten risk, deploy cash, or lock gains.`,
+      patch: {},
+      rationale: {},
+      warnings: [],
+      current,
+      diff: [],
+    };
+  }
+
+  if (decide || /stop loss|take profit|tolerate a \d/.test(text)) {
+    const patch: Record<string, number> = {};
+    const rationale: Record<string, string> = {};
+    const ddMatch = text.match(/(\d+(?:\.\d+)?)\s*%/);
+    if (ddMatch && /drop|drawdown|tolerate/.test(text)) {
+      patch.max_daily_drawdown_pct = clampCoach('max_daily_drawdown_pct', Number(ddMatch[1]) / 100);
+      rationale.max_daily_drawdown_pct = 'Matches the drop you said you can tolerate.';
+    }
+    const sl = clampCoach('stop_loss_pct', Math.min(0.12, (patch.max_daily_drawdown_pct ?? current.max_daily_drawdown_pct) * 0.65));
+    const tp = clampCoach('take_profit_pct', 0.18);
+    if (Math.abs(sl - current.stop_loss_pct) >= 1e-9) {
+      patch.stop_loss_pct = sl;
+      rationale.stop_loss_pct = 'Stop inside your drawdown band so one name cannot exhaust the daily cap.';
+    }
+    if (Math.abs(tp - current.take_profit_pct) >= 1e-9) {
+      patch.take_profit_pct = tp;
+      rationale.take_profit_pct = 'Position take-profit — not a 20% daily account target, which is not a slider.';
+    }
+    return {
+      needMoreContext: false,
+      clarifyingQuestions: [],
+      summary: 'I decided from what you already said. Confirm the diff to save — nothing has been applied yet.',
+      patch,
+      rationale,
+      warnings: mockCoachWarnings(cash, patch),
+      current,
+      diff: coachDiff(current, patch, rationale),
+    };
+  }
+
+  if (!tighten && !deploy && !lock && !reset) {
+    return {
+      needMoreContext: wantsChange,
+      clarifyingQuestions: wantsChange
+        ? [
+            'Do you want to take less risk, put idle cash to work, or lock gains sooner?',
+            'Is this for the current account size, or are you resetting to balanced defaults?',
+          ]
+        : [],
+      summary: wantsChange
+        ? 'I need a clearer goal before proposing slider changes. Nothing has been saved.'
+        : `Happy to talk through the book. Cash is ₦${Math.round(cash).toLocaleString('en-NG')}; cycle budget is ${pct(current.cycle_budget_pct)}. Ask a question or name a change.`,
+      patch: {},
+      rationale: {},
+      warnings: [],
+      current,
+      diff: [],
+    };
+  }
+
+  const patch: Record<string, number> = {};
+  const rationale: Record<string, string> = {};
+  let summary = '';
+
+  if (reset) {
+    for (const [field, value] of Object.entries(COACH_DEFAULTS)) {
+      const next = clampCoach(field, value);
+      if (Math.abs(next - current[field]) >= 1e-9) {
+        patch[field] = next;
+        rationale[field] = 'Balanced default used by Settings for a typical ₦ account.';
+      }
+    }
+    summary = `Reset toward balanced defaults using the current cash of ₦${Math.round(cash).toLocaleString('en-NG')}. Confirm to save; Settings sliders will update.`;
+  } else if (tighten) {
+    patch.max_position_pct = clampCoach('max_position_pct', current.max_position_pct * 0.8);
+    patch.cycle_budget_pct = clampCoach('cycle_budget_pct', current.cycle_budget_pct * 0.75);
+    patch.min_confidence_to_trade = clampCoach('min_confidence_to_trade', current.min_confidence_to_trade + 0.05);
+    rationale.max_position_pct = 'Smaller single-name weight after losses.';
+    rationale.cycle_budget_pct = 'Spend less cash per cycle until confidence recovers.';
+    rationale.min_confidence_to_trade = 'Block weaker signals while risk is elevated.';
+    summary = 'Tighten risk from the current sliders. Confirm to save — nothing is live until you apply.';
+  } else if (deploy) {
+    patch.cycle_budget_pct = clampCoach('cycle_budget_pct', Math.min(1, current.cycle_budget_pct + 0.15));
+    rationale.cycle_budget_pct = 'Raise the per-cycle share of current spendable cash. Fills already reduced the wallet.';
+    summary = `Deploy more of the current ₦${Math.round(cash).toLocaleString('en-NG')} cash each cycle. Confirm to save.`;
+  } else if (lock) {
+    patch.take_profit_pct = clampCoach('take_profit_pct', current.take_profit_pct * 0.7);
+    rationale.take_profit_pct = 'Lower the take-profit so open winners are realized sooner.';
+    summary = 'Lower take-profit from the current slider to lock gains sooner. Confirm to save.';
+  }
+
+  for (const field of Object.keys(patch)) {
+    patch[field] = clampCoach(field, patch[field]);
+    if (Math.abs(patch[field] - current[field]) < 1e-9) delete patch[field];
+  }
+
+  return {
+    needMoreContext: false,
+    clarifyingQuestions: [],
+    summary,
+    patch,
+    rationale,
+    warnings: mockCoachWarnings(cash, patch),
+    current,
+    diff: coachDiff(current, patch, rationale),
+  };
+}
+
 function loadSecrets(): Record<string, string> {
   return {};
 }
@@ -176,6 +393,26 @@ function loadStore(): MockStore {
 
 function saveStore(store: MockStore) {
   localStorage.setItem(STORE_KEY, JSON.stringify(store));
+}
+
+type CoachStore = {
+  sessions: { id: string; title: string; createdAt: string; updatedAt: string }[];
+  transcripts: Record<string, Record<string, unknown>[]>;
+  proposals: Record<string, Record<string, unknown>>;
+};
+
+function loadCoachStore(): CoachStore {
+  try {
+    const raw = localStorage.getItem(COACH_KEY);
+    if (raw) return JSON.parse(raw) as CoachStore;
+  } catch {
+    /* ignore */
+  }
+  return { sessions: [], transcripts: {}, proposals: {} };
+}
+
+function saveCoachStore(store: CoachStore) {
+  localStorage.setItem(COACH_KEY, JSON.stringify(store));
 }
 
 export async function httpInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -262,8 +499,9 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       }
       return {
         provider: s.llmProvider || 'openai',
-        model: s.llmModel || 'gpt-4o-mini',
+        model: s.llmModel || 'gpt-5.6-luna',
         baseUrl: s.llmBaseUrl ?? null,
+        temperature: s.llmTemperature ?? null,
         configured,
         maskedKey,
       } as T;
@@ -464,12 +702,13 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       const payload = (args || {}) as {
         strategy?: {
           maxPositionPct?: number;
-          maxDailyTrades?: number;
           stopLossPct?: number;
           takeProfitPct?: number | null;
           minConfidenceToTrade?: number;
           maxDailyDrawdownPct?: number;
-          positionSizePct?: number;
+          cycleBudgetPct?: number;
+          timeStopHours?: number;
+          partialTpFraction?: number;
         };
       };
       const s = payload.strategy || {};
@@ -477,17 +716,241 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       store.strategy = {
         ...store.strategy,
         max_position_pct: s.maxPositionPct ?? store.strategy.max_position_pct,
-        max_daily_trades: s.maxDailyTrades ?? store.strategy.max_daily_trades,
         stop_loss_pct: s.stopLossPct ?? store.strategy.stop_loss_pct,
         take_profit_pct: s.takeProfitPct ?? store.strategy.take_profit_pct ?? 0.1,
         min_confidence_to_trade: s.minConfidenceToTrade ?? store.strategy.min_confidence_to_trade,
         max_daily_drawdown_pct: s.maxDailyDrawdownPct ?? store.strategy.max_daily_drawdown_pct,
-        position_size_pct: s.positionSizePct ?? store.strategy.position_size_pct,
+        cycle_budget_pct: s.cycleBudgetPct ?? store.strategy.cycle_budget_pct ?? 0.2,
+        time_stop_hours: s.timeStopHours ?? store.strategy.time_stop_hours ?? 24,
+        partial_tp_fraction: s.partialTpFraction ?? store.strategy.partial_tp_fraction ?? 1,
       };
       delete store.strategy.allowed_symbols;
       saveStore(store);
       return store.strategy as T;
     }
+
+    case 'coach_list_sessions': {
+      return loadCoachStore().sessions as T;
+    }
+
+    case 'coach_new_session': {
+      const store = loadCoachStore();
+      const session = {
+        id: `c-${Date.now()}`,
+        title: 'New chat',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messages: [] as Record<string, unknown>[],
+      };
+      store.sessions.unshift({ id: session.id, title: session.title, createdAt: session.createdAt, updatedAt: session.updatedAt });
+      store.transcripts[session.id] = session.messages;
+      saveCoachStore(store);
+      return { ...session } as T;
+    }
+
+    case 'coach_get_session': {
+      const store = loadCoachStore();
+      const id = String(args?.id || store.sessions[0]?.id || '');
+      if (!id) {
+        const created = await httpInvoke('coach_new_session');
+        return created as T;
+      }
+      const meta = store.sessions.find((s) => s.id === id) || store.sessions[0];
+      return {
+        ...meta,
+        messages: store.transcripts[meta.id] || [],
+      } as T;
+    }
+
+    case 'coach_delete_session': {
+      const store = loadCoachStore();
+      const id = String(args?.id || '');
+      store.sessions = store.sessions.filter((s) => s.id !== id);
+      delete store.transcripts[id];
+      saveCoachStore(store);
+      return undefined as T;
+    }
+
+    case 'coach_turn': {
+      const message = String(args?.message || '').trim();
+      if (!message) throw new Error('Message is required');
+      let store = loadCoachStore();
+      let sessionId = String(args?.sessionId || store.sessions[0]?.id || '');
+      if (!sessionId) {
+        const created = (await httpInvoke<{ id: string }>('coach_new_session')) as { id: string };
+        sessionId = created.id;
+        store = loadCoachStore();
+      }
+      const msgs = store.transcripts[sessionId] || [];
+      msgs.push({ id: `u-${Date.now()}`, role: 'user', text: message, createdAt: new Date().toISOString() });
+      const lower = message.toLowerCase();
+      let summary = 'Browser mock Coach — use the Tauri app for live tools.';
+      let toolTrace: { name: string; ok: boolean; summary: string }[] = [];
+      let trade: Record<string, unknown> | null = null;
+      let extra: Record<string, unknown> = {};
+      const isMeta =
+        /tell me about yourself|tell me about you|who are you|what can you do|how do you work|what are you|introduce yourself/.test(
+          lower,
+        );
+      const isGreeting =
+        /^(hi|hey|hello|yo|thanks|thank you|cheers|ty|bye|goodbye|later|see ya|see you)\b/.test(lower) &&
+        lower.length <= 40;
+      const isAdvisory =
+        /\badvisable\b|\bshould i\b|\bthoughts on\b|\bworth buying\b/.test(lower);
+      if (isMeta) {
+        toolTrace = [];
+        summary =
+          "I'm Coach, Pulsar's NGX desk copilot. I can check the tape, a name's history, news when it's wired, help you tighten risk sliders, and propose trades. I won't silently place live orders, and I won't invent prices or headlines. What do you want to look at?";
+      } else if (isGreeting) {
+        toolTrace = [];
+        summary = lower.includes('thank')
+          ? 'Anytime. Ping me if you want the tape, a name, or a trade idea.'
+          : 'Hey. Tape, a ticker, news, risk sliders, or a trade idea — your call.';
+      } else if (isAdvisory || lower.includes('news')) {
+        const news = lower.includes('news');
+        toolTrace = news
+          ? [{ name: 'get_news', ok: false, summary: 'unavailable' }]
+          : [{ name: 'get_symbol_quote', ok: true, summary: 'GTCO @ 46.2' }];
+        summary = news
+          ? 'NGX news is not wired in this mock. No headlines were invented.'
+          : 'GTCO last ₦46.20 as-of mock tape. Advice only — not an order.';
+      } else if (lower.includes('moving') || lower.includes('quote')) {
+        toolTrace = [{ name: 'list_universe_quotes', ok: true, summary: '2 quotes' }];
+        summary = 'GTCO ₦46.20 (+1.2% as-of mock). MTNN ₦225.00. Figures are mock store data.';
+      } else if (lower.includes('history') || lower.includes('doing')) {
+        toolTrace = [{ name: 'get_price_history', ok: true, summary: 'GTCO' }];
+        summary = 'GTCO recent closes come from the mock book, not a live Pulse call.';
+      } else if (/\bbuy\b|\bsell\b/.test(lower)) {
+        toolTrace = [{ name: 'propose_trade', ok: true, summary: 'proposal (not placed)' }];
+        trade = {
+          id: `p-${Date.now()}`,
+          symbol: 'GTCO',
+          side: lower.includes('sell') ? 'SELL' : 'BUY',
+          quantity: 100,
+          preview: { price: 46.2, estimatedCost: 4620, warnings: ['Browser mock — not sent to a broker'] },
+          status: 'proposed',
+        };
+        store.proposals[String(trade.id)] = trade;
+        summary = 'Proposed a GTCO order card. Confirm in the UI to submit — this chat did not place it.';
+      } else {
+        extra = mockStrategyCoachPropose(message, loadStore()) as Record<string, unknown>;
+        summary = String(extra.summary || summary);
+        toolTrace = [{ name: 'get_strategy_params', ok: true, summary: 'ok' }];
+      }
+      const payload = { toolTrace, trade, warnings: extra.warnings || [], diff: extra.diff || [], ...extra };
+      msgs.push({
+        id: `a-${Date.now()}`,
+        role: 'assistant',
+        text: summary,
+        payload,
+        createdAt: new Date().toISOString(),
+      });
+      store.transcripts[sessionId] = msgs;
+      const meta = store.sessions.find((s) => s.id === sessionId);
+      if (meta && msgs.filter((m) => m.role === 'user').length === 1) {
+        meta.title = message.slice(0, 72);
+        meta.updatedAt = new Date().toISOString();
+      }
+      saveCoachStore(store);
+      return { summary, toolTrace, trade, sessionId, ...extra, warnings: extra.warnings || [], diff: extra.diff || [] } as T;
+    }
+
+    case 'coach_execute_trade': {
+      const store = loadCoachStore();
+      const id = String(args?.proposalId || '');
+      const p = store.proposals[id];
+      if (!p) throw new Error('Unknown trade proposal');
+      if (p.status !== 'proposed') throw new Error('Proposal is not awaiting confirm');
+      p.status = 'blocked';
+      p.result = { ok: false, riskPolicyResult: 'BLOCKED_BROKER', error: 'Browser mock cannot place orders' };
+      const sid = store.sessions[0]?.id;
+      if (sid && store.transcripts[sid]) {
+        store.transcripts[sid].push({
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          text: 'Trade confirmed but not filled: BLOCKED_BROKER.',
+          payload: { tradeResult: p.result, proposalId: id },
+          createdAt: new Date().toISOString(),
+        });
+      }
+      saveCoachStore(store);
+      return p.result as T;
+    }
+
+    case 'coach_cancel_trade': {
+      const store = loadCoachStore();
+      const id = String(args?.proposalId || '');
+      const p = store.proposals[id];
+      if (!p) throw new Error('Unknown trade proposal');
+      if (p.status !== 'proposed') throw new Error('Proposal is not awaiting confirm');
+      p.status = 'cancelled';
+      saveCoachStore(store);
+      return undefined as T;
+    }
+
+    case 'strategy_coach_propose': {
+      const message = String(args?.message || '').trim();
+      if (!message) throw new Error('Message is required');
+      return mockStrategyCoachPropose(message, loadStore()) as T;
+    }
+
+    case 'strategy_coach_apply': {
+      const selected = (args?.selected || {}) as Record<string, number>;
+      const keys = Object.keys(selected);
+      if (!keys.length) throw new Error('Select at least one parameter to apply');
+      const store = loadStore();
+      const current = currentCoachParams(store);
+      const next = { ...current };
+      for (const [field, raw] of Object.entries(selected)) {
+        if (!COACH_BOUNDS[field]) throw new Error(`Unknown strategy fields: ${field}`);
+        next[field] = clampCoach(field, Number(raw));
+      }
+      if (!(next.cycle_budget_pct >= 0.05 && next.cycle_budget_pct <= 1)) {
+        throw new Error('cycleBudgetPct must be between 0.05 and 1.0');
+      }
+      store.strategy = {
+        ...store.strategy,
+        max_position_pct: next.max_position_pct,
+        cycle_budget_pct: next.cycle_budget_pct,
+        min_confidence_to_trade: next.min_confidence_to_trade,
+        max_daily_drawdown_pct: next.max_daily_drawdown_pct,
+        stop_loss_pct: next.stop_loss_pct,
+        take_profit_pct: next.take_profit_pct,
+      };
+      const rationale = (args?.rationale || {}) as Record<string, string>;
+      const lines = ['Strategy coach applied:'];
+      for (const field of keys) {
+        lines.push(
+          `- ${field}: ${current[field]?.toFixed(4)} → ${next[field]?.toFixed(4)}${
+            rationale[field] ? ` (${rationale[field]})` : ''
+          }`,
+        );
+      }
+      const excerpt = String(args?.chatExcerpt || args?.chat_excerpt || '');
+      if (excerpt) lines.push(`Chat: ${excerpt.slice(0, 400)}`);
+      store.memories = [
+        ...(store.memories || []),
+        {
+          id: `mem-${Date.now()}`,
+          kind: 'freeform',
+          text: lines.join('\n'),
+          source: 'agent_upsert',
+          createdAt: new Date().toISOString(),
+        },
+      ];
+      saveStore(store);
+      return {
+        ok: true,
+        strategy: store.strategy,
+        message: 'Strategy parameters were saved. Settings sliders now show the new values.',
+      } as T;
+    }
+
+    case 'confidence_journal':
+      return [] as T;
+
+    case 'list_cycle_audits':
+      return [] as T;
 
     case 'memory_list': {
       return [...(loadStore().memories || [])].reverse() as T;

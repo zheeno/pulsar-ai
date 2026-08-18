@@ -4,25 +4,31 @@ mod bamboo;
 mod broker;
 mod cache;
 mod calendar;
+mod coach;
+mod coach_intent;
 mod commands;
-mod cycle_auth;
 mod db;
 mod execution;
 mod http_client;
 mod indicators;
 mod ingest;
 mod intents;
+mod launch_at_login;
 mod memory;
 mod net_policy;
 mod ngx;
+mod outcomes;
 mod portfolio;
 mod rate_limit;
+mod risk_exits;
+mod risk_monitor;
 mod runtime_util;
 mod scheduler;
 mod secrets;
 mod seed;
 mod settings;
 mod signals;
+mod strategy_coach;
 mod wealth;
 
 use std::path::PathBuf;
@@ -158,7 +164,11 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ngx_pulse=debug,wealth=debug")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "info,ngx_pulse=debug,wealth=debug,bamboo=debug,secrets=debug",
+                    )
+                }),
         )
         .init();
     load_dotenv();
@@ -191,6 +201,7 @@ pub fn run() {
 
             let app_data = app.path().app_data_dir().expect("app data dir");
             crate::secrets::init(&app_data);
+            tracing::info!(target: "secrets", "preloading secrets vault");
             crate::secrets::preload();
 
             let worker_path =
@@ -198,19 +209,26 @@ pub fn run() {
             tracing::info!(worker = %worker_path.display(), exists = worker_path.is_file(), "agent worker path");
             let db = Database::open(&app_data).expect("open database");
             let settings = db.with_conn(get_settings).unwrap_or_default();
+            crate::secrets::log_broker_restore_probe(
+                settings.wealth_connected,
+                settings.bamboo_connected,
+            );
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
                 .expect("seed database");
 
             let state = AppState::new(db, worker_path);
             app.manage(state.clone());
 
-            scheduler::start_scheduler(app.handle().clone(), state);
+            scheduler::start_scheduler(app.handle().clone(), state.clone());
+            risk_monitor::start_risk_monitor(app.handle().clone(), state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
             commands::settings_get,
             commands::settings_set,
+            commands::confidence_journal,
+            commands::list_cycle_audits,
             commands::logout,
             commands::test_pulse_login,
             commands::test_llm,
@@ -235,6 +253,15 @@ pub fn run() {
             commands::symbol_detail_pulse,
             commands::get_strategy,
             commands::update_strategy,
+            strategy_coach::strategy_coach_propose,
+            strategy_coach::strategy_coach_apply,
+            strategy_coach::coach_list_sessions,
+            strategy_coach::coach_get_session,
+            strategy_coach::coach_new_session,
+            strategy_coach::coach_delete_session,
+            strategy_coach::coach_turn,
+            strategy_coach::coach_execute_trade,
+            strategy_coach::coach_cancel_trade,
             commands::export_database,
             commands::app_data_dir,
             commands::reset_local_data,
