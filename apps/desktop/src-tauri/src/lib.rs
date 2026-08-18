@@ -24,6 +24,7 @@ mod secrets;
 mod seed;
 mod settings;
 mod signals;
+mod strategy_coach;
 mod wealth;
 
 use std::path::PathBuf;
@@ -246,6 +247,8 @@ pub fn run() {
             commands::symbol_detail_pulse,
             commands::get_strategy,
             commands::update_strategy,
+            strategy_coach::strategy_coach_propose,
+            strategy_coach::strategy_coach_apply,
             commands::export_database,
             commands::app_data_dir,
             commands::reset_local_data,

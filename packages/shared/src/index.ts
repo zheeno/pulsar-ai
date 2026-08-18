@@ -66,6 +66,26 @@ export const StrategyParamSetSchema = z.object({
 });
 export type StrategyParamSet = z.infer<typeof StrategyParamSetSchema>;
 
+export const StrategyCoachPatchSchema = z.object({
+  max_position_pct: z.number().min(0).max(1).optional(),
+  cycle_budget_pct: z.number().min(0).max(1).optional(),
+  min_confidence_to_trade: z.number().min(0).max(1).optional(),
+  max_daily_drawdown_pct: z.number().min(0).max(1).optional(),
+  stop_loss_pct: z.number().min(0).max(1).optional(),
+  take_profit_pct: z.number().min(0).max(1).optional(),
+});
+export type StrategyCoachPatch = z.infer<typeof StrategyCoachPatchSchema>;
+
+export const LlmStrategyCoachOutputSchema = z.object({
+  needMoreContext: z.boolean(),
+  clarifyingQuestions: z.array(z.string()).default([]),
+  summary: z.string(),
+  patch: StrategyCoachPatchSchema.default({}),
+  rationale: z.record(z.string()).default({}),
+  warnings: z.array(z.string()).default([]),
+});
+export type LlmStrategyCoachOutput = z.infer<typeof LlmStrategyCoachOutputSchema>;
+
 export const CURATED_SYMBOLS = [
   'DANGCEM', 'GTCO', 'ZENITHBANK', 'MTNN', 'BUACEMENT',
   'ACCESSCORP', 'UBA', 'FBNH', 'SEPLAT', 'NESTLE',
@@ -78,6 +98,7 @@ export const NGX_TIMEZONE = 'Africa/Lagos';
 
 export const PROMPT_VERSION = 'v1.0.0';
 export const PORTFOLIO_PROMPT_VERSION = 'v2.4.0';
+export const STRATEGY_COACH_PROMPT_VERSION = 'v1.2.0';
 
 export * from './types';
 export * from './desktop';

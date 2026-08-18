@@ -96,6 +96,18 @@ impl AgentBridge {
         self.symbol_signal_sync(settings, context)
     }
 
+    pub fn strategy_coach_sync(&self, settings: &AppSettings, context: Value) -> Result<Value> {
+        let llm = self.build_llm_config(settings)?;
+        self.call(
+            json!({ "op": "strategy_coach", "context": context, "llm": llm }),
+            None,
+        )
+    }
+
+    pub async fn strategy_coach(&self, settings: &AppSettings, context: Value) -> Result<Value> {
+        self.strategy_coach_sync(settings, context)
+    }
+
     fn build_llm_config(&self, settings: &AppSettings) -> Result<Value> {
         let api_key = get_secret(SECRET_LLM_API_KEY)?.unwrap_or_default();
         if api_key.is_empty() {

@@ -3,12 +3,14 @@ import { DynamicStructuredTool } from '@langchain/core/tools';
 import {
   LlmPortfolioSignalOutputSchema,
   LlmSignalOutputSchema,
+  LlmStrategyCoachOutputSchema,
   type LlmConfig,
 } from '@ngx/shared';
 import { z } from 'zod';
 import { createChatModel } from './model-factory';
 import { buildSignalPrompt } from './prompt/v1.0.0';
 import { buildPortfolioSignalPrompt } from './prompt/v2.4.0';
+import { buildStrategyCoachPrompt } from './prompt/strategy-coach';
 
 const MAX_TOOL_ROUNDS = 3;
 /** Prompt allows 1 search + 2 upserts; hard-cap total invocations across rounds. */
@@ -185,6 +187,14 @@ export async function generateSymbolSignal(
 ) {
   const prompt = buildSignalPrompt(context);
   return invokeWithRetry(llm, prompt, (parsed) => LlmSignalOutputSchema.parse(parsed));
+}
+
+export async function generateStrategyCoach(
+  context: Record<string, unknown>,
+  llm: LlmConfig,
+) {
+  const prompt = buildStrategyCoachPrompt(context);
+  return invokeWithRetry(llm, prompt, (parsed) => LlmStrategyCoachOutputSchema.parse(parsed));
 }
 
 export async function testLlmConnection(llm: LlmConfig): Promise<string> {

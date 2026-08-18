@@ -598,6 +598,101 @@ select.input {
   align-items: center;
 }
 
+.coach-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: min(70vh, 720px);
+  padding: 0;
+  overflow: hidden;
+}
+
+.coach-log {
+  flex: 1;
+  overflow: auto;
+  padding: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.coach-bubble {
+  max-width: 42rem;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-subtle);
+  background: var(--surface);
+}
+
+.coach-bubble--user {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  border-color: rgba(56, 189, 248, 0.22);
+}
+
+.coach-bubble--assistant {
+  align-self: flex-start;
+}
+
+.coach-bubble--error {
+  border-color: rgba(239, 68, 68, 0.38);
+}
+
+.coach-bubble__role {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.coach-bubble__text {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.coach-questions,
+.coach-warnings {
+  margin: 10px 0 0;
+  padding-left: 1.1rem;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+.coach-warnings {
+  color: var(--status-warn);
+}
+
+.coach-diff {
+  margin-top: var(--space-3);
+}
+
+.coach-pct {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.coach-pct__input {
+  width: 4.75rem;
+  min-height: 36px;
+  padding: 6px 8px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.coach-composer {
+  display: flex;
+  gap: 8px;
+  padding: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.coach-composer .input {
+  flex: 1;
+}
+
 /* ——— Tables ——— */
 
 .data-table {

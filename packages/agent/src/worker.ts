@@ -5,7 +5,12 @@ import {
   AgentToolResultSchema,
   type AgentResponse,
 } from '@ngx/shared';
-import { generatePortfolioSignals, generateSymbolSignal, testLlmConnection } from './llm';
+import {
+  generatePortfolioSignals,
+  generateStrategyCoach,
+  generateSymbolSignal,
+  testLlmConnection,
+} from './llm';
 
 function respond(response: AgentResponse): void {
   process.stdout.write(`${JSON.stringify(response)}\n`);
@@ -73,6 +78,11 @@ async function handleRequest(line: string): Promise<void> {
       }
       case 'symbol_signal': {
         const result = await generateSymbolSignal(req.context, req.llm);
+        respond({ id: req.id, ok: true, data: result });
+        break;
+      }
+      case 'strategy_coach': {
+        const result = await generateStrategyCoach(req.context, req.llm);
         respond({ id: req.id, ok: true, data: result });
         break;
       }

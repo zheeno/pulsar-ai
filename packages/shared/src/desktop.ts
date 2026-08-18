@@ -71,6 +71,12 @@ export const AgentRequestSchema = z.discriminatedUnion('op', [
     op: z.literal('test_llm'),
     llm: LlmConfigSchema,
   }),
+  z.object({
+    id: z.string(),
+    op: z.literal('strategy_coach'),
+    context: z.record(z.unknown()),
+    llm: LlmConfigSchema,
+  }),
 ]);
 export type AgentRequest = z.infer<typeof AgentRequestSchema>;
 

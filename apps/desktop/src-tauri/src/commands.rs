@@ -206,10 +206,7 @@ pub async fn complete_onboarding(state: State<'_, Arc<AppState>>) -> Result<crat
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
+pub(crate) fn load_portfolio_default_sync(state: &Arc<AppState>) -> Result<serde_json::Value, String> {
         let settings = state.db.with_conn(get_settings).map_err(|e| e.to_string())?;
         let id = state
             .db
@@ -258,7 +255,7 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
                 &book,
                 &status,
                 false,
-                wealth_pnl_today(&state, session.id().as_str(), book.profit),
+                wealth_pnl_today(state, session.id().as_str(), book.profit),
                 session.id(),
             )),
             Err(e) => {
@@ -270,7 +267,7 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
                         &book,
                         &status,
                         true,
-                        wealth_pnl_today(&state, session.id().as_str(), book.profit),
+                        wealth_pnl_today(state, session.id().as_str(), book.profit),
                         session.id(),
                     ))
                 } else if let Some(obj) = value.as_object_mut() {
@@ -286,9 +283,14 @@ pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_
                 }
             }
         }
-    })
-    .await
-    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn portfolio_default(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || load_portfolio_default_sync(&state))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1101,60 +1103,7 @@ pub fn list_trades(limit: Option<i64>, state: State<'_, Arc<AppState>>) -> Resul
     let limit = limit.unwrap_or(50);
     state
         .db
-        .with_conn(|conn| {
-            let mut out = Vec::new();
-
-            let mut stmt = conn.prepare(
-                "SELECT id, symbol, side, quantity, fill_price, simulated_fee, executed_at, resulting_cash_balance
-                 FROM sandbox_trades ORDER BY executed_at DESC LIMIT ?1",
-            )?;
-            for row in stmt.query_map([limit], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "symbol": row.get::<_, String>(1)?,
-                    "side": row.get::<_, String>(2)?,
-                    "quantity": row.get::<_, f64>(3)?,
-                    "fill_price": row.get::<_, f64>(4)?,
-                    "simulated_fee": row.get::<_, f64>(5)?,
-                    "executed_at": row.get::<_, String>(6)?,
-                    "resulting_cash_balance": row.get::<_, Option<f64>>(7)?,
-                    "venue": "sandbox",
-                    "status": "executed",
-                }))
-            })? {
-                out.push(row?);
-            }
-
-            let mut stmt = conn.prepare(
-                "SELECT id, symbol, side, quantity, fill_price, fee, created_at, status, rejection_reason
-                 FROM broker_orders ORDER BY created_at DESC LIMIT ?1",
-            )?;
-            for row in stmt.query_map([limit], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "symbol": row.get::<_, String>(1)?,
-                    "side": row.get::<_, String>(2)?,
-                    "quantity": row.get::<_, f64>(3)?,
-                    "fill_price": row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                    "simulated_fee": row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                    "executed_at": row.get::<_, String>(6)?,
-                    "resulting_cash_balance": null,
-                    "venue": "wealth",
-                    "status": row.get::<_, String>(7)?,
-                    "rejection_reason": row.get::<_, Option<String>>(8)?,
-                }))
-            })? {
-                out.push(row?);
-            }
-
-            out.sort_by(|a, b| {
-                let da = a.get("executed_at").and_then(|v| v.as_str()).unwrap_or("");
-                let db = b.get("executed_at").and_then(|v| v.as_str()).unwrap_or("");
-                db.cmp(da)
-            });
-            out.truncate(limit as usize);
-            Ok(out)
-        })
+        .with_conn(|conn| crate::strategy_coach::load_recent_trades(conn, limit))
         .map_err(|e| e.to_string())
 }
 
@@ -1445,96 +1394,16 @@ pub async fn symbol_detail_pulse(
 pub fn get_strategy(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     state
         .db
-        .with_conn(|conn| {
-            Ok(conn.query_row(
-                "SELECT id, name, max_position_pct, max_daily_trades, stop_loss_pct, take_profit_pct,
-                        min_confidence_to_trade, max_daily_drawdown_pct, position_size_pct,
-                        cycle_budget_pct, is_active
-                 FROM strategy_param_sets WHERE is_active = 1 LIMIT 1",
-                [],
-                |row| {
-                    Ok(serde_json::json!({
-                        "id": row.get::<_, String>(0)?,
-                        "name": row.get::<_, String>(1)?,
-                        "max_position_pct": row.get::<_, f64>(2)?,
-                        "max_daily_trades": row.get::<_, i64>(3)?,
-                        "stop_loss_pct": row.get::<_, f64>(4)?,
-                        "take_profit_pct": row.get::<_, Option<f64>>(5)?,
-                        "min_confidence_to_trade": row.get::<_, f64>(6)?,
-                        "max_daily_drawdown_pct": row.get::<_, f64>(7)?,
-                        "position_size_pct": row.get::<_, f64>(8)?,
-                        "cycle_budget_pct": row.get::<_, f64>(9)?,
-                        "is_active": row.get::<_, i64>(10)? == 1,
-                    }))
-                },
-            )?)
-        })
+        .with_conn(crate::strategy_coach::read_active_strategy_json)
         .map_err(|e| e.to_string())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StrategyUpdate {
-    pub max_position_pct: f64,
-    pub stop_loss_pct: f64,
-    pub take_profit_pct: Option<f64>,
-    pub min_confidence_to_trade: f64,
-    pub max_daily_drawdown_pct: f64,
-    pub cycle_budget_pct: f64,
-}
-
-fn validate_ratio(name: &str, value: f64) -> Result<(), String> {
-    if !(0.0..=1.0).contains(&value) {
-        return Err(format!("{name} must be between 0 and 1"));
-    }
-    Ok(())
 }
 
 #[tauri::command]
 pub fn update_strategy(
-    strategy: StrategyUpdate,
+    strategy: crate::strategy_coach::StrategyParams,
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    validate_ratio("maxPositionPct", strategy.max_position_pct)?;
-    validate_ratio("stopLossPct", strategy.stop_loss_pct)?;
-    validate_ratio("minConfidenceToTrade", strategy.min_confidence_to_trade)?;
-    validate_ratio("maxDailyDrawdownPct", strategy.max_daily_drawdown_pct)?;
-    if !(0.05..=1.0).contains(&strategy.cycle_budget_pct) {
-        return Err("cycleBudgetPct must be between 0.05 and 1.0".into());
-    }
-    if let Some(tp) = strategy.take_profit_pct {
-        validate_ratio("takeProfitPct", tp)?;
-    }
-
-    state
-        .db
-        .with_conn(|conn| {
-            let updated = conn.execute(
-                "UPDATE strategy_param_sets SET
-                    max_position_pct = ?1,
-                    stop_loss_pct = ?2,
-                    take_profit_pct = ?3,
-                    min_confidence_to_trade = ?4,
-                    max_daily_drawdown_pct = ?5,
-                    cycle_budget_pct = ?6,
-                    allowed_symbols = NULL
-                 WHERE is_active = 1",
-                rusqlite::params![
-                    strategy.max_position_pct,
-                    strategy.stop_loss_pct,
-                    strategy.take_profit_pct,
-                    strategy.min_confidence_to_trade,
-                    strategy.max_daily_drawdown_pct,
-                    strategy.cycle_budget_pct,
-                ],
-            )?;
-            if updated == 0 {
-                anyhow::bail!("No active strategy param set found");
-            }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())?;
-
+    crate::strategy_coach::apply_strategy_params(&state.db, &strategy)?;
     get_strategy(state)
 }
 

@@ -31,6 +31,19 @@ function tauriArgs(command: string, args?: Record<string, unknown>): Record<stri
     return { query: args.query, symbol: args.symbol, k: args.k };
   }
 
+  if (command === 'strategy_coach_propose') {
+    return { message: args.message, history: args.history };
+  }
+
+  if (command === 'strategy_coach_apply') {
+    return {
+      selected: args.selected,
+      rationale: args.rationale,
+      summary: args.summary,
+      chat_excerpt: args.chatExcerpt,
+    };
+  }
+
   return args;
 }
 
