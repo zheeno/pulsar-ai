@@ -2,6 +2,7 @@ mod agent;
 mod app_state;
 mod auth_bridge;
 mod bamboo;
+mod busha;
 mod broker;
 mod cache;
 mod calendar;

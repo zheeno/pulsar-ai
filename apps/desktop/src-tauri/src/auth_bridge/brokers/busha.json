@@ -34,5 +34,5 @@
     }
   },
   "timeoutMs": 300000,
-  "fallbackTtlSecs": 86400
+  "fallbackTtlSecs": 1800
 }

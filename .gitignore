@@ -13,3 +13,4 @@ apps/desktop/src-tauri/resources/
 apps/desktop/src-tauri/app-icon.png
 *.rdb
 dump.rdb
+busha-requests.txt

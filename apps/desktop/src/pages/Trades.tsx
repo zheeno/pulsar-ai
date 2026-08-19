@@ -19,6 +19,10 @@ interface Trade {
   rejection_reason?: string | null;
 }
 
+function isLiveVenue(venue?: string): boolean {
+  return venue === 'wealth' || venue === 'bamboo' || venue === 'busha';
+}
+
 export default function TradesPage() {
   const toast = useToast();
   const [trades, setTrades] = useState<Trade[]>([]);
@@ -34,7 +38,7 @@ export default function TradesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- load once on mount
   }, []);
 
-  const hasLive = trades.some((t) => t.venue === 'wealth');
+  const hasLive = trades.some((t) => isLiveVenue(t.venue));
 
   return (
     <div className="page">
@@ -43,8 +47,8 @@ export default function TradesPage() {
           <h1>Trades</h1>
           <p>
             {hasLive
-              ? 'Sandbox fills and Coronation Wealth live orders.'
-              : 'Simulated fills from the sandbox execution engine. Connect Wealth in Settings for live orders.'}
+              ? 'Sandbox fills and live broker orders (Wealth, Bamboo, or Busha).'
+              : 'Simulated fills from the sandbox execution engine. Connect a live venue in Settings for live orders.'}
           </p>
         </div>
       </header>
@@ -96,8 +100,8 @@ export default function TradesPage() {
                     </td>
                     <td className="mono">{formatNaira(Number(t.simulated_fee))}</td>
                     <td>
-                      <span className={`status-pill ${t.venue === 'wealth' ? 'status-pill--ok' : 'status-pill--muted'}`}>
-                        {t.venue === 'wealth' ? 'Live' : 'Sandbox'}
+                      <span className={`status-pill ${isLiveVenue(t.venue) ? 'status-pill--ok' : 'status-pill--muted'}`}>
+                        {isLiveVenue(t.venue) ? 'Live' : 'Sandbox'}
                         {t.status && t.status !== 'executed' ? ` · ${t.status}` : ''}
                       </span>
                     </td>

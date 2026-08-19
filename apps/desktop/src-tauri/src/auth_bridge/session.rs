@@ -68,6 +68,7 @@ pub fn persist_valid(
     header_name: &str,
     value: &str,
     account_hint: Option<String>,
+    profile_id: Option<String>,
 ) -> anyhow::Result<AuthSessionStatus> {
     let expires_at = expiry_for(config, value);
     let cred = StoredCredential {
@@ -76,6 +77,7 @@ pub fn persist_valid(
         token: value.to_string(),
         expires_at,
         account_hint,
+        profile_id,
     };
     store::put(&config.id, &cred)?;
     tracing::info!(
@@ -83,9 +85,14 @@ pub fn persist_valid(
         broker = %config.id,
         expires_at = %expires_at,
         hint_present = cred.account_hint.is_some(),
+        profile_present = cred.profile_id.is_some(),
         "session stored"
     );
     Ok(status_for(config))
+}
+
+pub fn get_profile_id(broker_id: &str) -> anyhow::Result<Option<String>> {
+    Ok(store::get(broker_id)?.and_then(|c| c.profile_id))
 }
 
 #[allow(dead_code)]

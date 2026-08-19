@@ -246,6 +246,10 @@ pub(crate) fn load_portfolio_default_sync(state: &Arc<AppState>) -> Result<serde
         if let Some(obj) = value.as_object_mut() {
             obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
             obj.insert(
+                "assetClass".into(),
+                serde_json::json!(crate::broker::asset_class().as_str()),
+            );
+            obj.insert(
                 "brokerId".into(),
                 serde_json::json!(crate::broker::BrokerId::parse(&settings.selected_broker).as_str()),
             );
@@ -430,6 +434,7 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
                 "quotedSymbols": Vec::<String>::new(),
                 "stale": collapsed,
                 "tradingMode": trading_mode,
+                "assetClass": crate::broker::asset_class().as_str(),
                 "brokerId": live_broker.as_str(),
                 "brokerName": live_broker.short_name(),
                 "portfolio": {
@@ -541,6 +546,7 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
             "quotedSymbols": quoted_symbols,
             "stale": stale,
             "tradingMode": trading_mode,
+            "assetClass": crate::broker::asset_class().as_str(),
             "portfolio": {
                 "id": id,
                 "cash_balance": cash,
@@ -607,6 +613,7 @@ fn live_portfolio_payload(
         "unrealized_pnl": unrealized_pnl,
         "quotesAsOf": book.synced_at,
         "tradingMode": "live",
+        "assetClass": broker_id.as_str().eq_ignore_ascii_case("busha").then_some("crypto").unwrap_or("stocks"),
         "brokerId": broker_id.as_str(),
         "brokerName": broker_id.short_name(),
         "tradingVerified": status.trading_verified,
@@ -801,6 +808,9 @@ pub fn set_selected_broker(
     state: State<'_, Arc<AppState>>,
 ) -> Result<AppSettings, String> {
     let id = crate::broker::BrokerId::parse(&payload.broker_id);
+    if id == crate::broker::BrokerId::Busha {
+        return state.db.with_conn(get_settings).map_err(|e| e.to_string());
+    }
     state
         .db
         .with_conn(|conn| crate::settings::set_selected_broker(conn, id.as_str()))
@@ -815,7 +825,7 @@ pub fn portfolio_performance(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let venue = venue.unwrap_or_else(|| "sandbox".into());
-    if venue == "wealth" || venue == "sandbox" || venue == "bamboo" {
+    if venue == "wealth" || venue == "sandbox" || venue == "bamboo" || venue == "busha" {
         return state
             .db
             .with_conn(|conn| crate::portfolio::EquityCurveService::get_curve(conn, &venue))
@@ -945,7 +955,9 @@ pub async fn cycle_run(
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
         let broker = crate::broker::open_live_broker(&settings);
         let calendar = TradingCalendar::default();
-        if !crate::runtime_util::market_activity_allowed(&calendar) {
+        if !crate::broker::busha_connected()
+            && !crate::runtime_util::market_activity_allowed(&calendar)
+        {
             let payload = serde_json::json!({
                 "ok": false,
                 "source": "manual",

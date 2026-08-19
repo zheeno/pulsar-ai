@@ -10,6 +10,7 @@ pub struct ProbeResult {
     pub ok: bool,
     pub status: u16,
     pub account_hint: Option<String>,
+    pub profile_id: Option<String>,
 }
 
 pub async fn probe(config: &BrokerAuthConfig, candidate: &Candidate) -> Result<ProbeResult> {
@@ -34,17 +35,21 @@ pub async fn probe(config: &BrokerAuthConfig, candidate: &Candidate) -> Result<P
         expected.contains(&status)
     };
 
-    let account_hint = if ok {
+    let (account_hint, profile_id) = if ok {
         let body = response.text().await.unwrap_or_default();
-        extract_hint(&body, config.probe.json_path_hint.as_deref())
+        (
+            extract_hint(&body, config.probe.json_path_hint.as_deref()),
+            extract_profile_id(&body),
+        )
     } else {
-        None
+        (None, None)
     };
 
     Ok(ProbeResult {
         ok,
         status,
         account_hint,
+        profile_id,
     })
 }
 
@@ -98,6 +103,43 @@ fn apply_probe_headers(
         );
     }
     Ok(())
+}
+
+fn extract_profile_id(body: &str) -> Option<String> {
+    let json: Value = serde_json::from_str(body).ok()?;
+    let paths = [
+        "profile_id",
+        "id",
+        "data.id",
+        "data.profile_id",
+        "data.0.id",
+        "data.0.profile_id",
+        "data.profile.id",
+        "user.id",
+    ];
+    for p in paths {
+        if let Some(v) = walk(&json, p) {
+            if let Some(s) = as_id(v) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn as_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => {
+            let s = s.trim();
+            if s.len() >= 8 && s.len() <= 80 {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        }
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 fn extract_hint(body: &str, path: Option<&str>) -> Option<String> {
@@ -211,6 +253,11 @@ mod tests {
         assert_eq!(walk(&v, "data.email").and_then(|x| x.as_str()), Some("a@b.c"));
         let arr: Value = serde_json::json!({"data": [{"email": "arr@b.c"}]});
         assert_eq!(extract_hint(&arr.to_string(), Some("data.0.email")).as_deref(), Some("arr@b.c"));
+        let pid = serde_json::json!({"data":[{"id":"e3009765-be3a-4284-b627-5626b93902d4"}]});
+        assert_eq!(
+            extract_profile_id(&pid.to_string()).as_deref(),
+            Some("e3009765-be3a-4284-b627-5626b93902d4")
+        );
     }
 
     /// Set BUSHA_LIVE_TEST=1 and BUSHA_LIVE_TOKEN (Bearer or raw JWT). Never prints the token.

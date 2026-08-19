@@ -54,6 +54,9 @@ pub struct AppSettings {
     /// Optional OS login-item (macOS). Gated behind the app-down warning in Settings.
     #[serde(default)]
     pub launch_at_login: bool,
+    /// Derived: `stocks` or `crypto`. Not persisted.
+    #[serde(default, skip_deserializing)]
+    pub asset_class: String,
 }
 
 impl Default for AppSettings {
@@ -87,6 +90,7 @@ impl Default for AppSettings {
             halt_new_buys: false,
             flatten_on_drawdown_armed: false,
             launch_at_login: false,
+            asset_class: "stocks".into(),
         }
     }
 }
@@ -151,6 +155,7 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
             _ => {}
         }
     }
+    settings.asset_class = crate::broker::asset_class().as_str().into();
     Ok(settings)
 }
 

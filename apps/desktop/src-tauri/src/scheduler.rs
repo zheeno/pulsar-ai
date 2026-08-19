@@ -90,7 +90,9 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
             }
 
             let calendar = TradingCalendar::default();
-            if !crate::runtime_util::market_activity_allowed(&calendar) {
+            if !crate::broker::busha_connected()
+                && !crate::runtime_util::market_activity_allowed(&calendar)
+            {
                 continue;
             }
 

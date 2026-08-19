@@ -64,6 +64,8 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
       ?? null,
     stale: Boolean((raw as { stale?: boolean }).stale),
     tradingMode: (raw as { tradingMode?: string }).tradingMode || 'sandbox',
+    assetClass: (raw as { assetClass?: string }).assetClass
+      || ((raw as { brokerId?: string }).brokerId === 'busha' ? 'crypto' : 'stocks'),
     brokerId: (raw as { brokerId?: string }).brokerId ?? null,
     brokerName: (raw as { brokerName?: string }).brokerName ?? null,
     tradingVerified: raw.tradingVerified ?? raw.wealthStatus?.tradingVerified,
@@ -366,13 +368,17 @@ export default function DashboardPage() {
         level: 'ok' as const,
         title: 'Systems healthy',
         sub: live
-          ? (data.tradingVerified
+          ? (data.assetClass === 'crypto'
+            ? 'Busha is connected. Home shows NGN cash and crypto holdings; cycles place live Busha transfers when live trading is on.'
+            : (data.tradingVerified
             ? `NGX Pulse is active. Home shows your ${broker} brokerage cash and holdings; cycles can place live market orders.`
             : (data.wealthStatus?.message
-              || `${broker} connected — Home shows brokerage cash and holdings. Complete trading verification to enable live orders.`))
+              || `${broker} connected — Home shows brokerage cash and holdings. Complete trading verification to enable live orders.`)))
           : data.wealthError
             ? `${broker} connected but portfolio sync failed: ${data.wealthError}`
-            : 'NGX Pulse session is active and your sandbox portfolio is ready. Connect a live broker in Settings to go live.',
+            : data.assetClass === 'crypto'
+              ? 'Busha crypto mode is on. Enable live trading in Settings to place orders.'
+              : 'NGX Pulse session is active and your sandbox portfolio is ready. Connect a live broker in Settings to go live.',
         live: true,
       };
     }
@@ -409,12 +415,19 @@ export default function DashboardPage() {
           <div className="status-hero__meta">
             {status.live && <span className="live-dot" title="Live session" />}
             {status.live ? 'Protected · Live' : status.level === 'bad' ? 'Issue detected' : 'Review required'}
-            {market ? (
+            {market && data?.assetClass !== 'crypto' ? (
               <>
                 <span className="status-hero__meta-sep" aria-hidden>·</span>
                 <span className={`status-pill ${marketChipClass}`} style={{ padding: '2px 8px', fontSize: '0.72rem' }}>
                   {market.phase === 'open' && <span className="live-dot" aria-hidden />}
                   {marketPhaseLabel(market.phase)}
+                </span>
+              </>
+            ) : data?.assetClass === 'crypto' ? (
+              <>
+                <span className="status-hero__meta-sep" aria-hidden>·</span>
+                <span className="status-pill status-pill--ok" style={{ padding: '2px 8px', fontSize: '0.72rem' }}>
+                  Crypto · 24h
                 </span>
               </>
             ) : null}
@@ -443,13 +456,20 @@ export default function DashboardPage() {
           </div>
           <h1 className="status-hero__title">{status.title}</h1>
           <p className="status-hero__sub">{status.sub}</p>
-          {market ? (
+          {market && data?.assetClass !== 'crypto' ? (
             <p className="status-hero__market muted">
               {market.nowWat}
               {market.pulseStatus ? ` · Pulse: ${market.pulseStatus}` : ''}
               {!market.marketHoursEnforced ? ' · Hours bypassed (dev)' : ''}
               {data?.quotesAsOf
                 ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : data.tradingMode === 'live' ? ` · ${data.brokerName || 'Broker'}` : ' · Pulse'}`
+                : ''}
+            </p>
+          ) : data?.assetClass === 'crypto' ? (
+            <p className="status-hero__market muted">
+              Busha crypto book in NGN
+              {data?.quotesAsOf
+                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : ' · Busha'}`
                 : ''}
             </p>
           ) : null}

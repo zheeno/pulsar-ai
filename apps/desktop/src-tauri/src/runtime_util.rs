@@ -59,6 +59,9 @@ pub async fn live_broker_market_open(
     session: &crate::broker::BrokerSession,
     calendar: &crate::calendar::TradingCalendar,
 ) -> bool {
+    if session.id() == crate::broker::BrokerId::Busha {
+        return true;
+    }
     broker_open_with_calendar_fallback(
         session.market_is_open().await.ok(),
         ngx_session_open_for_live_orders(calendar),

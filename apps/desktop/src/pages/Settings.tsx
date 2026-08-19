@@ -663,6 +663,7 @@ export default function SettingsPage() {
       status: 'disconnected' as const,
     };
   const bushaConnected = bushaAccount.status === 'connected';
+  const cryptoMode = bushaConnected || settings?.assetClass === 'crypto';
 
   return (
     <div className="page">
@@ -763,9 +764,9 @@ export default function SettingsPage() {
       <section className="panel" aria-labelledby="broker-heading" style={{ marginTop: 20 }}>
         <h2 id="broker-heading">Live broker</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
-          One NGX live broker at a time (Wealth or Bamboo). Pulse stays the market-data source.
-          Busha signs in on their site so Pulsar can read that account — it is not used for NGX
-          orders. Without a connected NGX broker, Pulsar runs in sandbox mode.
+          {cryptoMode
+            ? 'Busha is the live crypto venue in NGN. NGX brokers (Wealth / Bamboo) are ignored until you disconnect Busha. Pulse still unlocks the app but is not used for crypto prices.'
+            : 'One NGX live broker at a time (Wealth or Bamboo). Pulse stays the market-data source. Connect Busha to switch the app into crypto trading mode. Without a connected live venue, Pulsar runs in sandbox mode.'}
         </p>
         <div className="broker-grid">
           <div role="radiogroup" aria-labelledby="broker-heading" className="broker-grid__ngx">
@@ -819,13 +820,13 @@ export default function SettingsPage() {
                   ? 'Connected'
                   : bushaAccount.status === 'expired'
                     ? 'Expired'
-                    : 'Available'}
+                    : 'Crypto · NGN'}
             </span>
           </button>
         </div>
       </section>
 
-      {wealth?.connected || brokerIsConnected(selectedBroker, settings) ? (
+      {!cryptoMode && (wealth?.connected || brokerIsConnected(selectedBroker, settings)) ? (
       <section className="panel" aria-labelledby="wealth-heading" style={{ marginTop: 20 }}>
         <h2 id="wealth-heading">{selectedBroker === 'bamboo' ? 'Bamboo' : 'Coronation Wealth'}</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
@@ -924,8 +925,12 @@ export default function SettingsPage() {
         <h2 id="strategy-heading">Strategy</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
           {wealth?.tradingMode === 'live'
-            ? `Risk and sizing for live ${selectedBroker === 'bamboo' ? 'Bamboo' : 'Wealth'} orders. The trading universe is all active NGX instruments from Pulse.`
-            : 'Risk and sizing for the sandbox. The trading universe is all active NGX instruments from Pulse.'}
+            ? cryptoMode
+              ? 'Risk and sizing for live Busha crypto orders in NGN. The universe is NGN pairs from Busha, not NGX stocks.'
+              : `Risk and sizing for live ${selectedBroker === 'bamboo' ? 'Bamboo' : 'Wealth'} orders. The trading universe is all active NGX instruments from Pulse.`
+            : cryptoMode
+              ? 'Connect Busha and enable live trading to execute crypto orders. Disconnect Busha to return to NGX stocks.'
+              : 'Risk and sizing for the sandbox. The trading universe is all active NGX instruments from Pulse.'}
         </p>
 
         <div className="param-slider-grid">

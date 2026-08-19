@@ -226,6 +226,7 @@ impl AuthBridge {
             &candidate.header_name,
             &candidate.value,
             probed.account_hint,
+            probed.profile_id,
         )
         .map_err(|e| e.to_string())?;
 
@@ -389,7 +390,13 @@ mod tests {
         let candidate = capture::match_candidate(&cfg, "authorization", &token).unwrap();
         let probed = probe::probe(&cfg, &candidate).await.unwrap();
         assert!(probed.ok);
-        session::persist_valid(&cfg, &candidate.header_name, &candidate.value, probed.account_hint)
+        session::persist_valid(
+            &cfg,
+            &candidate.header_name,
+            &candidate.value,
+            probed.account_hint,
+            probed.profile_id,
+        )
             .unwrap();
         let stored = get_token("mock-spa").unwrap().unwrap();
         assert_eq!(stored, token);
@@ -413,7 +420,14 @@ mod tests {
         let probed = probe::probe(&cfg, &candidate).await.unwrap();
         assert!(probed.ok);
         assert_eq!(probed.account_hint.as_deref(), Some("cookie@example.com"));
-        session::persist_valid(&cfg, "sessionid", "sess_abc123", probed.account_hint).unwrap();
+        session::persist_valid(
+            &cfg,
+            "sessionid",
+            "sess_abc123",
+            probed.account_hint,
+            probed.profile_id,
+        )
+        .unwrap();
         assert!(get_token("mock-cookie").unwrap().is_some());
         session::revoke("mock-cookie").unwrap();
     }

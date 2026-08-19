@@ -10,7 +10,6 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::execution::{remaining_buy_budget, BAMBOO_MIN_ORDER_NOTIONAL};
 use crate::indicators::IndicatorService;
-use crate::ngx::is_valid_ticker;
 use crate::settings::AppSettings;
 use crate::signals::SignalGenerationService;
 
@@ -349,6 +348,9 @@ fn cached_live_book(
     conn: &Connection,
     settings: &AppSettings,
 ) -> Option<crate::wealth::CachedWealthBook> {
+    if crate::broker::busha_connected() {
+        return crate::busha::load_snapshot(conn).ok().flatten();
+    }
     if settings.selected_broker == "bamboo" {
         crate::bamboo::load_snapshot(conn).ok().flatten()
     } else {
@@ -358,7 +360,11 @@ fn cached_live_book(
 
 fn get_account_snapshot(conn: &Connection, settings: &AppSettings) -> Result<Value> {
     let cash = sandbox_cash(conn);
-    let broker = settings.selected_broker.clone();
+    let broker = if crate::broker::busha_connected() {
+        "busha".to_string()
+    } else {
+        settings.selected_broker.clone()
+    };
     let min_n = crate::execution::min_order_notional_for_venue(&broker);
     let params = crate::strategy_coach::read_active_strategy(conn).ok();
     let cycle_pct = params
@@ -394,6 +400,7 @@ fn get_account_snapshot(conn: &Connection, settings: &AppSettings) -> Result<Val
         "spendableBudget": remaining,
         "bambooMinNotional": BAMBOO_MIN_ORDER_NOTIONAL,
         "minOrderNotional": min_n,
+        "assetClass": crate::broker::asset_class().as_str(),
         "asOf": chrono::Utc::now().to_rfc3339(),
     }))
 }
@@ -497,7 +504,12 @@ fn list_universe_quotes(conn: &Connection, limit: i64) -> Result<Value> {
 }
 
 fn get_symbol_quote(conn: &Connection, symbol: &str) -> Result<Value> {
-    if !is_valid_ticker(symbol) {
+    let venue = if crate::broker::busha_connected() {
+        "busha"
+    } else {
+        "sandbox"
+    };
+    if !crate::broker::is_valid_trade_symbol(venue, symbol) {
         return Ok(json!({ "ok": false, "error": format!("invalid ticker {symbol}") }));
     }
     match last_price(conn, symbol) {
@@ -518,7 +530,12 @@ fn get_symbol_quote(conn: &Connection, symbol: &str) -> Result<Value> {
 }
 
 fn get_price_history(conn: &Connection, symbol: &str, days: i64) -> Result<Value> {
-    if !is_valid_ticker(symbol) {
+    let venue = if crate::broker::busha_connected() {
+        "busha"
+    } else {
+        "sandbox"
+    };
+    if !crate::broker::is_valid_trade_symbol(venue, symbol) {
         return Ok(json!({ "ok": false, "error": format!("invalid ticker {symbol}") }));
     }
     let mut stmt = conn.prepare(
@@ -615,7 +632,14 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
     let Some(symbol) = arg_str(args, "symbol") else {
         return Ok(json!({ "ok": false, "error": "symbol is required" }));
     };
-    if !is_valid_ticker(&symbol) {
+    if !crate::broker::is_valid_trade_symbol(
+        if crate::broker::busha_connected() {
+            "busha"
+        } else {
+            "sandbox"
+        },
+        &symbol,
+    ) {
         return Ok(json!({ "ok": false, "error": format!("invalid ticker {symbol}") }));
     }
     let side = args
@@ -650,11 +674,21 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
     };
     let est_qty = qty.unwrap_or_else(|| {
         notional
-            .map(|n| (n / price).floor())
+            .map(|n| {
+                if crate::broker::busha_connected() {
+                    n / price
+                } else {
+                    (n / price).floor()
+                }
+            })
             .unwrap_or(0.0)
     });
     let est_notional = notional.unwrap_or(est_qty * price);
-    let min_n = crate::execution::min_order_notional_for_venue(&settings.selected_broker);
+    let min_n = crate::execution::min_order_notional_for_venue(if crate::broker::busha_connected() {
+        "busha"
+    } else {
+        &settings.selected_broker
+    });
     let cash = sandbox_cash(conn);
     let mut warnings = Vec::new();
     if side == "BUY" && est_notional + 1e-9 < min_n && min_n > 0.0 {

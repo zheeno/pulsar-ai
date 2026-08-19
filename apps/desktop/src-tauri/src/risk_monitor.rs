@@ -80,7 +80,9 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
     }
 
     let calendar = TradingCalendar::default();
-    if !crate::runtime_util::market_activity_allowed(&calendar) {
+    if !crate::broker::busha_connected()
+        && !crate::runtime_util::market_activity_allowed(&calendar)
+    {
         return Ok(None);
     }
 

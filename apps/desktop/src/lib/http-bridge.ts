@@ -71,6 +71,7 @@ function defaultSettings(): Settings {
     haltNewBuys: false,
     flattenOnDrawdownArmed: false,
     launchAtLogin: false,
+    assetClass: 'stocks',
   };
 }
 

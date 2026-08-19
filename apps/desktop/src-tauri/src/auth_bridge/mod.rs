@@ -1,16 +1,16 @@
 mod capture;
-mod config;
+pub(crate) mod config;
 mod interceptor;
 mod manager;
 mod probe;
-mod session;
-mod store;
+pub(crate) mod session;
+pub(crate) mod store;
 mod window;
 
 #[allow(unused_imports)]
 pub use manager::{get_token, notify_unauthorized, AuthBridge};
 #[allow(unused_imports)]
-pub use session::{AuthSessionStatus, SessionStatusKind};
+pub use session::{get_profile_id, AuthSessionStatus, SessionStatusKind};
 
 use tauri::{AppHandle, State, WebviewWindow};
 

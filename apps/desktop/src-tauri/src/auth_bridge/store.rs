@@ -14,6 +14,8 @@ pub struct StoredCredential {
     pub token: String,
     pub expires_at: DateTime<Utc>,
     pub account_hint: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 static TEST_STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -102,6 +104,7 @@ mod tests {
             token: "Bearer test-token-value".into(),
             expires_at: Utc::now() + Duration::hours(1),
             account_hint: Some("user@example.com".into()),
+            profile_id: Some("prof_test".into()),
         };
         put("test-broker", &cred).unwrap();
         let loaded = get("test-broker").unwrap().unwrap();
