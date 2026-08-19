@@ -17,7 +17,7 @@ pub const MAX_SIGNAL_BUYS: usize = 15;
 pub const MAX_SIGNAL_SELLS: usize = 15;
 /// Bamboo NGX market orders reject notionals below this floor.
 pub const BAMBOO_MIN_ORDER_NOTIONAL: f64 = 5_000.0;
-/// Busha NGN conversions reject notionals below ~₦250 (`min_buy_amount.counter`).
+/// Typical Busha NGN conversion floor (~₦250). Per-pair mins/maxes from `/v1/pairs` override this.
 pub const BUSHA_MIN_ORDER_NOTIONAL: f64 = 250.0;
 
 pub fn min_order_notional_for_venue(venue: &str) -> f64 {
@@ -919,7 +919,7 @@ impl ExecutionService {
             }
 
             let min_n = min_order_notional_for_venue(client.id().as_str());
-            if action == "BUY" && min_n > 0.0 {
+            if action == "BUY" && min_n > 0.0 && client.id().whole_shares() {
                 let pps = fee.price_per_share.max(broker_quote);
                 if pps > 0.0 && fee.total_price + 1e-9 < min_n {
                     let need = (min_n / pps).ceil();
@@ -1299,7 +1299,7 @@ impl ExecutionService {
         remaining_budget: f64,
         venue: &str,
     ) -> Result<std::collections::HashMap<String, f64>> {
-        let mut qualified: Vec<(String, f64)> = Vec::new();
+        let mut qualified: Vec<(String, f64, String)> = Vec::new();
 
         for signal_id in signal_ids {
             let signal: Option<(String, String, f64)> = conn
@@ -1347,7 +1347,7 @@ impl ExecutionService {
                 )?;
                 continue;
             }
-            qualified.push((signal_id.clone(), confidence));
+            qualified.push((signal_id.clone(), confidence, symbol));
         }
 
         qualified.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1355,41 +1355,65 @@ impl ExecutionService {
         if budget <= 0.0 {
             return Ok(std::collections::HashMap::new());
         }
-        let max_n = max_buys_for_min_notional(
-            budget,
-            min_notional,
-            qualified.len().min(MAX_SIGNAL_BUYS),
-        );
+        let mut kept: Vec<(String, f64, f64)> = Vec::new();
+        let mut reserved = 0.0;
+        for (id, conf, symbol) in qualified {
+            let pair_min = if venue.eq_ignore_ascii_case("busha") {
+                crate::busha::min_buy_ngn_for(conn, &symbol).unwrap_or(min_notional)
+            } else {
+                min_notional
+            };
+            if pair_min > 0.0 && budget + 1e-9 < pair_min {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_NOTIONAL' WHERE id = ?1",
+                    [&id],
+                )?;
+                continue;
+            }
+            if pair_min > 0.0 && budget - reserved + 1e-9 < pair_min {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_NOTIONAL' WHERE id = ?1",
+                    [&id],
+                )?;
+                continue;
+            }
+            kept.push((id, conf, pair_min));
+            reserved += pair_min.max(0.0);
+        }
+        let max_n = kept.len().min(MAX_SIGNAL_BUYS);
         if max_n == 0 {
             return Ok(std::collections::HashMap::new());
         }
-        qualified.truncate(max_n);
+        kept.truncate(max_n);
         let weights = RiskPolicyService::confidence_weights(
-            &qualified.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+            &kept.iter().map(|(_, c, _)| *c).collect::<Vec<_>>(),
         );
         let mut out = std::collections::HashMap::new();
-        if min_notional <= 0.0 {
-            for ((signal_id, _), weight) in qualified.into_iter().zip(weights.into_iter()) {
-                out.insert(signal_id, budget * weight);
-            }
-            return Ok(out);
-        }
-        let mut rows: Vec<(String, f64)> = qualified
+        let mut rows: Vec<(String, f64, f64)> = kept
             .into_iter()
             .zip(weights)
-            .map(|((id, _), w)| (id, (budget * w).max(min_notional)))
+            .map(|((id, _, pair_min), w)| {
+                let floor = pair_min.max(0.0);
+                let sized = if floor <= 0.0 {
+                    budget * w
+                } else {
+                    (budget * w).max(floor)
+                };
+                (id, sized, floor)
+            })
             .collect();
         loop {
-            let sum: f64 = rows.iter().map(|(_, n)| *n).sum();
+            let sum: f64 = rows.iter().map(|(_, n, _)| *n).sum();
             if sum <= cash + 1e-9 || rows.is_empty() {
                 break;
             }
             if rows.len() == 1 {
-                if cash + 1e-9 < min_notional {
+                let floor = rows[0].2;
+                if floor > 0.0 && cash + 1e-9 < floor {
                     rows.clear();
                 } else {
-                    rows[0].1 = cash.min(budget.max(min_notional));
-                    if rows[0].1 + 1e-9 < min_notional {
+                    rows[0].1 = cash.min(budget.max(floor));
+                    if floor > 0.0 && rows[0].1 + 1e-9 < floor {
                         rows.clear();
                     }
                 }
@@ -1397,12 +1421,11 @@ impl ExecutionService {
             }
             rows.pop();
             let n = rows.len() as f64;
-            let each = (budget / n).max(min_notional);
             for row in rows.iter_mut() {
-                row.1 = each;
+                row.1 = (budget / n).max(row.2);
             }
         }
-        for (id, n) in rows {
+        for (id, n, _) in rows {
             out.insert(id, n);
         }
         Ok(out)

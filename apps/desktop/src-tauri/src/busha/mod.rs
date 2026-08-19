@@ -25,7 +25,15 @@ pub struct BushaPair {
     pub is_buy_supported: bool,
     pub is_sell_supported: bool,
     pub min_buy_ngn: f64,
+    pub min_buy_base: f64,
     pub min_sell_ngn: f64,
+    pub min_sell_base: f64,
+    pub max_buy_ngn: f64,
+    pub max_buy_base: f64,
+    pub max_sell_ngn: f64,
+    pub max_sell_base: f64,
+    pub base_decimal: usize,
+    pub counter_decimal: usize,
     pub percentage_change: f64,
 }
 
@@ -212,8 +220,14 @@ impl BushaClient {
         source_currency: &str,
         target_currency: &str,
         source_amount: f64,
+        decimals: Option<usize>,
     ) -> Result<BushaQuote> {
-        let body = quote_body(source_currency, target_currency, source_amount);
+        let body = quote_body_with_decimals(
+            source_currency,
+            target_currency,
+            source_amount,
+            decimals,
+        );
         tracing::debug!(
             target: "busha",
             source = source_currency,
@@ -301,35 +315,23 @@ impl BushaClient {
         if source_amount <= 0.0 {
             return Err(anyhow!("Busha quote amount must be positive"));
         }
+        let mut decimals: Option<usize> = None;
         if let Ok(pairs) = self.pairs_ngn().await {
             if let Some(p) = pair_for(&pairs, &base) {
-                if buy {
-                    source_amount = meet_ngn_floor(source_amount, p.min_buy_ngn);
-                } else if price > 0.0 {
-                    let proceeds = quantity * price;
-                    let need = meet_ngn_floor(proceeds, p.min_sell_ngn);
-                    if need > proceeds {
-                        source_amount = need / price;
-                    }
-                }
-            } else if buy {
-                source_amount = meet_ngn_floor(
-                    source_amount,
-                    crate::execution::BUSHA_MIN_ORDER_NOTIONAL,
-                );
+                source_amount = apply_pair_quote_limits(buy, source_amount, price, p)?;
+                decimals = Some(if buy {
+                    p.counter_decimal
+                } else {
+                    p.base_decimal
+                });
             }
-        } else if buy {
-            source_amount = meet_ngn_floor(
-                source_amount,
-                crate::execution::BUSHA_MIN_ORDER_NOTIONAL,
-            );
         }
         let (source, target) = if buy {
             ("NGN", base.as_str())
         } else {
             (base.as_str(), "NGN")
         };
-        let quote = self.create_quote(source, target, source_amount).await?;
+        let quote = self.create_quote(source, target, source_amount, decimals).await?;
         let fee = BushaFeeQuote {
             quote_id: quote.id.clone(),
             expires_at: quote.expires_at,
@@ -411,40 +413,117 @@ fn urlencoding_lite(s: &str) -> String {
 }
 
 pub fn quote_body(source: &str, target: &str, source_amount: f64) -> Value {
+    quote_body_with_decimals(source, target, source_amount, None)
+}
+
+pub fn quote_body_with_decimals(
+    source: &str,
+    target: &str,
+    source_amount: f64,
+    decimals: Option<usize>,
+) -> Value {
+    let places = decimals.unwrap_or_else(|| {
+        if source.eq_ignore_ascii_case("NGN") {
+            2
+        } else {
+            8
+        }
+    });
     json!({
         "source_currency": source,
         "target_currency": target,
-        "source_amount": format_amount_for(source, source_amount),
+        "source_amount": format_amount_decimals(source_amount, places),
     })
 }
 
-pub fn meet_ngn_floor(amount: f64, min_ngn: f64) -> f64 {
-    let floor = min_ngn.max(crate::execution::BUSHA_MIN_ORDER_NOTIONAL);
-    if amount + 1e-9 >= floor {
+/// Raise `amount` to the pair's posted min, using that pair's decimal places.
+pub fn meet_floor(amount: f64, min: f64, decimals: usize) -> f64 {
+    if !min.is_finite() || min <= 0.0 {
         return amount;
     }
-    // Busha sometimes requires strictly above the posted min (e.g. 250.000001).
-    let bumped = (floor * 100.0).ceil() / 100.0;
-    if bumped <= floor + 1e-9 {
-        floor + 0.01
+    if amount + 1e-12 >= min {
+        return amount;
+    }
+    let d = decimals.min(12);
+    let factor = 10_f64.powi(d as i32);
+    let bumped = (min * factor).ceil() / factor;
+    if bumped <= min + 1e-12 {
+        min + 1.0 / factor
     } else {
         bumped
     }
 }
 
-/// NGN is 2 decimal places in captured quotes (`"650"`). Other assets keep up to 8.
-pub fn format_amount_for(currency: &str, n: f64) -> String {
-    if !n.is_finite() || n <= 0.0 {
-        return "0".into();
+pub fn apply_pair_quote_limits(
+    buy: bool,
+    source_amount: f64,
+    price: f64,
+    pair: &BushaPair,
+) -> Result<f64> {
+    if buy {
+        let mut ngn = meet_floor(source_amount, pair.min_buy_ngn, pair.counter_decimal);
+        let px = if pair.buy_price > 0.0 {
+            pair.buy_price
+        } else {
+            price
+        };
+        if px > 0.0 && pair.min_buy_base > 0.0 && ngn / px + 1e-12 < pair.min_buy_base {
+            ngn = meet_floor(
+                pair.min_buy_base * px,
+                pair.min_buy_ngn,
+                pair.counter_decimal,
+            );
+        }
+        if pair.max_buy_ngn > 0.0 && ngn > pair.max_buy_ngn + 1e-9 {
+            return Err(anyhow!(
+                "Busha {} buy ₦{:.2} exceeds max ₦{:.2}",
+                pair.base,
+                ngn,
+                pair.max_buy_ngn
+            ));
+        }
+        Ok(ngn)
+    } else {
+        let mut qty = meet_floor(source_amount, pair.min_sell_base, pair.base_decimal);
+        let px = if pair.sell_price > 0.0 {
+            pair.sell_price
+        } else {
+            price
+        };
+        if px > 0.0 && pair.min_sell_ngn > 0.0 && qty * px + 1e-12 < pair.min_sell_ngn {
+            qty = meet_floor(
+                pair.min_sell_ngn / px,
+                pair.min_sell_base,
+                pair.base_decimal,
+            );
+        }
+        if pair.max_sell_base > 0.0 && qty > pair.max_sell_base + 1e-12 {
+            qty = pair.max_sell_base;
+        }
+        if px > 0.0 && pair.max_sell_ngn > 0.0 && qty * px > pair.max_sell_ngn + 1e-9 {
+            qty = pair.max_sell_ngn / px;
+        }
+        Ok(qty)
     }
-    let decimals: usize = if currency.eq_ignore_ascii_case("NGN") {
+}
+
+pub fn format_amount_for(currency: &str, n: f64) -> String {
+    let decimals = if currency.eq_ignore_ascii_case("NGN") {
         2
     } else {
         8
     };
-    let factor = 10_f64.powi(decimals as i32);
+    format_amount_decimals(n, decimals)
+}
+
+pub fn format_amount_decimals(n: f64, decimals: usize) -> String {
+    if !n.is_finite() || n <= 0.0 {
+        return "0".into();
+    }
+    let d = decimals.min(12);
+    let factor = 10_f64.powi(d as i32);
     let rounded = (n * factor).round() / factor;
-    let s = format!("{rounded:.decimals$}");
+    let s = format!("{rounded:.d$}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
@@ -560,10 +639,42 @@ pub fn parse_pairs(root: &Value) -> Result<Vec<BushaPair>> {
                 .pointer("/min_buy_amount/counter")
                 .map(money)
                 .unwrap_or(0.0),
+            min_buy_base: item
+                .pointer("/min_buy_amount")
+                .map(money)
+                .unwrap_or(0.0),
             min_sell_ngn: item
                 .pointer("/min_sell_amount/counter")
                 .map(money)
                 .unwrap_or(0.0),
+            min_sell_base: item
+                .pointer("/min_sell_amount")
+                .map(money)
+                .unwrap_or(0.0),
+            max_buy_ngn: item
+                .pointer("/max_buy_amount/counter")
+                .map(money)
+                .unwrap_or(0.0),
+            max_buy_base: item
+                .pointer("/max_buy_amount")
+                .map(money)
+                .unwrap_or(0.0),
+            max_sell_ngn: item
+                .pointer("/max_sell_amount/counter")
+                .map(money)
+                .unwrap_or(0.0),
+            max_sell_base: item
+                .pointer("/max_sell_amount")
+                .map(money)
+                .unwrap_or(0.0),
+            base_decimal: item
+                .get("base_decimal")
+                .map(|v| parse_decimal_places(Some(v)))
+                .unwrap_or(8),
+            counter_decimal: item
+                .get("counter_decimal")
+                .map(|v| parse_decimal_places(Some(v)))
+                .unwrap_or(2),
             percentage_change: pct,
         });
     }
@@ -687,9 +798,28 @@ pub fn transfer_matches_tx(transfer: &BushaTransfer, tx: &Value) -> bool {
     })
 }
 
+fn parse_decimal_places(v: Option<&Value>) -> usize {
+    match v {
+        Some(Value::String(s)) => s.parse().ok().unwrap_or(8),
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(8) as usize,
+        _ => 8,
+    }
+    .min(12)
+}
+
 fn pair_for<'a>(pairs: &'a [BushaPair], symbol: &str) -> Option<&'a BushaPair> {
     let s = symbol.trim().to_uppercase();
     pairs.iter().find(|p| p.base == s || p.id.eq_ignore_ascii_case(&s))
+}
+
+pub fn min_buy_ngn_for(conn: &Connection, symbol: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT min_buy_ngn FROM busha_pairs WHERE symbol = ?1",
+        [symbol.trim().to_uppercase()],
+        |row| row.get::<_, f64>(0),
+    )
+    .ok()
+    .filter(|n| n.is_finite() && *n > 0.0)
 }
 
 fn persist_pairs(conn: &Connection, pairs: &[BushaPair]) -> Result<()> {
@@ -697,6 +827,7 @@ fn persist_pairs(conn: &Connection, pairs: &[BushaPair]) -> Result<()> {
         "UPDATE instruments SET is_active = 0 WHERE sector = 'CRYPTO'",
         [],
     )?;
+    conn.execute("DELETE FROM busha_pairs", [])?;
     let today = Utc::now().date_naive().to_string();
     for p in pairs {
         conn.execute(
@@ -709,6 +840,30 @@ fn persist_pairs(conn: &Connection, pairs: &[BushaPair]) -> Result<()> {
              VALUES (?1, ?2, ?3, ?4, 0)
              ON CONFLICT(symbol, trade_date) DO UPDATE SET price = excluded.price, change_percent = excluded.change_percent",
             rusqlite::params![p.base, today, p.buy_price, p.percentage_change],
+        )?;
+        conn.execute(
+            "INSERT INTO busha_pairs (
+                symbol, pair_id, buy_price, sell_price,
+                min_buy_ngn, min_buy_base, min_sell_ngn, min_sell_base,
+                max_buy_ngn, max_buy_base, max_sell_ngn, max_sell_base,
+                base_decimal, counter_decimal, synced_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, datetime('now'))",
+            rusqlite::params![
+                p.base,
+                p.id,
+                p.buy_price,
+                p.sell_price,
+                p.min_buy_ngn,
+                p.min_buy_base,
+                p.min_sell_ngn,
+                p.min_sell_base,
+                p.max_buy_ngn,
+                p.max_buy_base,
+                p.max_sell_ngn,
+                p.max_sell_base,
+                p.base_decimal as i64,
+                p.counter_decimal as i64,
+            ],
         )?;
     }
     Ok(())
@@ -816,6 +971,10 @@ mod tests {
         "sell_price":{"amount":"88919802.32","currency":"NGN"},
         "is_buy_supported":true,"is_sell_supported":true,
         "min_buy_amount":{"amount":"0.000005","counter":{"amount":"467.51","currency":"NGN"},"currency":"BTC"},
+        "min_sell_amount":{"amount":"0.000005","counter":{"amount":"444.60","currency":"NGN"},"currency":"BTC"},
+        "max_buy_amount":{"amount":"1","counter":{"amount":"93501695.36","currency":"NGN"},"currency":"BTC"},
+        "max_sell_amount":{"amount":"1","counter":{"amount":"88919802.32","currency":"NGN"},"currency":"BTC"},
+        "base_decimal":"8","counter_decimal":"2",
         "percentage_change":"1.1"
       }]
     }"#;
@@ -877,13 +1036,73 @@ mod tests {
         assert_eq!(pairs[0].base, "BTC");
         assert!((pairs[0].buy_price - 93501695.36).abs() < 0.01);
         assert!((pairs[0].min_buy_ngn - 467.51).abs() < 0.01);
+        assert!((pairs[0].min_sell_ngn - 444.60).abs() < 0.01);
+        assert!((pairs[0].max_buy_ngn - 93_501_695.36).abs() < 0.01);
+        assert_eq!(pairs[0].base_decimal, 8);
+        assert_eq!(pairs[0].counter_decimal, 2);
     }
 
     #[test]
-    fn ngn_floor_clears_busha_min_sale() {
-        assert!(meet_ngn_floor(80.0, 250.0) >= 250.01);
-        assert!(meet_ngn_floor(80.0, 250.000001) > 250.0);
-        assert!((meet_ngn_floor(650.0, 250.0) - 650.0).abs() < 1e-9);
+    fn pair_limits_are_per_asset_not_a_global_250() {
+        let btc = parse_pairs(&serde_json::from_str(PAIRS).unwrap()).unwrap();
+        let p = &btc[0];
+        let bumped = apply_pair_quote_limits(true, 80.0, p.buy_price, p).unwrap();
+        assert!(bumped + 1e-9 >= 467.51);
+        let cngn = BushaPair {
+            id: "CNGNNGN".into(),
+            base: "CNGN".into(),
+            counter: "NGN".into(),
+            buy_price: 1.001,
+            sell_price: 0.999,
+            is_buy_supported: true,
+            is_sell_supported: true,
+            min_buy_ngn: 1.001,
+            min_buy_base: 1.0,
+            min_sell_ngn: 0.999,
+            min_sell_base: 1.0,
+            max_buy_ngn: 50_050_000.0,
+            max_buy_base: 50_000_000.0,
+            max_sell_ngn: 49_950_000.0,
+            max_sell_base: 50_000_000.0,
+            base_decimal: 2,
+            counter_decimal: 3,
+            percentage_change: 0.0,
+        };
+        let tiny = apply_pair_quote_limits(true, 80.0, 1.001, &cngn).unwrap();
+        assert!((tiny - 80.0).abs() < 1e-9);
+        let usdt = BushaPair {
+            id: "USDTNGN".into(),
+            base: "USDT".into(),
+            counter: "NGN".into(),
+            buy_price: 1400.94,
+            sell_price: 1385.34,
+            is_buy_supported: true,
+            is_sell_supported: true,
+            min_buy_ngn: 2619.76,
+            min_buy_base: 1.87,
+            min_sell_ngn: 2853.8,
+            min_sell_base: 2.06,
+            max_buy_ngn: 700_470_000.0,
+            max_buy_base: 500_000.0,
+            max_sell_ngn: 692_670_000.0,
+            max_sell_base: 500_000.0,
+            base_decimal: 2,
+            counter_decimal: 2,
+            percentage_change: 0.0,
+        };
+        let usdt_q = apply_pair_quote_limits(true, 950.0, 1400.94, &usdt).unwrap();
+        assert!(usdt_q + 1e-9 >= 2619.76);
+        let sell = apply_pair_quote_limits(false, 1.0, 1385.34, &usdt).unwrap();
+        assert!(sell + 1e-9 >= 2.06);
+    }
+
+    #[test]
+    fn ngn_floor_uses_posted_pair_min() {
+        assert!(meet_floor(80.0, 250.0, 2) >= 250.01);
+        assert!(meet_floor(80.0, 250.000001, 2) > 250.0);
+        assert!((meet_floor(650.0, 250.0, 2) - 650.0).abs() < 1e-9);
+        assert!(meet_floor(0.5, 1.001, 3) >= 1.001);
+        assert!((meet_floor(80.0, 0.0, 2) - 80.0).abs() < 1e-9);
     }
 
     #[test]
