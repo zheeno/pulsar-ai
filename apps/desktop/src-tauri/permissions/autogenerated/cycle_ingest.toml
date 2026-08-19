@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cycle-ingest"
+description = "Enables the cycle_ingest command without any pre-configured scope."
+commands.allow = ["cycle_ingest"]
+
+[[permission]]
+identifier = "deny-cycle-ingest"
+description = "Denies the cycle_ingest command without any pre-configured scope."
+commands.deny = ["cycle_ingest"]

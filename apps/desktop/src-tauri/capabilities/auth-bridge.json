@@ -1,0 +1,27 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "description": "Remote partner login webviews may only submit a capture candidate",
+  "identifier": "auth-bridge",
+  "local": false,
+  "permissions": [
+    "allow-auth-bridge-submit-candidate"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*/*",
+      "http://localhost:*/*",
+      "https://app.busha.io/*",
+      "https://www.busha.io/*",
+      "https://busha.io/*",
+      "https://api.busha.co/*",
+      "https://api.busha.io/*",
+      "https://api.ben.busha.team/*",
+      "https://*.busha.co/*",
+      "https://*.busha.io/*",
+      "https://*.busha.team/*"
+    ]
+  },
+  "windows": [
+    "auth-bridge-*"
+  ]
+}

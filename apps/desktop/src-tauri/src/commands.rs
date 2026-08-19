@@ -115,6 +115,7 @@ pub fn logout(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let _ = delete_secret(SECRET_PULSE_API_KEY);
     let _ = delete_secret(SECRET_LLM_API_KEY);
     crate::wealth::WealthClient::clear_local_secrets();
+    crate::auth_bridge::revoke_all();
     state
         .db
         .with_conn(clear_session_settings)

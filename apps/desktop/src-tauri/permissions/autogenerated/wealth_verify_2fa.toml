@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wealth-verify-2fa"
+description = "Enables the wealth_verify_2fa command without any pre-configured scope."
+commands.allow = ["wealth_verify_2fa"]
+
+[[permission]]
+identifier = "deny-wealth-verify-2fa"
+description = "Denies the wealth_verify_2fa command without any pre-configured scope."
+commands.deny = ["wealth_verify_2fa"]

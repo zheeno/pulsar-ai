@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-coach-list-sessions"
+description = "Enables the coach_list_sessions command without any pre-configured scope."
+commands.allow = ["coach_list_sessions"]
+
+[[permission]]
+identifier = "deny-coach-list-sessions"
+description = "Denies the coach_list_sessions command without any pre-configured scope."
+commands.deny = ["coach_list_sessions"]

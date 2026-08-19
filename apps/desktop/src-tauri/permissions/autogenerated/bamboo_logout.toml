@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bamboo-logout"
+description = "Enables the bamboo_logout command without any pre-configured scope."
+commands.allow = ["bamboo_logout"]
+
+[[permission]]
+identifier = "deny-bamboo-logout"
+description = "Denies the bamboo_logout command without any pre-configured scope."
+commands.deny = ["bamboo_logout"]

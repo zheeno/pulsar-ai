@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wealth-profile"
+description = "Enables the wealth_profile command without any pre-configured scope."
+commands.allow = ["wealth_profile"]
+
+[[permission]]
+identifier = "deny-wealth-profile"
+description = "Denies the wealth_profile command without any pre-configured scope."
+commands.deny = ["wealth_profile"]

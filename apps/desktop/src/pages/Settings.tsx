@@ -9,6 +9,13 @@ import {
   llmTemperatureFromDraft,
 } from '../components/LlmTemperatureControl';
 import { api, type AppSettings } from '../lib/api';
+import {
+  authenticate as authBridgeAuthenticate,
+  listSessions,
+  onExpired,
+  revoke as authBridgeRevoke,
+  type AuthSessionStatus,
+} from '../lib/auth-bridge';
 import { formatNaira } from '../lib/format';
 import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
@@ -305,6 +312,9 @@ export default function SettingsPage() {
   const [dataDir, setDataDir] = useState<string | null>(null);
   const [resetConfirm, setResetConfirm] = useState('');
   const [resetBusy, setResetBusy] = useState(false);
+  const [authBridgeAccounts, setAuthBridgeAccounts] = useState<AuthSessionStatus[]>([]);
+  const [authBridgeBusy, setAuthBridgeBusy] = useState<string | null>(null);
+  const [authBridgeConsent, setAuthBridgeConsent] = useState<string | null>(null);
 
   async function refresh() {
     const [s, llm, strategy] = await Promise.all([
@@ -338,6 +348,11 @@ export default function SettingsPage() {
         { id: 'wealth', name: 'Coronation Wealth', available: true, connected: !!s.wealthConnected },
         { id: 'bamboo', name: 'Bamboo', available: true, connected: !!s.bambooConnected },
       ]);
+    }
+    try {
+      setAuthBridgeAccounts(await listSessions());
+    } catch {
+      setAuthBridgeAccounts([]);
     }
     try {
       setDataDir(await api<string>('app_data_dir'));
@@ -378,6 +393,21 @@ export default function SettingsPage() {
   useEffect(() => {
     refresh().catch(() => {});
   }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void onExpired((event) => {
+      toast.info(`${event.brokerId} session expired. Sign in again to continue.`, 'Connected account');
+      void listSessions()
+        .then(setAuthBridgeAccounts)
+        .catch(() => {});
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [toast]);
 
   useEffect(() => {
     if (!llmModalOpen) return;
@@ -522,6 +552,38 @@ export default function SettingsPage() {
     }
     if (!brokerIsConnected(next, settings) && !wealth?.connected) {
       setBrokerModalOpen(true);
+    }
+  }
+
+  async function connectAuthBridge(brokerId: string) {
+    setAuthBridgeBusy(brokerId);
+    try {
+      const session = await authBridgeAuthenticate(brokerId);
+      setAuthBridgeAccounts((prev) => {
+        const rest = prev.filter((a) => a.brokerId !== session.brokerId);
+        return [...rest, session];
+      });
+      toast.success(`${session.displayName} connected.`, 'Connected account');
+      setAuthBridgeConsent(null);
+    } catch (err) {
+      toast.error(String(err), 'Could not connect');
+    } finally {
+      setAuthBridgeBusy(null);
+    }
+  }
+
+  async function disconnectAuthBridge(brokerId: string) {
+    setAuthBridgeBusy(brokerId);
+    try {
+      const session = await authBridgeRevoke(brokerId);
+      setAuthBridgeAccounts((prev) =>
+        prev.map((a) => (a.brokerId === session.brokerId ? session : a)),
+      );
+      toast.success('Session removed.', 'Connected account');
+    } catch (err) {
+      toast.error(String(err), 'Could not disconnect');
+    } finally {
+      setAuthBridgeBusy(null);
     }
   }
 
@@ -725,6 +787,80 @@ export default function SettingsPage() {
             );
           })}
         </div>
+      </section>
+
+      <section className="panel" aria-labelledby="auth-bridge-heading" style={{ marginTop: 20 }}>
+        <h2 id="auth-bridge-heading">Connected accounts</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Sign in on the partner’s official site. Pulsar keeps only the session token that site
+          issues to this window so it can read your account. This is not used for NGX live orders.
+        </p>
+        {(authBridgeAccounts.length ? authBridgeAccounts : [{ brokerId: 'busha', displayName: 'Busha', status: 'disconnected' as const }]).map(
+          (account) => {
+            const connected = account.status === 'connected';
+            const busyId = authBridgeBusy === account.brokerId;
+            return (
+              <div key={account.brokerId} className="profile-meta" style={{ marginTop: 12 }}>
+                <div className="profile-meta__item">
+                  <dt>{account.displayName}</dt>
+                  <dd>
+                    {connected
+                      ? account.accountHint || 'Connected'
+                      : account.status === 'expired'
+                        ? 'Expired'
+                        : 'Not connected'}
+                  </dd>
+                </div>
+                <div className="btn-row" style={{ marginTop: 12 }}>
+                  {connected ? (
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      disabled={busyId}
+                      onClick={() => void disconnectAuthBridge(account.brokerId)}
+                    >
+                      {busyId ? <IconSpinner /> : null}
+                      Disconnect
+                    </button>
+                  ) : authBridgeConsent === account.brokerId ? (
+                    <>
+                      <p className="muted" style={{ fontSize: 13, maxWidth: 520 }}>
+                        You will log in to {account.displayName} in their official page. Pulsar will
+                        keep the session token they issue to this window to fetch your account data.
+                      </p>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={busyId}
+                        onClick={() => void connectAuthBridge(account.brokerId)}
+                      >
+                        {busyId ? <IconSpinner /> : null}
+                        Continue to {account.displayName}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        disabled={busyId}
+                        onClick={() => setAuthBridgeConsent(null)}
+                      >
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={busyId}
+                      onClick={() => setAuthBridgeConsent(account.brokerId)}
+                    >
+                      Connect {account.displayName}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          },
+        )}
       </section>
 
       {wealth?.connected || brokerIsConnected(selectedBroker, settings) ? (

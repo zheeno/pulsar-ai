@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bamboo-profile"
+description = "Enables the bamboo_profile command without any pre-configured scope."
+commands.allow = ["bamboo_profile"]
+
+[[permission]]
+identifier = "deny-bamboo-profile"
+description = "Denies the bamboo_profile command without any pre-configured scope."
+commands.deny = ["bamboo_profile"]

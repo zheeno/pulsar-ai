@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-market-status"
+description = "Enables the market_status command without any pre-configured scope."
+commands.allow = ["market_status"]
+
+[[permission]]
+identifier = "deny-market-status"
+description = "Denies the market_status command without any pre-configured scope."
+commands.deny = ["market_status"]

@@ -1,5 +1,6 @@
 mod agent;
 mod app_state;
+mod auth_bridge;
 mod bamboo;
 mod broker;
 mod cache;
@@ -166,7 +167,7 @@ pub fn run() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(
-                        "info,ngx_pulse=debug,wealth=debug,bamboo=debug,secrets=debug",
+                        "info,ngx_pulse=debug,wealth=debug,bamboo=debug,secrets=debug,auth_bridge=info",
                     )
                 }),
         )
@@ -218,6 +219,8 @@ pub fn run() {
 
             let state = AppState::new(db, worker_path);
             app.manage(state.clone());
+            app.manage(crate::auth_bridge::AuthBridge::new());
+            crate::auth_bridge::start_expiry_watcher(app.handle().clone());
 
             scheduler::start_scheduler(app.handle().clone(), state.clone());
             risk_monitor::start_risk_monitor(app.handle().clone(), state);
@@ -274,6 +277,11 @@ pub fn run() {
             commands::bamboo_logout,
             commands::broker_list,
             commands::set_selected_broker,
+            auth_bridge::auth_bridge_authenticate,
+            auth_bridge::auth_bridge_session,
+            auth_bridge::auth_bridge_list,
+            auth_bridge::auth_bridge_revoke,
+            auth_bridge::auth_bridge_submit_candidate,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

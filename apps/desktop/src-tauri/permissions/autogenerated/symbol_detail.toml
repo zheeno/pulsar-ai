@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-symbol-detail"
+description = "Enables the symbol_detail command without any pre-configured scope."
+commands.allow = ["symbol_detail"]
+
+[[permission]]
+identifier = "deny-symbol-detail"
+description = "Denies the symbol_detail command without any pre-configured scope."
+commands.deny = ["symbol_detail"]

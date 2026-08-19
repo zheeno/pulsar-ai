@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cycle-status"
+description = "Enables the cycle_status command without any pre-configured scope."
+commands.allow = ["cycle_status"]
+
+[[permission]]
+identifier = "deny-cycle-status"
+description = "Denies the cycle_status command without any pre-configured scope."
+commands.deny = ["cycle_status"]

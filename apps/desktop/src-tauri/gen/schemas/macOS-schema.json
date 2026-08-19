@@ -177,6 +177,666 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the app_data_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-app-data-dir",
+          "markdownDescription": "Enables the app_data_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_bridge_authenticate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-bridge-authenticate",
+          "markdownDescription": "Enables the auth_bridge_authenticate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_bridge_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-bridge-list",
+          "markdownDescription": "Enables the auth_bridge_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_bridge_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-bridge-revoke",
+          "markdownDescription": "Enables the auth_bridge_revoke command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_bridge_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-bridge-session",
+          "markdownDescription": "Enables the auth_bridge_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_bridge_submit_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-bridge-submit-candidate",
+          "markdownDescription": "Enables the auth_bridge_submit_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the bamboo_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-bamboo-login",
+          "markdownDescription": "Enables the bamboo_login command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the bamboo_logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-bamboo-logout",
+          "markdownDescription": "Enables the bamboo_logout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the bamboo_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-bamboo-profile",
+          "markdownDescription": "Enables the bamboo_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the broker_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-broker-list",
+          "markdownDescription": "Enables the broker_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the coach_cancel_trade command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-coach-cancel-trade",
+          "markdownDescription": "Enables the coach_cancel_trade command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the coach_delete_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-coach-delete-session",
+          "markdownDescription": "Enables the coach_delete_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the coach_execute_trade command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-coach-execute-trade",
+          "markdownDescription": "Enables the coach_execute_trade command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the coach_get_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-coach-get-session",
+          "markdownDescription": "Enables the coach_get_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the coach_list_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-coach-list-sessions",
+          "markdownDescription": "Enables the coach_list_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the coach_new_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-coach-new-session",
+          "markdownDescription": "Enables the coach_new_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the coach_turn command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-coach-turn",
+          "markdownDescription": "Enables the coach_turn command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the complete_onboarding command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-complete-onboarding",
+          "markdownDescription": "Enables the complete_onboarding command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the confidence_journal command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confidence-journal",
+          "markdownDescription": "Enables the confidence_journal command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cycle_ingest command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cycle-ingest",
+          "markdownDescription": "Enables the cycle_ingest command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cycle_run command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cycle-run",
+          "markdownDescription": "Enables the cycle_run command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cycle_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cycle-status",
+          "markdownDescription": "Enables the cycle_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the export_database command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-export-database",
+          "markdownDescription": "Enables the export_database command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the generate_signals command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-generate-signals",
+          "markdownDescription": "Enables the generate_signals command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_strategy command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-strategy",
+          "markdownDescription": "Enables the get_strategy command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_cycle_audits command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-cycle-audits",
+          "markdownDescription": "Enables the list_cycle_audits command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_signals command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-signals",
+          "markdownDescription": "Enables the list_signals command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_trades command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-trades",
+          "markdownDescription": "Enables the list_trades command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the llm_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-llm-status",
+          "markdownDescription": "Enables the llm_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-logout",
+          "markdownDescription": "Enables the logout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the market_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-market-status",
+          "markdownDescription": "Enables the market_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the memory_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-memory-delete",
+          "markdownDescription": "Enables the memory_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the memory_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-memory-list",
+          "markdownDescription": "Enables the memory_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the memory_search command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-memory-search",
+          "markdownDescription": "Enables the memory_search command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ping command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ping",
+          "markdownDescription": "Enables the ping command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the portfolio_default command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-portfolio-default",
+          "markdownDescription": "Enables the portfolio_default command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the portfolio_performance command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-portfolio-performance",
+          "markdownDescription": "Enables the portfolio_performance command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the portfolio_quotes command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-portfolio-quotes",
+          "markdownDescription": "Enables the portfolio_quotes command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pulse_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pulse-profile",
+          "markdownDescription": "Enables the pulse_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reset_local_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reset-local-data",
+          "markdownDescription": "Enables the reset_local_data command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_selected_broker command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-selected-broker",
+          "markdownDescription": "Enables the set_selected_broker command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the settings_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-settings-get",
+          "markdownDescription": "Enables the settings_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the settings_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-settings-set",
+          "markdownDescription": "Enables the settings_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the strategy_coach_apply command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-strategy-coach-apply",
+          "markdownDescription": "Enables the strategy_coach_apply command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the strategy_coach_propose command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-strategy-coach-propose",
+          "markdownDescription": "Enables the strategy_coach_propose command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the symbol_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-symbol-detail",
+          "markdownDescription": "Enables the symbol_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the symbol_detail_pulse command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-symbol-detail-pulse",
+          "markdownDescription": "Enables the symbol_detail_pulse command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the test_llm command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-test-llm",
+          "markdownDescription": "Enables the test_llm command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the test_pulse_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-test-pulse-login",
+          "markdownDescription": "Enables the test_pulse_login command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_strategy command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-strategy",
+          "markdownDescription": "Enables the update_strategy command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the usage_ngx_pulse command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-usage-ngx-pulse",
+          "markdownDescription": "Enables the usage_ngx_pulse command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the wealth_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-wealth-login",
+          "markdownDescription": "Enables the wealth_login command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the wealth_logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-wealth-logout",
+          "markdownDescription": "Enables the wealth_logout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the wealth_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-wealth-profile",
+          "markdownDescription": "Enables the wealth_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the wealth_verify_2fa command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-wealth-verify-2fa",
+          "markdownDescription": "Enables the wealth_verify_2fa command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the app_data_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-app-data-dir",
+          "markdownDescription": "Denies the app_data_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_bridge_authenticate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-bridge-authenticate",
+          "markdownDescription": "Denies the auth_bridge_authenticate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_bridge_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-bridge-list",
+          "markdownDescription": "Denies the auth_bridge_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_bridge_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-bridge-revoke",
+          "markdownDescription": "Denies the auth_bridge_revoke command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_bridge_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-bridge-session",
+          "markdownDescription": "Denies the auth_bridge_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_bridge_submit_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-bridge-submit-candidate",
+          "markdownDescription": "Denies the auth_bridge_submit_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the bamboo_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-bamboo-login",
+          "markdownDescription": "Denies the bamboo_login command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the bamboo_logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-bamboo-logout",
+          "markdownDescription": "Denies the bamboo_logout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the bamboo_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-bamboo-profile",
+          "markdownDescription": "Denies the bamboo_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the broker_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-broker-list",
+          "markdownDescription": "Denies the broker_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the coach_cancel_trade command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-coach-cancel-trade",
+          "markdownDescription": "Denies the coach_cancel_trade command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the coach_delete_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-coach-delete-session",
+          "markdownDescription": "Denies the coach_delete_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the coach_execute_trade command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-coach-execute-trade",
+          "markdownDescription": "Denies the coach_execute_trade command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the coach_get_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-coach-get-session",
+          "markdownDescription": "Denies the coach_get_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the coach_list_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-coach-list-sessions",
+          "markdownDescription": "Denies the coach_list_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the coach_new_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-coach-new-session",
+          "markdownDescription": "Denies the coach_new_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the coach_turn command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-coach-turn",
+          "markdownDescription": "Denies the coach_turn command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the complete_onboarding command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-complete-onboarding",
+          "markdownDescription": "Denies the complete_onboarding command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confidence_journal command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confidence-journal",
+          "markdownDescription": "Denies the confidence_journal command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cycle_ingest command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cycle-ingest",
+          "markdownDescription": "Denies the cycle_ingest command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cycle_run command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cycle-run",
+          "markdownDescription": "Denies the cycle_run command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cycle_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cycle-status",
+          "markdownDescription": "Denies the cycle_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the export_database command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-export-database",
+          "markdownDescription": "Denies the export_database command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the generate_signals command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-generate-signals",
+          "markdownDescription": "Denies the generate_signals command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_strategy command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-strategy",
+          "markdownDescription": "Denies the get_strategy command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_cycle_audits command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-cycle-audits",
+          "markdownDescription": "Denies the list_cycle_audits command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_signals command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-signals",
+          "markdownDescription": "Denies the list_signals command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_trades command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-trades",
+          "markdownDescription": "Denies the list_trades command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the llm_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-llm-status",
+          "markdownDescription": "Denies the llm_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-logout",
+          "markdownDescription": "Denies the logout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the market_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-market-status",
+          "markdownDescription": "Denies the market_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the memory_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-memory-delete",
+          "markdownDescription": "Denies the memory_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the memory_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-memory-list",
+          "markdownDescription": "Denies the memory_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the memory_search command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-memory-search",
+          "markdownDescription": "Denies the memory_search command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ping command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ping",
+          "markdownDescription": "Denies the ping command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the portfolio_default command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-portfolio-default",
+          "markdownDescription": "Denies the portfolio_default command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the portfolio_performance command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-portfolio-performance",
+          "markdownDescription": "Denies the portfolio_performance command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the portfolio_quotes command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-portfolio-quotes",
+          "markdownDescription": "Denies the portfolio_quotes command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pulse_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pulse-profile",
+          "markdownDescription": "Denies the pulse_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reset_local_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reset-local-data",
+          "markdownDescription": "Denies the reset_local_data command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_selected_broker command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-selected-broker",
+          "markdownDescription": "Denies the set_selected_broker command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the settings_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-settings-get",
+          "markdownDescription": "Denies the settings_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the settings_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-settings-set",
+          "markdownDescription": "Denies the settings_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the strategy_coach_apply command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-strategy-coach-apply",
+          "markdownDescription": "Denies the strategy_coach_apply command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the strategy_coach_propose command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-strategy-coach-propose",
+          "markdownDescription": "Denies the strategy_coach_propose command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the symbol_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-symbol-detail",
+          "markdownDescription": "Denies the symbol_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the symbol_detail_pulse command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-symbol-detail-pulse",
+          "markdownDescription": "Denies the symbol_detail_pulse command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the test_llm command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-test-llm",
+          "markdownDescription": "Denies the test_llm command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the test_pulse_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-test-pulse-login",
+          "markdownDescription": "Denies the test_pulse_login command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_strategy command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-strategy",
+          "markdownDescription": "Denies the update_strategy command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the usage_ngx_pulse command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-usage-ngx-pulse",
+          "markdownDescription": "Denies the usage_ngx_pulse command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the wealth_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-wealth-login",
+          "markdownDescription": "Denies the wealth_login command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the wealth_logout command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-wealth-logout",
+          "markdownDescription": "Denies the wealth_logout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the wealth_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-wealth-profile",
+          "markdownDescription": "Denies the wealth_profile command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the wealth_verify_2fa command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-wealth-verify-2fa",
+          "markdownDescription": "Denies the wealth_verify_2fa command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

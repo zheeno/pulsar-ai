@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-coach-delete-session"
+description = "Enables the coach_delete_session command without any pre-configured scope."
+commands.allow = ["coach_delete_session"]
+
+[[permission]]
+identifier = "deny-coach-delete-session"
+description = "Denies the coach_delete_session command without any pre-configured scope."
+commands.deny = ["coach_delete_session"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-portfolio-performance"
+description = "Enables the portfolio_performance command without any pre-configured scope."
+commands.allow = ["portfolio_performance"]
+
+[[permission]]
+identifier = "deny-portfolio-performance"
+description = "Denies the portfolio_performance command without any pre-configured scope."
+commands.deny = ["portfolio_performance"]

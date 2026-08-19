@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-auth-bridge-list"
+description = "Enables the auth_bridge_list command without any pre-configured scope."
+commands.allow = ["auth_bridge_list"]
+
+[[permission]]
+identifier = "deny-auth-bridge-list"
+description = "Denies the auth_bridge_list command without any pre-configured scope."
+commands.deny = ["auth_bridge_list"]
