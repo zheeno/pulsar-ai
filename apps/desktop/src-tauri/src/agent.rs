@@ -163,7 +163,9 @@ impl AgentBridge {
                     *guard = Some(spawn_worker(&worker_path)?);
                 }
                 let process = guard.as_mut().unwrap();
-                writeln!(process.stdin, "{line}").context("write agent")?;
+                // Always LF: writeln! emits CRLF on Windows, which can leave `\r` on
+                // Node readline when the worker is spawned without a TTY.
+                write!(process.stdin, "{line}\n").context("write agent")?;
                 process.stdin.flush()?;
                 let api_key = tools
                     .as_ref()
@@ -211,7 +213,7 @@ impl AgentBridge {
                             "name": name,
                             "result": result,
                         });
-                        writeln!(process.stdin, "{}", serde_json::to_string(&reply)?)
+                        write!(process.stdin, "{}\n", serde_json::to_string(&reply)?)
                             .context("write tool result")?;
                         process.stdin.flush()?;
                         continue;
@@ -335,11 +337,25 @@ fn resolve_node_bin_windows() -> PathBuf {
 
 const EMBEDDED_WORKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent-worker.cjs"));
 
+/// Node on Windows cannot exec `\\?\C:\...` verbatim paths: it treats `C:` as
+/// the script and dies with `EISDIR: lstat 'C:'`. Strip the prefix for argv.
+fn path_for_node(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
 fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
     verify_bundled_worker(path)?;
     let node = resolve_node_bin();
+    let node_arg = path_for_node(path);
     let mut child = Command::new(&node)
-        .arg(path)
+        .arg(&node_arg)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -498,6 +514,21 @@ mod tests {
         assert!(rendered.iter().any(|p| p.ends_with("/resources/agent-worker.cjs")));
         assert!(rendered.iter().any(|p| p.contains("/_up_/resources/agent-worker.cjs")));
         assert!(rendered.iter().any(|p| p.ends_with("/agent-worker.cjs") && !p.contains("/_up_/")));
+    }
+
+    #[test]
+    fn path_for_node_strips_windows_verbatim_prefix() {
+        let verbatim = PathBuf::from(r"\\?\C:\Users\efezi\agent-worker.cjs");
+        let simplified = path_for_node(&verbatim);
+        assert_eq!(simplified, PathBuf::from(r"C:\Users\efezi\agent-worker.cjs"));
+        assert!(!simplified.to_string_lossy().starts_with(r"\\?\"));
+        let unc = PathBuf::from(r"\\?\UNC\server\share\agent-worker.cjs");
+        assert_eq!(
+            path_for_node(&unc),
+            PathBuf::from(r"\\server\share\agent-worker.cjs")
+        );
+        let already = PathBuf::from(r"C:\Users\efezi\agent-worker.cjs");
+        assert_eq!(path_for_node(&already), already);
     }
 
     #[test]

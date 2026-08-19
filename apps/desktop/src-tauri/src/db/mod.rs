@@ -11,11 +11,25 @@ pub struct Database {
     pub path: PathBuf,
 }
 
+pub fn sqlite_filename(dev: bool) -> &'static str {
+    if dev {
+        "pulsar-dev.db"
+    } else {
+        "pulsar.db"
+    }
+}
+
 impl Database {
     pub fn open(app_data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(app_data_dir).context("create app data dir")?;
         harden_dir_permissions(app_data_dir);
-        let db_path = app_data_dir.join("pulsar.db");
+        let db_path = app_data_dir.join(sqlite_filename(crate::runtime_util::is_dev()));
+        tracing::info!(
+            target: "db",
+            path = %db_path.display(),
+            app_env = crate::runtime_util::app_env(),
+            "opening sqlite database"
+        );
         let conn = Connection::open(&db_path).context("open sqlite db")?;
         harden_file_permissions(&db_path);
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
@@ -163,5 +177,16 @@ fn harden_file_permissions(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqlite_filename;
+
+    #[test]
+    fn sqlite_filename_splits_dev_and_production() {
+        assert_eq!(sqlite_filename(false), "pulsar.db");
+        assert_eq!(sqlite_filename(true), "pulsar-dev.db");
     }
 }
