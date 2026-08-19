@@ -11,8 +11,30 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const resourcesDir = join(root, 'apps/desktop/src-tauri/resources');
 const workerEntry = join(root, 'packages/agent/src/worker.ts');
+const sharedSrc = join(root, 'packages/shared/src/index.ts');
 const workerOut = join(resourcesDir, 'agent-worker.cjs');
 const appEnvOut = join(resourcesDir, 'app.env');
+
+/** Must stay in sync with AgentRequestSchema / Rust agent.rs ops. */
+const REQUIRED_WORKER_OPS = [
+  'ping',
+  'portfolio_signals',
+  'symbol_signal',
+  'test_llm',
+  'strategy_coach',
+];
+
+async function assertWorkerOps(bundled) {
+  const missing = REQUIRED_WORKER_OPS.filter(
+    (op) => !bundled.includes(`literal("${op}")`) && !bundled.includes(`literal('${op}')`),
+  );
+  if (missing.length) {
+    throw new Error(
+      `Bundled agent worker is missing AgentRequest ops: ${missing.join(', ')}. ` +
+        'esbuild must resolve @ngx/shared from packages/shared/src, not a stale dist/.',
+    );
+  }
+}
 
 function parseDotEnv(text) {
   const out = {};
@@ -46,6 +68,9 @@ async function loadEnvFile() {
 async function main() {
   await mkdir(resourcesDir, { recursive: true });
 
+  // Bundle shared from TypeScript source. Resolving @ngx/shared via package.json
+  // "main" (dist/) silently ships a stale AgentRequestSchema — e.g. rejecting
+  // strategy_coach with invalid_union_discriminator while worker.ts handles it.
   await build({
     entryPoints: [workerEntry],
     bundle: true,
@@ -53,7 +78,14 @@ async function main() {
     format: 'cjs',
     outfile: workerOut,
     logLevel: 'info',
+    absWorkingDir: root,
+    alias: {
+      '@ngx/shared': sharedSrc,
+    },
   });
+
+  const bundled = await readFile(workerOut, 'utf8');
+  await assertWorkerOps(bundled);
 
   const fileEnv = await loadEnvFile();
   const pick = (key, fallback = '') => process.env[key] || fileEnv[key] || fallback;
