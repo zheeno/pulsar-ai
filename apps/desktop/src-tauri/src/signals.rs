@@ -728,7 +728,7 @@ impl SignalGenerationService {
             "coach:propose",
             PORTFOLIO_PROMPT_VERSION,
             false,
-            if crate::broker::busha_connected() { "busha" } else { "sandbox" },
+            if crate::broker::crypto_mode() { "busha" } else { "sandbox" },
         )?;
         if let Some(ref sid) = id {
             let snap = json!({ "coachQty": quantity.max(0.0) });
@@ -763,7 +763,7 @@ impl SignalGenerationService {
             model_name,
             PORTFOLIO_PROMPT_VERSION,
             false,
-            if crate::broker::busha_connected() { "busha" } else { "sandbox" },
+            if crate::broker::crypto_mode() { "busha" } else { "sandbox" },
         )?;
         if let Some(ref sid) = id {
             let snap = json!({ "sellFraction": sell_fraction.clamp(0.1, 1.0) });

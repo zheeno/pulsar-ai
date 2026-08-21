@@ -348,7 +348,7 @@ fn cached_live_book(
     conn: &Connection,
     settings: &AppSettings,
 ) -> Option<crate::wealth::CachedWealthBook> {
-    if crate::broker::busha_connected() {
+    if crate::broker::crypto_mode() {
         return crate::busha::load_snapshot(conn).ok().flatten();
     }
     if settings.selected_broker == "bamboo" {
@@ -360,7 +360,7 @@ fn cached_live_book(
 
 fn get_account_snapshot(conn: &Connection, settings: &AppSettings) -> Result<Value> {
     let cash = sandbox_cash(conn);
-    let broker = if crate::broker::busha_connected() {
+    let broker = if crate::broker::crypto_mode() {
         "busha".to_string()
     } else {
         settings.selected_broker.clone()
@@ -401,6 +401,7 @@ fn get_account_snapshot(conn: &Connection, settings: &AppSettings) -> Result<Val
         "bambooMinNotional": BAMBOO_MIN_ORDER_NOTIONAL,
         "minOrderNotional": min_n,
         "assetClass": crate::broker::asset_class().as_str(),
+        "cryptoSession": crate::broker::crypto_session().as_str(),
         "asOf": chrono::Utc::now().to_rfc3339(),
     }))
 }
@@ -504,7 +505,7 @@ fn list_universe_quotes(conn: &Connection, limit: i64) -> Result<Value> {
 }
 
 fn get_symbol_quote(conn: &Connection, symbol: &str) -> Result<Value> {
-    let venue = if crate::broker::busha_connected() {
+    let venue = if crate::broker::crypto_mode() {
         "busha"
     } else {
         "sandbox"
@@ -530,7 +531,7 @@ fn get_symbol_quote(conn: &Connection, symbol: &str) -> Result<Value> {
 }
 
 fn get_price_history(conn: &Connection, symbol: &str, days: i64) -> Result<Value> {
-    let venue = if crate::broker::busha_connected() {
+    let venue = if crate::broker::crypto_mode() {
         "busha"
     } else {
         "sandbox"
@@ -633,7 +634,7 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
         return Ok(json!({ "ok": false, "error": "symbol is required" }));
     };
     if !crate::broker::is_valid_trade_symbol(
-        if crate::broker::busha_connected() {
+        if crate::broker::crypto_mode() {
             "busha"
         } else {
             "sandbox"
@@ -675,7 +676,7 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
     let est_qty = qty.unwrap_or_else(|| {
         notional
             .map(|n| {
-                if crate::broker::busha_connected() {
+                if crate::broker::crypto_mode() {
                     n / price
                 } else {
                     (n / price).floor()
@@ -684,7 +685,7 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
             .unwrap_or(0.0)
     });
     let est_notional = notional.unwrap_or(est_qty * price);
-    let min_n = crate::execution::min_order_notional_for_venue(if crate::broker::busha_connected() {
+    let min_n = crate::execution::min_order_notional_for_venue(if crate::broker::crypto_mode() {
         "busha"
     } else {
         &settings.selected_broker

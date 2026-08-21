@@ -79,15 +79,72 @@ impl AssetClass {
     }
 }
 
+/// Soft session for Busha: expiry must not silently demote the app to NGX sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CryptoSession {
+    /// Fresh JWT — live Busha trading allowed.
+    Connected,
+    /// Cred still stored but JWT expired / marked dead — crypto UI, reconnect required.
+    ExpiredNeedsReconnect,
+    /// User disconnected or never connected.
+    Disconnected,
+}
+
+impl CryptoSession {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::ExpiredNeedsReconnect => "expiredNeedsReconnect",
+            Self::Disconnected => "disconnected",
+        }
+    }
+
+    pub fn is_crypto_mode(self) -> bool {
+        !matches!(self, Self::Disconnected)
+    }
+
+    pub fn can_trade(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+}
+
+/// Derive crypto session from Auth Bridge Busha credential freshness.
+pub fn crypto_session() -> CryptoSession {
+    match crate::auth_bridge::store::get("busha") {
+        Ok(Some(cred))
+            if crate::secrets::token_is_fresh(
+                cred.expires_at,
+                crate::secrets::TOKEN_EXPIRY_SKEW_SECS,
+            ) =>
+        {
+            CryptoSession::Connected
+        }
+        Ok(Some(_)) => CryptoSession::ExpiredNeedsReconnect,
+        _ => CryptoSession::Disconnected,
+    }
+}
+
+fn busha_token_fresh() -> bool {
+    matches!(crypto_session(), CryptoSession::Connected)
+}
+
+/// Fresh Busha JWT present — live HTTP / order routing allowed.
 pub fn busha_connected() -> bool {
-    crate::auth_bridge::get_token("busha")
-        .ok()
-        .flatten()
-        .is_some()
+    busha_token_fresh()
+}
+
+/// Crypto product mode (connected or soft-expired). Used for asset class / 24h market gates.
+pub fn crypto_mode() -> bool {
+    crypto_session().is_crypto_mode()
+}
+
+pub fn crypto_reconnect_required() -> bool {
+    matches!(crypto_session(), CryptoSession::ExpiredNeedsReconnect)
 }
 
 pub fn asset_class() -> AssetClass {
-    if busha_connected() {
+    if crypto_mode() {
         AssetClass::Crypto
     } else {
         AssetClass::Stocks
@@ -203,14 +260,16 @@ pub fn catalog(settings: &AppSettings) -> Vec<BrokerListItem> {
 
 /// Which live broker would be opened (does not construct HTTP clients).
 pub fn live_broker_id(settings: &AppSettings) -> Option<BrokerId> {
-    if busha_connected() {
-        return Some(BrokerId::Busha);
-    }
-    match BrokerId::parse(&settings.selected_broker) {
-        BrokerId::Wealth if settings.wealth_connected => Some(BrokerId::Wealth),
-        BrokerId::Bamboo if settings.bamboo_connected => Some(BrokerId::Bamboo),
-        BrokerId::Busha => None,
-        _ => None,
+    match crypto_session() {
+        CryptoSession::Connected => Some(BrokerId::Busha),
+        // Soft-expired: stay in crypto mode, but do not open NGX brokers underneath.
+        CryptoSession::ExpiredNeedsReconnect => None,
+        CryptoSession::Disconnected => match BrokerId::parse(&settings.selected_broker) {
+            BrokerId::Wealth if settings.wealth_connected => Some(BrokerId::Wealth),
+            BrokerId::Bamboo if settings.bamboo_connected => Some(BrokerId::Bamboo),
+            BrokerId::Busha => None,
+            _ => None,
+        },
     }
 }
 
@@ -587,9 +646,41 @@ mod tests {
         .unwrap();
         assert_eq!(live_broker_id(&settings), Some(BrokerId::Busha));
         assert_eq!(asset_class(), AssetClass::Crypto);
+        assert_eq!(crypto_session(), CryptoSession::Connected);
         let _ = crate::auth_bridge::store::delete("busha");
         assert_eq!(live_broker_id(&settings), Some(BrokerId::Bamboo));
         assert_eq!(asset_class(), AssetClass::Stocks);
+    }
+
+    #[test]
+    fn busha_soft_expired_keeps_crypto_blocks_ngx_and_live() {
+        let _ = crate::auth_bridge::store::delete("busha");
+        let mut settings = AppSettings::default();
+        settings.selected_broker = "bamboo".into();
+        settings.bamboo_connected = true;
+        crate::auth_bridge::store::put(
+            "busha",
+            &crate::auth_bridge::store::StoredCredential {
+                kind: "header".into(),
+                header_name: "authorization".into(),
+                token: "stale-token".into(),
+                expires_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+                account_hint: Some("user".into()),
+                profile_id: Some("prof_test".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(crypto_session(), CryptoSession::ExpiredNeedsReconnect);
+        assert!(crypto_mode());
+        assert!(crypto_reconnect_required());
+        assert!(!busha_connected());
+        assert_eq!(asset_class(), AssetClass::Crypto);
+        assert_eq!(live_broker_id(&settings), None);
+        assert!(open_live_broker(&settings).is_none());
+        let _ = crate::auth_bridge::store::delete("busha");
+        assert_eq!(crypto_session(), CryptoSession::Disconnected);
+        assert_eq!(asset_class(), AssetClass::Stocks);
+        assert_eq!(live_broker_id(&settings), Some(BrokerId::Bamboo));
     }
 
     #[test]

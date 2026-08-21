@@ -90,7 +90,14 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
             }
 
             let calendar = TradingCalendar::default();
-            if !crate::broker::busha_connected()
+            if crate::broker::crypto_reconnect_required() {
+                tracing::info!(
+                    target: "scheduler",
+                    "auto cycle skipped — Busha session expired, reconnect required"
+                );
+                continue;
+            }
+            if !crate::broker::crypto_mode()
                 && !crate::runtime_util::market_activity_allowed(&calendar)
             {
                 continue;

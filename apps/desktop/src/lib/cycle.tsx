@@ -100,6 +100,7 @@ export function CycleProvider({ children }: { children: ReactNode }) {
             toast.info(
               `${label} detected for ${names} (signal saved; live fill needs authorization).`,
               'Risk exit',
+              { sound: true },
             );
           }
         });

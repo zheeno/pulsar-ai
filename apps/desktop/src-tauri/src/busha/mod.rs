@@ -187,8 +187,8 @@ impl BushaClient {
 
     async fn read_json(&self, response: reqwest::Response) -> Result<Value> {
         let status = response.status();
-        if status.as_u16() == 401 {
-            let _ = crate::auth_bridge::session::revoke("busha");
+            if status.as_u16() == 401 {
+            let _ = crate::auth_bridge::session::mark_expired("busha");
             return Err(anyhow!("Busha session expired. Sign in again."));
         }
         let text = response.text().await.unwrap_or_default();

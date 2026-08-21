@@ -34,5 +34,6 @@
     }
   },
   "timeoutMs": 300000,
-  "fallbackTtlSecs": 1800
+  "fallbackTtlSecs": 1800,
+  "renewUrl": "https://app.busha.io/"
 }

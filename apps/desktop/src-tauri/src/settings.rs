@@ -57,6 +57,9 @@ pub struct AppSettings {
     /// Derived: `stocks` or `crypto`. Not persisted.
     #[serde(default, skip_deserializing)]
     pub asset_class: String,
+    /// Derived: Busha crypto session soft-state. Not persisted.
+    #[serde(default, skip_deserializing)]
+    pub crypto_session: String,
 }
 
 impl Default for AppSettings {
@@ -91,6 +94,7 @@ impl Default for AppSettings {
             flatten_on_drawdown_armed: false,
             launch_at_login: false,
             asset_class: "stocks".into(),
+            crypto_session: "disconnected".into(),
         }
     }
 }
@@ -156,6 +160,7 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
         }
     }
     settings.asset_class = crate::broker::asset_class().as_str().into();
+    settings.crypto_session = crate::broker::crypto_session().as_str().into();
     Ok(settings)
 }
 

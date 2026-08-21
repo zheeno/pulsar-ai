@@ -80,7 +80,14 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
     }
 
     let calendar = TradingCalendar::default();
-    let crypto_mode = crate::broker::busha_connected();
+    let crypto_mode = crate::broker::crypto_mode();
+    if crate::broker::crypto_reconnect_required() {
+        tracing::info!(
+            target: "risk_monitor",
+            "skipped — Busha session expired, reconnect required"
+        );
+        return Ok(None);
+    }
     if !crypto_mode && !crate::runtime_util::market_activity_allowed(&calendar) {
         return Ok(None);
     }

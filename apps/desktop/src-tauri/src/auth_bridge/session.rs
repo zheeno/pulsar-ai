@@ -6,6 +6,10 @@ use super::config::BrokerAuthConfig;
 use super::store::{self, StoredCredential};
 
 pub const EXPIRED_EVENT: &str = "auth-bridge:expired";
+pub const EXPIRING_EVENT: &str = "auth-bridge:expiring";
+
+/// Lead time before JWT `exp` to start a silent renew attempt.
+pub const RENEWAL_LEAD_SECS: i64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +114,17 @@ pub fn get_token(broker_id: &str) -> anyhow::Result<Option<String>> {
 pub fn revoke(broker_id: &str) -> anyhow::Result<()> {
     store::delete(broker_id)?;
     tracing::info!(target: "auth_bridge", broker = %broker_id, "session revoked");
+    Ok(())
+}
+
+/// Soft-expire: keep the record so crypto mode stays preferred, but block live JWT use.
+pub fn mark_expired(broker_id: &str) -> anyhow::Result<()> {
+    let Some(mut cred) = store::get(broker_id)? else {
+        return Ok(());
+    };
+    cred.expires_at = Utc::now() - chrono::Duration::seconds(1);
+    store::put(broker_id, &cred)?;
+    tracing::info!(target: "auth_bridge", broker = %broker_id, "session soft-expired");
     Ok(())
 }
 

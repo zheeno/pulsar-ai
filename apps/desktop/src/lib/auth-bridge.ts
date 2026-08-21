@@ -21,6 +21,11 @@ export type AuthExpiredEvent = {
   brokerId: string;
 };
 
+export type AuthExpiringEvent = {
+  brokerId: string;
+  expiresAt: string;
+};
+
 function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
@@ -52,6 +57,17 @@ export async function onExpired(
     return () => undefined;
   }
   return listen<AuthExpiredEvent>('auth-bridge:expired', (event) => {
+    callback(event.payload);
+  });
+}
+
+export async function onExpiring(
+  callback: (event: AuthExpiringEvent) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri()) {
+    return () => undefined;
+  }
+  return listen<AuthExpiringEvent>('auth-bridge:expiring', (event) => {
     callback(event.payload);
   });
 }

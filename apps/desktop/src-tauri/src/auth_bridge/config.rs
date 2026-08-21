@@ -17,6 +17,9 @@ pub struct BrokerAuthConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_fallback_ttl")]
     pub fallback_ttl_secs: u64,
+    /// Optional URL for silent renew (already-logged-in app shell). Falls back to `login_url`.
+    #[serde(default)]
+    pub renew_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

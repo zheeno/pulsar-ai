@@ -14,10 +14,16 @@ import {
   authenticate as authBridgeAuthenticate,
   listSessions,
   onExpired,
+  onExpiring,
   revoke as authBridgeRevoke,
   type AuthSessionStatus,
 } from '../lib/auth-bridge';
 import { formatNaira } from '../lib/format';
+import {
+  notificationSoundsEnabled,
+  playNotificationSound,
+  setNotificationSoundsEnabled,
+} from '../lib/notify-sound';
 import { useSession } from '../lib/session';
 import { useToast } from '../lib/toast';
 
@@ -268,6 +274,7 @@ export default function SettingsPage() {
   const maxActionsId = useId();
   const maxNotionalId = useId();
   const retainLogsId = useId();
+  const soundsId = useId();
   const firstFieldRef = useRef<HTMLSelectElement>(null);
 
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -316,6 +323,13 @@ export default function SettingsPage() {
   const [resetBusy, setResetBusy] = useState(false);
   const [authBridgeAccounts, setAuthBridgeAccounts] = useState<AuthSessionStatus[]>([]);
   const [authBridgeBusy, setAuthBridgeBusy] = useState<string | null>(null);
+  const [notificationSounds, setNotificationSounds] = useState(() => notificationSoundsEnabled());
+  const [bushaCash, setBushaCash] = useState<number | null>(null);
+  const [confirmKind, setConfirmKind] = useState<'logout' | 'busha' | 'wealth' | 'bamboo' | null>(
+    null,
+  );
+  const confirmTitleId = useId();
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   async function refresh() {
     const [s, llm, strategy] = await Promise.all([
@@ -389,6 +403,21 @@ export default function SettingsPage() {
         message: 'Broker status unavailable.',
       });
     }
+    if (s.assetClass === 'crypto' || s.cryptoSession === 'expiredNeedsReconnect') {
+      try {
+        const book = await api<{
+          portfolio?: { cash_balance?: number };
+          total_equity?: number;
+        }>('portfolio_default');
+        setBushaCash(
+          book.portfolio?.cash_balance != null ? Number(book.portfolio.cash_balance) : null,
+        );
+      } catch {
+        setBushaCash(null);
+      }
+    } else {
+      setBushaCash(null);
+    }
   }
 
   useEffect(() => {
@@ -396,17 +425,35 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenExpired: (() => void) | undefined;
+    let unlistenExpiring: (() => void) | undefined;
     void onExpired((event) => {
-      toast.info(`${event.brokerId} session expired. Sign in again to continue.`, 'Live broker');
+      toast.warning(
+        `${event.brokerId === 'busha' ? 'Busha' : event.brokerId} session expired. Reconnect to resume trading — crypto mode stays on.`,
+        'Live broker',
+      );
+      void listSessions()
+        .then(setAuthBridgeAccounts)
+        .catch(() => {});
+      void refresh().catch(() => {});
+    }).then((fn) => {
+      unlistenExpired = fn;
+    });
+    void onExpiring((event) => {
+      if (event.brokerId === 'busha') {
+        toast.info('Busha session is expiring — renewing in the background.', 'Live broker', {
+          sound: true,
+        });
+      }
       void listSessions()
         .then(setAuthBridgeAccounts)
         .catch(() => {});
     }).then((fn) => {
-      unlisten = fn;
+      unlistenExpiring = fn;
     });
     return () => {
-      unlisten?.();
+      unlistenExpired?.();
+      unlistenExpiring?.();
     };
   }, [toast]);
 
@@ -510,6 +557,15 @@ export default function SettingsPage() {
     return () => window.removeEventListener('keydown', onKey);
   }, [brokerModalOpen, wealthBusy]);
 
+  useEffect(() => {
+    if (!confirmKind) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape' && !confirmBusy) closeConfirmModal();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [confirmKind, confirmBusy]);
+
   function closeBrokerModal() {
     if (wealthBusy) return;
     setBrokerModalOpen(false);
@@ -565,6 +621,7 @@ export default function SettingsPage() {
         return [...rest, session];
       });
       toast.success(`${session.displayName} connected.`, 'Live broker');
+      await refresh().catch(() => {});
     } catch (err) {
       toast.error(String(err), 'Could not connect');
     } finally {
@@ -579,13 +636,100 @@ export default function SettingsPage() {
       setAuthBridgeAccounts((prev) =>
         prev.map((a) => (a.brokerId === session.brokerId ? session : a)),
       );
-      toast.success('Busha disconnected.', 'Live broker');
+      toast.success('Busha disconnected. NGX brokers are available again.', 'Live broker');
+      await refresh().catch(() => {});
     } catch (err) {
       toast.error(String(err), 'Could not disconnect');
     } finally {
       setAuthBridgeBusy(null);
     }
   }
+
+  async function disconnectNgxBroker() {
+    setWealthBusy(true);
+    try {
+      if (selectedBroker === 'bamboo') {
+        await api('bamboo_logout');
+        setBambooPassword('');
+        setBambooPin('');
+        toast.success('Bamboo account disconnected. Sandbox mode restored.', 'Bamboo');
+      } else {
+        await api('wealth_logout');
+        setWealthTempToken(null);
+        setWealthPassword('');
+        setWealth2fa('');
+        toast.success('Wealth account disconnected. Sandbox mode restored.', 'Wealth');
+      }
+      await refresh();
+    } catch (e) {
+      toast.error(
+        String(e),
+        selectedBroker === 'bamboo' ? 'Bamboo logout failed' : 'Wealth logout failed',
+      );
+    } finally {
+      setWealthBusy(false);
+    }
+  }
+
+  function closeConfirmModal() {
+    if (confirmBusy) return;
+    setConfirmKind(null);
+  }
+
+  async function runConfirmedAction() {
+    if (!confirmKind || confirmBusy) return;
+    setConfirmBusy(true);
+    try {
+      if (confirmKind === 'logout') {
+        setBusy(true);
+        toast.info('Logging out…');
+        try {
+          await logout();
+        } catch (e) {
+          toast.error(String(e), 'Logout failed');
+          setBusy(false);
+        }
+      } else if (confirmKind === 'busha') {
+        await disconnectAuthBridge('busha');
+      } else {
+        await disconnectNgxBroker();
+      }
+      setConfirmKind(null);
+    } finally {
+      setConfirmBusy(false);
+    }
+  }
+
+  const confirmCopy =
+    confirmKind === 'logout'
+      ? {
+          title: 'Log out of Pulsar?',
+          body: 'This ends your NGX Pulse session and returns you to onboarding. Local portfolio data stays on this device.',
+          confirmLabel: 'Log out',
+          danger: true,
+        }
+      : confirmKind === 'busha'
+        ? {
+            title: 'Disconnect Busha?',
+            body: 'Live crypto trading stops and the app leaves crypto mode. NGX brokers (Wealth / Bamboo) become available again.',
+            confirmLabel: 'Disconnect Busha',
+            danger: false,
+          }
+        : confirmKind === 'bamboo'
+          ? {
+              title: 'Disconnect Bamboo?',
+              body: 'Live Bamboo orders stop and Pulsar returns to sandbox for NGX until you reconnect a broker.',
+              confirmLabel: 'Disconnect Bamboo',
+              danger: false,
+            }
+          : confirmKind === 'wealth'
+            ? {
+                title: 'Disconnect Coronation Wealth?',
+                body: 'Live Wealth orders stop and Pulsar returns to sandbox for NGX until you reconnect a broker.',
+                confirmLabel: 'Disconnect Wealth',
+                danger: false,
+              }
+            : null;
 
   async function saveAutoCycle() {
     if (!settings) return;
@@ -663,10 +807,40 @@ export default function SettingsPage() {
       status: 'disconnected' as const,
     };
   const bushaConnected = bushaAccount.status === 'connected';
-  const cryptoMode = bushaConnected || settings?.assetClass === 'crypto';
+  const bushaExpired =
+    bushaAccount.status === 'expired'
+    || settings?.cryptoSession === 'expiredNeedsReconnect';
+  const cryptoMode =
+    bushaConnected
+    || bushaExpired
+    || settings?.assetClass === 'crypto'
+    || settings?.cryptoSession === 'expiredNeedsReconnect';
 
   return (
     <div className="page">
+      {bushaExpired ? (
+        <div className="banner banner-warn" role="status" style={{ marginBottom: 16 }}>
+          Busha session expired. Live crypto trading is paused — you are still in crypto mode (not NGX sandbox).
+          <button
+            type="button"
+            className="btn btn-primary"
+            style={{ marginLeft: 12 }}
+            disabled={authBridgeBusy === 'busha'}
+            onClick={() => void connectAuthBridge('busha')}
+          >
+            {authBridgeBusy === 'busha' ? 'Reconnecting…' : 'Reconnect Busha'}
+          </button>
+          <button
+            type="button"
+            className="btn"
+            style={{ marginLeft: 8 }}
+            disabled={authBridgeBusy === 'busha'}
+            onClick={() => setConfirmKind('busha')}
+          >
+            Leave crypto
+          </button>
+        </div>
+      ) : null}
       <header className="page-header">
         <div>
           <h1>Settings</h1>
@@ -742,18 +916,7 @@ export default function SettingsPage() {
             type="button"
             className="btn btn-danger"
             disabled={busy}
-            onClick={() => {
-              void (async () => {
-                setBusy(true);
-                toast.info('Logging out…');
-                try {
-                  await logout();
-                } catch (e) {
-                  toast.error(String(e), 'Logout failed');
-                  setBusy(false);
-                }
-              })();
-            }}
+            onClick={() => setConfirmKind('logout')}
           >
             {busy ? <IconSpinner /> : <IconLogout />}
             Log out
@@ -771,7 +934,7 @@ export default function SettingsPage() {
         <div className="broker-grid">
           <div role="radiogroup" aria-labelledby="broker-heading" className="broker-grid__ngx">
           {(brokers.length ? brokers : DEFAULT_BROKERS).map((b) => {
-            const selected = selectedBroker === b.id;
+            const selected = !cryptoMode && selectedBroker === b.id;
             return (
               <button
                 key={b.id}
@@ -779,7 +942,12 @@ export default function SettingsPage() {
                 role="radio"
                 aria-checked={selected}
                 className={`broker-card${selected ? ' is-selected' : ''}`}
-                disabled={wealthBusy}
+                disabled={wealthBusy || cryptoMode}
+                title={
+                  cryptoMode
+                    ? 'Disconnect Busha to use NGX brokers'
+                    : undefined
+                }
                 onClick={() => void selectBroker(b.id)}
               >
                 {BROKER_LOGOS[b.id] ? (
@@ -799,15 +967,18 @@ export default function SettingsPage() {
           </div>
           <button
             type="button"
-            className={`broker-card${bushaConnected ? ' is-selected' : ''}`}
-            aria-pressed={bushaConnected}
-            title={bushaConnected ? 'Disconnect Busha' : 'Connect Busha'}
+            className={`broker-card${bushaConnected || bushaExpired ? ' is-selected' : ''}`}
+            aria-pressed={bushaConnected || bushaExpired}
+            title={
+              bushaConnected
+                ? 'Busha is the active live venue — see account details below'
+                : bushaExpired
+                  ? 'Reconnect Busha'
+                  : 'Connect Busha'
+            }
             disabled={authBridgeBusy === 'busha'}
             onClick={() => {
-              if (bushaConnected) {
-                void disconnectAuthBridge('busha');
-                return;
-              }
+              if (bushaConnected) return;
               void connectAuthBridge('busha');
             }}
           >
@@ -818,13 +989,85 @@ export default function SettingsPage() {
                 ? 'Connecting'
                 : bushaConnected
                   ? 'Connected'
-                  : bushaAccount.status === 'expired'
-                    ? 'Expired'
+                  : bushaExpired
+                    ? 'Expired · Reconnect'
                     : 'Crypto · NGN'}
             </span>
           </button>
         </div>
       </section>
+
+      {cryptoMode ? (
+      <section className="panel" aria-labelledby="busha-heading" style={{ marginTop: 20 }}>
+        <h2 id="busha-heading">Busha</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
+          Cash and crypto lots come from Busha in NGN. Cycles place live transfers when live trading is on.
+          Disconnect to leave crypto mode and restore NGX brokers.
+        </p>
+        {bushaExpired ? (
+          <div className="banner banner-warn" style={{ marginBottom: 12 }} role="status">
+            Session expired. Live crypto trading is paused until you reconnect.
+          </div>
+        ) : null}
+        <div className="profile-card__badges" style={{ marginBottom: 12 }}>
+          <span className={`status-pill ${bushaConnected ? 'status-pill--ok' : 'status-pill--warn'}`}>
+            <span className={`live-dot ${bushaConnected ? '' : 'live-dot--off'}`} aria-hidden />
+            {bushaConnected ? 'Connected' : 'Expired · reconnect'}
+          </span>
+          <span className="status-pill status-pill--muted">Crypto · NGN</span>
+          {liveTradingEnabled ? (
+            <span className="status-pill status-pill--ok">Live trading on</span>
+          ) : (
+            <span className="status-pill status-pill--muted">Live trading off</span>
+          )}
+        </div>
+        <dl className="profile-meta">
+          <div className="profile-meta__item">
+            <dt>Account</dt>
+            <dd>{bushaAccount.accountHint || '—'}</dd>
+          </div>
+          <div className="profile-meta__item">
+            <dt>NGN cash</dt>
+            <dd className="mono">{bushaCash != null ? formatNaira(bushaCash) : '—'}</dd>
+          </div>
+          <div className="profile-meta__item">
+            <dt>Session expires</dt>
+            <dd className="mono">
+              {bushaAccount.expiresAt
+                ? new Date(bushaAccount.expiresAt).toLocaleString(undefined, {
+                    month: 'short',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })
+                : '—'}
+            </dd>
+          </div>
+        </dl>
+        <div className="btn-row" style={{ marginTop: 16 }}>
+          {bushaExpired ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={authBridgeBusy === 'busha'}
+              onClick={() => void connectAuthBridge('busha')}
+            >
+              {authBridgeBusy === 'busha' ? <IconSpinner /> : null}
+              {authBridgeBusy === 'busha' ? 'Reconnecting…' : 'Reconnect Busha'}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="btn btn-secondary"
+            disabled={authBridgeBusy === 'busha'}
+            onClick={() => setConfirmKind('busha')}
+          >
+            {authBridgeBusy === 'busha' ? <IconSpinner /> : null}
+            Disconnect Busha
+          </button>
+        </div>
+      </section>
+      ) : null}
 
       {!cryptoMode && (wealth?.connected || brokerIsConnected(selectedBroker, settings)) ? (
       <section className="panel" aria-labelledby="wealth-heading" style={{ marginTop: 20 }}>
@@ -889,30 +1132,7 @@ export default function SettingsPage() {
             type="button"
             className="btn btn-secondary"
             disabled={wealthBusy}
-            onClick={() => {
-              void (async () => {
-                setWealthBusy(true);
-                try {
-                  if (selectedBroker === 'bamboo') {
-                    await api('bamboo_logout');
-                    setBambooPassword('');
-                    setBambooPin('');
-                    toast.success('Bamboo account disconnected. Sandbox mode restored.', 'Bamboo');
-                  } else {
-                    await api('wealth_logout');
-                    setWealthTempToken(null);
-                    setWealthPassword('');
-                    setWealth2fa('');
-                    toast.success('Wealth account disconnected. Sandbox mode restored.', 'Wealth');
-                  }
-                  await refresh();
-                } catch (e) {
-                  toast.error(String(e), selectedBroker === 'bamboo' ? 'Bamboo logout failed' : 'Wealth logout failed');
-                } finally {
-                  setWealthBusy(false);
-                }
-              })();
-            }}
+            onClick={() => setConfirmKind(selectedBroker === 'bamboo' ? 'bamboo' : 'wealth')}
           >
             {wealthBusy ? <IconSpinner /> : null}
             Disconnect {selectedBroker === 'bamboo' ? 'Bamboo' : 'Wealth'}
@@ -1040,6 +1260,31 @@ export default function SettingsPage() {
           (stop-loss / take-profit / time-stop). Auto-cycle off with live trading on still submits those
           protective sells while the app remains open; it only stops timed ingest → signal cycles.
         </p>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
+            <label className="toggle-row__label" htmlFor={soundsId}>Notification sounds</label>
+            <p className="toggle-row__hint">
+              Play a short cue when cycles finish, risk exits fire, errors occur, or Busha needs reconnect.
+              Progress chatter (Saving…) stays silent.
+            </p>
+          </div>
+          <button
+            id={soundsId}
+            type="button"
+            role="switch"
+            aria-checked={notificationSounds}
+            className={`toggle ${notificationSounds ? 'is-on' : ''}`}
+            onClick={() => {
+              const next = !notificationSounds;
+              setNotificationSounds(next);
+              setNotificationSoundsEnabled(next);
+              if (next) playNotificationSound('success');
+            }}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
 
         <div className="toggle-row">
           <div className="toggle-row__copy">
@@ -1678,6 +1923,60 @@ export default function SettingsPage() {
           </div>
         </div>
       )}
+
+      {confirmKind && confirmCopy ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) closeConfirmModal();
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={confirmTitleId}
+          >
+            <div className="modal__header">
+              <div>
+                <h2 id={confirmTitleId}>{confirmCopy.title}</h2>
+                <p className="muted" style={{ margin: '6px 0 0', fontSize: 13, lineHeight: 1.45 }}>
+                  {confirmCopy.body}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal__close"
+                aria-label="Close"
+                onClick={closeConfirmModal}
+                disabled={confirmBusy}
+              >
+                ×
+              </button>
+            </div>
+            <div className="btn-row">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={confirmBusy}
+                onClick={closeConfirmModal}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={confirmCopy.danger ? 'btn btn-danger' : 'btn btn-primary'}
+                disabled={confirmBusy}
+                onClick={() => void runConfirmedAction()}
+              >
+                {confirmBusy ? <IconSpinner /> : null}
+                {confirmBusy ? 'Working…' : confirmCopy.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

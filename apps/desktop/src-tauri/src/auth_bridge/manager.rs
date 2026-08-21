@@ -4,14 +4,16 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Runtime, Url, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, Runtime, Url, WebviewWindow};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::capture::{self, digest};
 use super::config::{self, origin_allowed, BrokerAuthConfig};
 use super::probe;
-use super::session::{self, AuthSessionStatus, SessionStatusKind, EXPIRED_EVENT};
+use super::session::{
+    self, AuthSessionStatus, SessionStatusKind, EXPIRED_EVENT, EXPIRING_EVENT, RENEWAL_LEAD_SECS,
+};
 use super::window as auth_window;
 
 #[derive(Clone)]
@@ -42,6 +44,35 @@ pub enum FinishReason {
 #[serde(rename_all = "camelCase")]
 struct ExpiredPayload {
     broker_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpiringPayload {
+    broker_id: String,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Debounce expired/expiring emits per broker + expiry timestamp.
+fn event_dedupe() -> &'static Mutex<HashMap<String, String>> {
+    static DEDUPE: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    DEDUPE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn should_emit(kind: &str, broker_id: &str, epoch: &str) -> bool {
+    let key = format!("{kind}:{broker_id}");
+    let mut m = event_dedupe().lock();
+    if m.get(&key).map(|s| s.as_str()) == Some(epoch) {
+        return false;
+    }
+    m.insert(key, epoch.to_string());
+    true
+}
+
+pub fn clear_event_dedupe(broker_id: &str) {
+    let mut m = event_dedupe().lock();
+    m.remove(&format!("expired:{broker_id}"));
+    m.remove(&format!("expiring:{broker_id}"));
 }
 
 impl AuthBridge {
@@ -89,6 +120,12 @@ impl AuthBridge {
         let config = config::get(broker_id).map_err(|e| e.to_string())?;
         self.cancel_inflight(app, &config.id);
 
+        let prefer_renew = config.id == "busha"
+            && crate::auth_bridge::store::get(&config.id)
+                .ok()
+                .flatten()
+                .is_some();
+
         let session_nonce = Uuid::new_v4().to_string();
         let window_label = format!("auth-bridge-{}-{}", config.id, &session_nonce[..8]);
         let (tx, rx) = oneshot::channel();
@@ -109,9 +146,14 @@ impl AuthBridge {
             );
         }
 
-        if let Err(e) =
-            auth_window::spawn_auth_window(app, self, &config, &session_nonce, &window_label)
-        {
+        if let Err(e) = auth_window::spawn_auth_window(
+            app,
+            self,
+            &config,
+            &session_nonce,
+            &window_label,
+            prefer_renew,
+        ) {
             self.cancel_inflight(app, &config.id);
             return Err(e);
         }
@@ -119,6 +161,7 @@ impl AuthBridge {
         tracing::info!(
             target: "auth_bridge",
             broker = %config.id,
+            prefer_renew,
             "auth window opened"
         );
 
@@ -230,6 +273,7 @@ impl AuthBridge {
         )
         .map_err(|e| e.to_string())?;
 
+        clear_event_dedupe(&config.id);
         self.complete_captured(app, &config.id, status.clone());
         Ok(())
     }
@@ -280,39 +324,112 @@ pub fn start_expiry_watcher<R: Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            sweep_expired(&app);
+            sweep_sessions(&app);
         }
     });
 }
 
-#[allow(dead_code)]
+/// Soft-expire Busha on 401; hard-revoke other brokers. Emits `auth-bridge:expired`.
 pub fn notify_unauthorized<R: Runtime>(app: &AppHandle<R>, broker_id: &str) {
-    let _ = session::revoke(broker_id);
-    let _ = app.emit(
-        EXPIRED_EVENT,
-        ExpiredPayload {
-            broker_id: broker_id.to_string(),
-        },
-    );
+    if broker_id == "busha" {
+        let _ = session::mark_expired(broker_id);
+    } else {
+        let _ = session::revoke(broker_id);
+    }
+    let epoch = chrono::Utc::now().to_rfc3339();
+    if should_emit("expired", broker_id, &epoch) {
+        let _ = app.emit(
+            EXPIRED_EVENT,
+            ExpiredPayload {
+                broker_id: broker_id.to_string(),
+            },
+        );
+    }
     tracing::info!(target: "auth_bridge", broker = %broker_id, "session unauthorized");
 }
 
-fn sweep_expired<R: Runtime>(app: &AppHandle<R>) {
+fn sweep_sessions<R: Runtime>(app: &AppHandle<R>) {
     let Ok(cfgs) = config::builtin_configs() else {
         return;
     };
     for cfg in cfgs {
         let status = session::status_for(&cfg);
-        if status.status == SessionStatusKind::Expired {
-            let _ = session::revoke(&cfg.id);
-            let _ = app.emit(
-                EXPIRED_EVENT,
-                ExpiredPayload {
-                    broker_id: cfg.id,
-                },
-            );
+        match status.status {
+            SessionStatusKind::Expired => {
+                let epoch = status
+                    .expires_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "expired".into());
+                // Soft-expired Busha: keep credential so crypto mode does not flip to stocks.
+                if cfg.id != "busha" {
+                    let _ = session::revoke(&cfg.id);
+                }
+                if should_emit("expired", &cfg.id, &epoch) {
+                    let _ = app.emit(
+                        EXPIRED_EVENT,
+                        ExpiredPayload {
+                            broker_id: cfg.id.clone(),
+                        },
+                    );
+                }
+            }
+            SessionStatusKind::Connected => {
+                let Some(expires_at) = status.expires_at else {
+                    continue;
+                };
+                let remaining = (expires_at - chrono::Utc::now()).num_seconds();
+                if remaining > RENEWAL_LEAD_SECS {
+                    continue;
+                }
+                let epoch = expires_at.to_rfc3339();
+                if should_emit("expiring", &cfg.id, &epoch) {
+                    let _ = app.emit(
+                        EXPIRING_EVENT,
+                        ExpiringPayload {
+                            broker_id: cfg.id.clone(),
+                            expires_at,
+                        },
+                    );
+                    if cfg.id == "busha" {
+                        spawn_proactive_reauth(app, &cfg.id);
+                    }
+                }
+            }
+            _ => {}
         }
     }
+}
+
+fn spawn_proactive_reauth<R: Runtime>(app: &AppHandle<R>, broker_id: &str) {
+    let Some(state) = app.try_state::<AuthBridge>() else {
+        return;
+    };
+    if state.is_awaiting(broker_id) {
+        return;
+    }
+    let app = app.clone();
+    let bridge = state.inner().clone();
+    let broker_id = broker_id.to_string();
+    tracing::info!(
+        target: "auth_bridge",
+        broker = %broker_id,
+        "proactive re-auth starting"
+    );
+    tauri::async_runtime::spawn(async move {
+        match bridge.authenticate(&app, &broker_id).await {
+            Ok(_) => tracing::info!(
+                target: "auth_bridge",
+                broker = %broker_id,
+                "proactive re-auth succeeded"
+            ),
+            Err(e) => tracing::warn!(
+                target: "auth_bridge",
+                broker = %broker_id,
+                error = %e,
+                "proactive re-auth failed"
+            ),
+        }
+    });
 }
 
 #[allow(dead_code)]

@@ -72,6 +72,7 @@ function defaultSettings(): Settings {
     flattenOnDrawdownArmed: false,
     launchAtLogin: false,
     assetClass: 'stocks',
+    cryptoSession: 'disconnected',
   };
 }
 
