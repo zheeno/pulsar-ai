@@ -745,8 +745,19 @@ impl ExecutionService {
                 );
                 if result == "APPROVED" && action == "SELL" {
                     let frac = sell_fraction_from_snapshot(&snapshot);
-                    quantity = crate::risk_exits::sell_qty_for_exit(quantity, frac);
+                    quantity = crate::risk_exits::sell_qty_for_exit_ex(
+                        quantity,
+                        frac,
+                        client.id().whole_shares(),
+                    );
                     if client.id().whole_shares() && quantity < 1.0 {
+                        conn.execute(
+                            "UPDATE signals SET risk_policy_result = 'BLOCKED_NO_POSITION' WHERE id = ?1",
+                            [signal_id],
+                        )?;
+                        return Ok(None);
+                    }
+                    if !client.id().whole_shares() && quantity <= 0.0 {
                         conn.execute(
                             "UPDATE signals SET risk_policy_result = 'BLOCKED_NO_POSITION' WHERE id = ?1",
                             [signal_id],
@@ -761,11 +772,25 @@ impl ExecutionService {
                 if result != "APPROVED" || quantity <= 0.0 {
                     return Ok(None);
                 }
-                if action == "SELL" {
+                // Full-lot exits go in one order (stocks + crypto). The 25% equity
+                // throttle only applies to partial / discretionary sells that would
+                // otherwise dump the book across many names without confirmation.
+                let full_lot_exit = action == "SELL"
+                    && sell_fraction_from_snapshot(&snapshot) >= 1.0 - 1e-9;
+                if action == "SELL" && !full_lot_exit {
                     let cap = current_equity * MAX_LIQUIDATION_PCT;
-                    if !allow_bulk_liquidation && *cycle_sell_notional + quantity * broker_quote > cap {
-                        quantity = ((cap - *cycle_sell_notional).max(0.0) / broker_quote).floor();
-                        if quantity < 1.0 {
+                    if !allow_bulk_liquidation
+                        && *cycle_sell_notional + quantity * broker_quote > cap
+                    {
+                        let mut capped =
+                            ((cap - *cycle_sell_notional).max(0.0) / broker_quote).max(0.0);
+                        if client.id().whole_shares() {
+                            capped = capped.floor();
+                        }
+                        quantity = capped;
+                        if (client.id().whole_shares() && quantity < 1.0)
+                            || (!client.id().whole_shares() && quantity <= 0.0)
+                        {
                             anyhow::bail!("Bulk liquidation requires extra confirmation");
                         }
                     }
@@ -959,10 +984,30 @@ impl ExecutionService {
             }
 
             if fee.total_price.max(quantity * broker_quote) > settings.max_live_notional {
-                db.with_conn(|conn| {
-                    intents::mark_terminal(conn, &intent.id, "rejected", None, Some("notional cap"))
-                })?;
-                return Err(anyhow::anyhow!("Live notional exceeds configured cap"));
+                // Full-lot SELLs must still go through in one order so exits are not
+                // rejected / retried in fee-multiplying chunks.
+                let full_lot_exit = action == "SELL"
+                    && sell_fraction_from_snapshot(&snapshot) >= 1.0 - 1e-9;
+                if !full_lot_exit {
+                    db.with_conn(|conn| {
+                        intents::mark_terminal(
+                            conn,
+                            &intent.id,
+                            "rejected",
+                            None,
+                            Some("notional cap"),
+                        )
+                    })?;
+                    return Err(anyhow::anyhow!("Live notional exceeds configured cap"));
+                }
+                tracing::info!(
+                    target: "execution",
+                    symbol = %symbol,
+                    quantity,
+                    notional = fee.total_price.max(quantity * broker_quote),
+                    cap = settings.max_live_notional,
+                    "full-lot SELL exceeds max_live_notional; submitting anyway"
+                );
             }
 
             db.with_conn(|conn| intents::mark_submitted(conn, &intent.id, None))?;
@@ -1111,9 +1156,10 @@ impl ExecutionService {
                 return Ok(false);
             }
             if action == "SELL" {
-                quantity = crate::risk_exits::sell_qty_for_exit(
+                quantity = crate::risk_exits::sell_qty_for_exit_ex(
                     quantity,
                     sell_fraction_from_snapshot(&snapshot),
+                    true,
                 );
                 if quantity < 1.0 {
                     return Ok(false);
@@ -1663,7 +1709,7 @@ pub fn classify_live_execution_error(msg: &str) -> &'static str {
         "BLOCKED_QUOTE_DEVIATION"
     } else if m.contains("drawdown") {
         "BLOCKED_DRAWDOWN"
-    } else if m.contains("notional") || m.contains("bulk liquidation") {
+    } else if m.contains("notional") || m.contains("bulk liquidation") || m.contains("below min") {
         "BLOCKED_NOTIONAL"
     } else if m.contains("transaction pin") {
         "BLOCKED_PIN_MISSING"

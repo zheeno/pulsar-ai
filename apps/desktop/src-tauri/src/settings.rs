@@ -387,9 +387,36 @@ impl AppSettings {
         self.execution_skip(trading_mode, true).is_none()
     }
 
-    /// Live protective exits (stop-loss / take-profit) also require an open market.
+    /// Protective exits (stop-loss / take-profit / time-stop / flatten) execute whenever a
+    /// live broker session is available and the venue is open — they do **not** require the
+    /// "Enable live trading" toggle (that gate is for discretionary cycle BUYs/SELLs only).
+    pub fn risk_exit_execution_skip(
+        &self,
+        trading_mode: TradingMode,
+        live_market_open: bool,
+    ) -> Option<&'static str> {
+        match trading_mode {
+            TradingMode::Sandbox => {
+                // Simulated fills when not in a live broker session.
+                if self.live_trading_enabled {
+                    Some("BLOCKED_BROKER")
+                } else {
+                    None
+                }
+            }
+            TradingMode::Live => {
+                if !live_market_open {
+                    Some("BLOCKED_MARKET_CLOSED")
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Live protective exits require an open market, not the live-trading toggle.
     pub fn should_execute_risk_exits(&self, trading_mode: TradingMode, live_market_open: bool) -> bool {
-        self.execution_skip(trading_mode, live_market_open).is_none()
+        self.risk_exit_execution_skip(trading_mode, live_market_open).is_none()
     }
 
     /// Status to persist when cycle execution was skipped (assumes market open).
@@ -403,7 +430,7 @@ impl AppSettings {
         trading_mode: TradingMode,
         live_market_open: bool,
     ) -> Option<&'static str> {
-        self.execution_skip(trading_mode, live_market_open)
+        self.risk_exit_execution_skip(trading_mode, live_market_open)
     }
 }
 
@@ -512,18 +539,17 @@ mod tests {
         off.live_trading_enabled = false;
         assert!(off.should_execute(TradingMode::Sandbox));
         assert!(!off.should_execute(TradingMode::Live));
+        // Protective exits still run in sandbox (simulated) and live (broker) without the toggle.
         assert!(off.should_execute_risk_exits(TradingMode::Sandbox, false));
-        assert!(!off.should_execute_risk_exits(TradingMode::Live, true));
+        assert!(off.should_execute_risk_exits(TradingMode::Live, true));
+        assert!(!off.should_execute_risk_exits(TradingMode::Live, false));
 
         let on = live_on();
         assert!(!on.should_execute(TradingMode::Sandbox));
         assert!(on.should_execute(TradingMode::Live));
         assert!(on.should_execute_risk_exits(TradingMode::Live, true));
         assert!(!on.should_execute_risk_exits(TradingMode::Live, false));
-        assert_eq!(
-            on.should_execute(TradingMode::Live),
-            on.should_execute_risk_exits(TradingMode::Live, true)
-        );
+        assert!(!on.should_execute_risk_exits(TradingMode::Sandbox, true));
     }
 
     #[test]
@@ -534,13 +560,11 @@ mod tests {
             off.cycle_skip_result(TradingMode::Live),
             Some("BLOCKED_LIVE_DISABLED")
         );
-        assert_eq!(
-            off.risk_exit_skip_result(TradingMode::Live, true),
-            Some("BLOCKED_LIVE_DISABLED")
-        );
+        // Risk exits ignore the live-trading toggle; only market hours can block.
+        assert_eq!(off.risk_exit_skip_result(TradingMode::Live, true), None);
         assert_eq!(
             off.risk_exit_skip_result(TradingMode::Live, false),
-            Some("BLOCKED_LIVE_DISABLED")
+            Some("BLOCKED_MARKET_CLOSED")
         );
         assert_eq!(off.cycle_skip_result(TradingMode::Sandbox), None);
 

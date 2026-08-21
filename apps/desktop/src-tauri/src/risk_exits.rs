@@ -235,8 +235,14 @@ pub fn evaluate_position_exits_full(
     out
 }
 
-/// Whole shares to sell for an exit (at least 1 when fraction leaves a stub under 1).
+/// Whole (or fractional) quantity to sell for an exit.
+/// `whole_shares`: NGX-style integer lots. Crypto passes `false` so a full exit
+/// can liquidate the exact held amount in one order.
 pub fn sell_qty_for_exit(available: f64, fraction: f64) -> f64 {
+    sell_qty_for_exit_ex(available, fraction, true)
+}
+
+pub fn sell_qty_for_exit_ex(available: f64, fraction: f64, whole_shares: bool) -> f64 {
     if available <= 0.0 {
         return 0.0;
     }
@@ -246,13 +252,25 @@ pub fn sell_qty_for_exit(available: f64, fraction: f64) -> f64 {
         fraction.clamp(0.1, 1.0)
     };
     if frac >= 1.0 - 1e-9 {
-        return available.floor().max(0.0);
+        return if whole_shares {
+            available.floor().max(0.0)
+        } else {
+            available.max(0.0)
+        };
     }
-    let qty = (available * frac).floor();
-    if qty < 1.0 {
-        1.0_f64.min(available.floor())
+    let qty = if whole_shares {
+        (available * frac).floor()
     } else {
+        available * frac
+    };
+    if whole_shares && qty < 1.0 {
+        1.0_f64.min(available.floor())
+    } else if !whole_shares && qty <= 0.0 {
+        0.0
+    } else if whole_shares {
         qty.min(available.floor())
+    } else {
+        qty.min(available)
     }
 }
 
@@ -359,6 +377,8 @@ mod tests {
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].kind, ExitKind::TimeStop);
         assert_eq!(sell_qty_for_exit(80.0, 1.0), 80.0);
+        assert_eq!(sell_qty_for_exit_ex(0.75, 1.0, false), 0.75);
+        assert_eq!(sell_qty_for_exit_ex(1.75, 1.0, true), 1.0);
     }
 
     #[test]

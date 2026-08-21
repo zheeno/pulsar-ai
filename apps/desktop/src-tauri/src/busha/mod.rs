@@ -221,18 +221,21 @@ impl BushaClient {
         target_currency: &str,
         source_amount: f64,
         decimals: Option<usize>,
+        floor_amount: bool,
     ) -> Result<BushaQuote> {
         let body = quote_body_with_decimals(
             source_currency,
             target_currency,
             source_amount,
             decimals,
+            floor_amount,
         );
         tracing::debug!(
             target: "busha",
             source = source_currency,
             target = target_currency,
             amount = body["source_amount"].as_str().unwrap_or(""),
+            floor_amount,
             "creating Busha quote"
         );
         let v = self.post_json("/v1/quotes", &body).await?;
@@ -316,14 +319,20 @@ impl BushaClient {
             return Err(anyhow!("Busha quote amount must be positive"));
         }
         let mut decimals: Option<usize> = None;
+        let mut floor_amount = false;
         if let Ok(pairs) = self.pairs_ngn().await {
             if let Some(p) = pair_for(&pairs, &base) {
-                source_amount = apply_pair_quote_limits(buy, source_amount, price, p)?;
-                decimals = Some(if buy {
-                    p.counter_decimal
+                if buy {
+                    source_amount = apply_pair_quote_limits(true, source_amount, price, p)?;
+                    decimals = Some(p.counter_decimal);
                 } else {
-                    p.base_decimal
-                });
+                    // Never raise a SELL above what the wallet can spend — meet_floor used to
+                    // bump dust bags past `available` and Busha returned insufficient balance.
+                    let available = self.available_crypto(&base).await.unwrap_or(source_amount);
+                    source_amount = apply_sell_quote_limits(source_amount, price, p, available)?;
+                    decimals = Some(p.base_decimal);
+                    floor_amount = true;
+                }
             }
         }
         let (source, target) = if buy {
@@ -331,7 +340,9 @@ impl BushaClient {
         } else {
             (base.as_str(), "NGN")
         };
-        let quote = self.create_quote(source, target, source_amount, decimals).await?;
+        let quote = self
+            .create_quote(source, target, source_amount, decimals, floor_amount)
+            .await?;
         let fee = BushaFeeQuote {
             quote_id: quote.id.clone(),
             expires_at: quote.expires_at,
@@ -369,6 +380,17 @@ impl BushaClient {
             },
             fee,
         ))
+    }
+
+    async fn available_crypto(&self, currency: &str) -> Result<f64> {
+        let (cash, holdings) = self.balances().await?;
+        let _ = cash;
+        let code = currency.trim().to_uppercase();
+        Ok(holdings
+            .iter()
+            .find(|h| h.symbol.eq_ignore_ascii_case(&code))
+            .map(|h| h.quantity)
+            .unwrap_or(0.0))
     }
 
     pub async fn place_and_await_fill(
@@ -413,7 +435,7 @@ fn urlencoding_lite(s: &str) -> String {
 }
 
 pub fn quote_body(source: &str, target: &str, source_amount: f64) -> Value {
-    quote_body_with_decimals(source, target, source_amount, None)
+    quote_body_with_decimals(source, target, source_amount, None, false)
 }
 
 pub fn quote_body_with_decimals(
@@ -421,6 +443,7 @@ pub fn quote_body_with_decimals(
     target: &str,
     source_amount: f64,
     decimals: Option<usize>,
+    floor_amount: bool,
 ) -> Value {
     let places = decimals.unwrap_or_else(|| {
         if source.eq_ignore_ascii_case("NGN") {
@@ -429,10 +452,15 @@ pub fn quote_body_with_decimals(
             8
         }
     });
+    let amount = if floor_amount {
+        format_amount_floor(source_amount, places)
+    } else {
+        format_amount_decimals(source_amount, places)
+    };
     json!({
         "source_currency": source,
         "target_currency": target,
-        "source_amount": format_amount_decimals(source_amount, places),
+        "source_amount": amount,
     })
 }
 
@@ -452,6 +480,63 @@ pub fn meet_floor(amount: f64, min: f64, decimals: usize) -> f64 {
     } else {
         bumped
     }
+}
+
+pub fn floor_amount_decimals(n: f64, decimals: usize) -> f64 {
+    if !n.is_finite() || n <= 0.0 {
+        return 0.0;
+    }
+    let d = decimals.min(12);
+    let factor = 10_f64.powi(d as i32);
+    (n * factor).floor() / factor
+}
+
+/// Size a SELL without ever quoting more than `available` (floored to pair decimals).
+pub fn apply_sell_quote_limits(
+    requested: f64,
+    price: f64,
+    pair: &BushaPair,
+    available: f64,
+) -> Result<f64> {
+    let px = if pair.sell_price > 0.0 {
+        pair.sell_price
+    } else {
+        price
+    };
+    // Leave one quantum so float / lock dust does not trip insufficient balance.
+    let eps = 10_f64.powi(-(pair.base_decimal.min(12) as i32));
+    let mut qty = floor_amount_decimals(requested.min(available) - eps, pair.base_decimal);
+    if qty <= 0.0 {
+        return Err(anyhow!(
+            "Busha {} sell size is zero after flooring available {:.8}",
+            pair.base,
+            available
+        ));
+    }
+    if pair.max_sell_base > 0.0 && qty > pair.max_sell_base + 1e-12 {
+        qty = floor_amount_decimals(pair.max_sell_base, pair.base_decimal);
+    }
+    if px > 0.0 && pair.max_sell_ngn > 0.0 && qty * px > pair.max_sell_ngn + 1e-9 {
+        qty = floor_amount_decimals(pair.max_sell_ngn / px, pair.base_decimal);
+    }
+    if pair.min_sell_base > 0.0 && qty + 1e-12 < pair.min_sell_base {
+        return Err(anyhow!(
+            "Busha {} position {:.8} is below min sell {:.8}",
+            pair.base,
+            available,
+            pair.min_sell_base
+        ));
+    }
+    if px > 0.0 && pair.min_sell_ngn > 0.0 && qty * px + 1e-12 < pair.min_sell_ngn {
+        return Err(anyhow!(
+            "Busha {} sell ₦{:.2} is below min ₦{:.2} (held {:.8})",
+            pair.base,
+            qty * px,
+            pair.min_sell_ngn,
+            available
+        ));
+    }
+    Ok(qty)
 }
 
 pub fn apply_pair_quote_limits(
@@ -484,6 +569,7 @@ pub fn apply_pair_quote_limits(
         }
         Ok(ngn)
     } else {
+        // Legacy path without wallet clamp — prefer `apply_sell_quote_limits`.
         let mut qty = meet_floor(source_amount, pair.min_sell_base, pair.base_decimal);
         let px = if pair.sell_price > 0.0 {
             pair.sell_price
@@ -524,6 +610,20 @@ pub fn format_amount_decimals(n: f64, decimals: usize) -> String {
     let factor = 10_f64.powi(d as i32);
     let rounded = (n * factor).round() / factor;
     let s = format!("{rounded:.d$}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Format for SELL source amounts — never round up past the wallet balance.
+pub fn format_amount_floor(n: f64, decimals: usize) -> String {
+    if !n.is_finite() || n <= 0.0 {
+        return "0".into();
+    }
+    let floored = floor_amount_decimals(n, decimals);
+    if floored <= 0.0 {
+        return "0".into();
+    }
+    let d = decimals.min(12);
+    let s = format!("{floored:.d$}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
@@ -1215,6 +1315,11 @@ mod tests {
         assert!(usdt_q + 1e-9 >= 2619.76);
         let sell = apply_pair_quote_limits(false, 1.0, 1385.34, &usdt).unwrap();
         assert!(sell + 1e-9 >= 2.06);
+        let clamped = apply_sell_quote_limits(1.0, 1385.34, &usdt, 1.0);
+        assert!(clamped.is_err(), "must not bump sell above available wallet qty");
+        let ok = apply_sell_quote_limits(5.0, 1385.34, &usdt, 5.0).unwrap();
+        assert!(ok + 1e-9 >= 2.06);
+        assert!(ok <= 5.0);
     }
 
     #[test]

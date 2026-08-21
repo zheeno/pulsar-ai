@@ -1257,8 +1257,8 @@ export default function SettingsPage() {
         <h2 id="automation-heading">Automation</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
           Pulsar is not a headless daemon. Closing this window stops cycle scheduling and the risk monitor
-          (stop-loss / take-profit / time-stop). Auto-cycle off with live trading on still submits those
-          protective sells while the app remains open; it only stops timed ingest → signal cycles.
+          (stop-loss / take-profit / time-stop). Auto-cycle off still submits those protective sells while
+          the app remains open and a live broker is connected; it only stops timed ingest → signal cycles.
         </p>
 
         <div className="toggle-row">
@@ -1290,7 +1290,7 @@ export default function SettingsPage() {
           <div className="toggle-row__copy">
             <label className="toggle-row__label" htmlFor={autoCycleId}>Run cycles automatically</label>
             <p className="toggle-row__hint">
-              When on, the app schedules full trading cycles during NGX hours. When off, cycles only run from Home — protective exits still run if live trading is on and the app is open.
+              When on, the app schedules full trading cycles during NGX hours. When off, cycles only run from Home — protective exits (stop-loss / take-profit / time-stop) still submit while a live broker is connected and the app is open.
             </p>
           </div>
           <button
@@ -1310,7 +1310,7 @@ export default function SettingsPage() {
           <div className="toggle-row__copy">
             <label className="toggle-row__label">Enable live trading</label>
             <p className="toggle-row__hint">
-              When on, Pulsar submits real broker orders for cycles and protective exits — no per-cycle confirmation. Turn off to generate signals only (this also stops live SL/TP fills). Prefer Halt new buys if you want to keep exits.
+              When on, Pulsar submits real broker orders for discretionary trading cycles. Stop-loss, take-profit, and time-stop always submit while a live broker is connected and the venue is open — this toggle does not gate those protective sells. Prefer Halt new buys if you want to freeze entries only.
             </p>
           </div>
           <button
@@ -1329,7 +1329,7 @@ export default function SettingsPage() {
           <div className="toggle-row__copy">
             <label className="toggle-row__label" htmlFor={haltBuysId}>Halt new buys (keep exits)</label>
             <p className="toggle-row__hint">
-              Protective-only: block new BUY capacity and live BUY submits, but still execute stop-loss, take-profit, and time-stop sells. Use this instead of turning live trading off when you want to freeze entries.
+              Protective-only: block new BUY capacity and live BUY submits, but still execute stop-loss, take-profit, and time-stop sells.
             </p>
           </div>
           <button

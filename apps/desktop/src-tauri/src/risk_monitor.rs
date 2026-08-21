@@ -344,13 +344,17 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
 
         state.db.with_conn(|conn| {
             for exit in &candidates {
-                let qty = crate::risk_exits::sell_qty_for_exit(
+                let qty = crate::risk_exits::sell_qty_for_exit_ex(
                     lots
                         .iter()
                         .find(|l| l.symbol.eq_ignore_ascii_case(&exit.symbol))
                         .map(|l| l.quantity)
                         .unwrap_or(0.0),
                     exit.sell_fraction,
+                    broker
+                        .as_ref()
+                        .map(|s| s.id().whole_shares())
+                        .unwrap_or(true),
                 );
                 if qty <= 0.0 {
                     continue;
@@ -432,7 +436,6 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
             tracing::info!(
                 target: "risk_monitor",
                 signals = signal_ids.len(),
-                live_trading_enabled = settings.live_trading_enabled,
                 live_market_open,
                 skip_result,
                 "risk exits persisted but live execution skipped"
@@ -537,6 +540,9 @@ pub(crate) fn recent_unexecuted_rule_sell_id(
            AND model_name IN ('rules:stop-loss', 'rules:take-profit', 'rules:time-stop', 'rules:flatten')
            AND executed = 0
            AND generated_at >= datetime('now', '-24 hours')
+           AND COALESCE(risk_policy_result, '') NOT IN (
+             'BLOCKED_NOTIONAL', 'BLOCKED_NO_POSITION', 'BLOCKED_SYMBOL'
+           )
          ORDER BY generated_at DESC
          LIMIT 1",
         [symbol],
@@ -562,7 +568,8 @@ mod tests {
                 action TEXT,
                 model_name TEXT,
                 executed INTEGER,
-                generated_at TEXT
+                generated_at TEXT,
+                risk_policy_result TEXT
              );",
         )
         .unwrap();

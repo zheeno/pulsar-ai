@@ -87,6 +87,7 @@ export function CycleProvider({ children }: { children: ReactNode }) {
           exits?: number;
           executedLive?: boolean;
           tradingMode?: string;
+          warnings?: string[];
         }>('risk-exit', (event) => {
           if (cancelled) return;
           const p = event.payload || {};
@@ -97,11 +98,16 @@ export function CycleProvider({ children }: { children: ReactNode }) {
           if (executed > 0) {
             toast.success(`${label} sold ${names}`, 'Risk exit');
           } else if ((p.exits ?? 0) > 0) {
-            toast.info(
-              `${label} detected for ${names} (signal saved; live fill needs authorization).`,
-              'Risk exit',
-              { sound: true },
-            );
+            const warn = Array.isArray(p.warnings) && p.warnings.length
+              ? String(p.warnings[0])
+              : '';
+            const detail = warn
+              || (p.executedLive === false
+                ? (p.tradingMode === 'sandbox'
+                  ? 'broker not live — signal saved only'
+                  : 'venue closed or live submit skipped')
+                : 'submit did not fill yet — check Signals / logs');
+            toast.warning(`${label} for ${names}: ${detail}`, 'Risk exit', { sound: true });
           }
         });
         unlisteners.push(u3);
