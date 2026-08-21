@@ -441,9 +441,11 @@ export default function SettingsPage() {
     });
     void onExpiring((event) => {
       if (event.brokerId === 'busha') {
-        toast.info('Busha session is expiring — renewing in the background.', 'Live broker', {
-          sound: true,
-        });
+        toast.warning(
+          'Busha session is expiring. Open Settings and tap Reconnect Busha to sign in again before live trading pauses.',
+          'Live broker',
+          { sound: true },
+        );
       }
       void listSessions()
         .then(setAuthBridgeAccounts)

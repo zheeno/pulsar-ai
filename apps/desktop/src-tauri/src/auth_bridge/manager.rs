@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, Runtime, Url, WebviewWindow};
+use tauri::{AppHandle, Emitter, Runtime, Url, WebviewWindow};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -120,12 +120,8 @@ impl AuthBridge {
         let config = config::get(broker_id).map_err(|e| e.to_string())?;
         self.cancel_inflight(app, &config.id);
 
-        let prefer_renew = config.id == "busha"
-            && crate::auth_bridge::store::get(&config.id)
-                .ok()
-                .flatten()
-                .is_some();
-
+        // Always use a clean login URL. Cookie-backed renewUrl leaves the user in a
+        // logged-in Busha shell with no login form and no fresh Bearer to capture.
         let session_nonce = Uuid::new_v4().to_string();
         let window_label = format!("auth-bridge-{}-{}", config.id, &session_nonce[..8]);
         let (tx, rx) = oneshot::channel();
@@ -146,14 +142,9 @@ impl AuthBridge {
             );
         }
 
-        if let Err(e) = auth_window::spawn_auth_window(
-            app,
-            self,
-            &config,
-            &session_nonce,
-            &window_label,
-            prefer_renew,
-        ) {
+        if let Err(e) =
+            auth_window::spawn_auth_window(app, self, &config, &session_nonce, &window_label)
+        {
             self.cancel_inflight(app, &config.id);
             return Err(e);
         }
@@ -161,7 +152,6 @@ impl AuthBridge {
         tracing::info!(
             target: "auth_bridge",
             broker = %config.id,
-            prefer_renew,
             "auth window opened"
         );
 
@@ -390,46 +380,20 @@ fn sweep_sessions<R: Runtime>(app: &AppHandle<R>) {
                             expires_at,
                         },
                     );
-                    if cfg.id == "busha" {
-                        spawn_proactive_reauth(app, &cfg.id);
-                    }
+                    // Do not auto-open Auth Bridge: a cookie-backed Busha shell stays
+                    // logged-in and never emits a fresh Bearer for capture. Soft-expire
+                    // + Settings Reconnect (clean login) is the reliable path.
+                    tracing::info!(
+                        target: "auth_bridge",
+                        broker = %cfg.id,
+                        expires_at = %expires_at,
+                        "session expiring — reconnect required (no auto webview)"
+                    );
                 }
             }
             _ => {}
         }
     }
-}
-
-fn spawn_proactive_reauth<R: Runtime>(app: &AppHandle<R>, broker_id: &str) {
-    let Some(state) = app.try_state::<AuthBridge>() else {
-        return;
-    };
-    if state.is_awaiting(broker_id) {
-        return;
-    }
-    let app = app.clone();
-    let bridge = state.inner().clone();
-    let broker_id = broker_id.to_string();
-    tracing::info!(
-        target: "auth_bridge",
-        broker = %broker_id,
-        "proactive re-auth starting"
-    );
-    tauri::async_runtime::spawn(async move {
-        match bridge.authenticate(&app, &broker_id).await {
-            Ok(_) => tracing::info!(
-                target: "auth_bridge",
-                broker = %broker_id,
-                "proactive re-auth succeeded"
-            ),
-            Err(e) => tracing::warn!(
-                target: "auth_bridge",
-                broker = %broker_id,
-                error = %e,
-                "proactive re-auth failed"
-            ),
-        }
-    });
 }
 
 #[allow(dead_code)]

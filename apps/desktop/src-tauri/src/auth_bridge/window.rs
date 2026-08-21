@@ -17,17 +17,9 @@ pub fn spawn_auth_window<R: Runtime>(
     config: &BrokerAuthConfig,
     session_nonce: &str,
     window_label: &str,
-    prefer_renew: bool,
 ) -> Result<WebviewWindow<R>, String> {
-    let start_url = if prefer_renew {
-        config
-            .renew_url
-            .as_deref()
-            .unwrap_or(config.login_url.as_str())
-    } else {
-        config.login_url.as_str()
-    };
-    let login: Url = start_url
+    let login: Url = config
+        .login_url
         .parse()
         .map_err(|_| "invalid login URL".to_string())?;
     if !origin_allowed(&login, &config.allowed_origins) {
@@ -37,14 +29,14 @@ pub fn spawn_auth_window<R: Runtime>(
     let script = interceptor::render(config, session_nonce);
     let allowed = config.allowed_origins.clone();
     let title = format!("Connect {}", config.display_name);
-    // Persist Busha browsing data so proactive renew can reuse cookies.
-    let persist_profile = config.id == "busha";
+    // Incognito + clear on teardown so reconnect always shows a real login form
+    // and the interceptor can capture a fresh Bearer (not a stale cookie session).
 
     let mut builder = WebviewWindowBuilder::new(app, window_label, WebviewUrl::External(login))
         .title(&title)
         .inner_size(480.0, 740.0)
         .resizable(true)
-        .incognito(!persist_profile)
+        .incognito(true)
         .devtools(false)
         .initialization_script(&script)
         .on_navigation(move |url| origin_allowed(&url, &allowed));
@@ -61,7 +53,6 @@ pub fn spawn_auth_window<R: Runtime>(
     let config_child = config.clone();
     let nonce_child = session_nonce.to_string();
     let parent_label = window_label.to_string();
-    let persist_child = persist_profile;
     builder = builder.on_new_window(move |url, features| {
         if !origin_allowed(&url, &config_child.allowed_origins) {
             tracing::info!(
@@ -80,7 +71,7 @@ pub fn spawn_auth_window<R: Runtime>(
             WebviewUrl::External(url),
         )
         .title(&config_child.display_name)
-        .incognito(!persist_child)
+        .incognito(true)
         .devtools(false)
         .initialization_script(&script)
         .on_navigation(move |u| origin_allowed(&u, &allowed))
@@ -220,10 +211,7 @@ pub(crate) fn first_matching_cookie(
 pub fn teardown<R: Runtime>(app: &AppHandle<R>, labels: &HashSet<String>) {
     for label in labels {
         if let Some(window) = app.get_webview_window(label) {
-            // Keep Busha cookies for silent renew; other brokers stay ephemeral.
-            if !label.starts_with("auth-bridge-busha-") {
-                let _ = window.clear_all_browsing_data();
-            }
+            let _ = window.clear_all_browsing_data();
             let _ = window.destroy();
         }
     }
