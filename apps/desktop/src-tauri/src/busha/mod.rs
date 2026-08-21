@@ -681,6 +681,11 @@ pub fn parse_pairs(root: &Value) -> Result<Vec<BushaPair>> {
     Ok(out)
 }
 
+/// Fiat wallets that are never portfolio coins (NGN is cash; KES/USD are ignored).
+fn is_omitted_fiat_currency(code: &str) -> bool {
+    matches!(code, "NGN" | "KES" | "USD")
+}
+
 pub fn parse_balances(root: &Value) -> Result<(f64, Vec<WealthHolding>)> {
     let arr = root
         .get("data")
@@ -695,13 +700,13 @@ pub fn parse_balances(root: &Value) -> Result<(f64, Vec<WealthHolding>)> {
             .unwrap_or("")
             .to_uppercase();
         let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let trade = item.get("trade").and_then(|v| v.as_bool()).unwrap_or(false);
         let available = item.get("available").map(money).unwrap_or(0.0);
         if code == "NGN" && kind == "fiat" {
             cash = available;
             continue;
         }
-        if kind != "crypto" || !trade || available <= 0.0 {
+        // Live Busha sets trade=false on held coins; do not gate portfolio on trade.
+        if is_omitted_fiat_currency(&code) || kind != "crypto" || available <= 0.0 {
             continue;
         }
         let fiat = item
@@ -812,6 +817,67 @@ fn pair_for<'a>(pairs: &'a [BushaPair], symbol: &str) -> Option<&'a BushaPair> {
     pairs.iter().find(|p| p.base == s || p.id.eq_ignore_ascii_case(&s))
 }
 
+/// Exit marks (crypto→NGN) for held symbols from `/v1/pairs`.
+pub fn sell_marks_for_symbols(
+    pairs: &[BushaPair],
+    symbols: &[String],
+) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    for sym in symbols {
+        let key = sym.trim().to_uppercase();
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(p) = pair_for(pairs, &key) {
+            let px = if p.sell_price > 0.0 {
+                p.sell_price
+            } else {
+                p.buy_price
+            };
+            if px > 0.0 {
+                out.insert(key, px);
+            }
+        }
+    }
+    out
+}
+
+/// Persist sell marks into `price_history` + cache for risk / UI fallbacks.
+pub fn apply_sell_marks(
+    conn: &Connection,
+    cache: &crate::cache::PriceCache,
+    pairs: &[BushaPair],
+    symbols: &[String],
+    trade_date: &str,
+) -> Result<std::collections::HashMap<String, f64>> {
+    use crate::cache::CachedPrice;
+    let marks = sell_marks_for_symbols(pairs, symbols);
+    for (symbol, price) in &marks {
+        let pct = pair_for(pairs, symbol)
+            .map(|p| p.percentage_change)
+            .unwrap_or(0.0);
+        conn.execute(
+            "INSERT INTO instruments (symbol, name, sector, is_active) VALUES (?1, ?1, 'CRYPTO', 1)
+             ON CONFLICT(symbol) DO UPDATE SET sector = 'CRYPTO', is_active = 1",
+            [symbol],
+        )?;
+        conn.execute(
+            "INSERT INTO price_history (symbol, trade_date, price, change_percent, ingested_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(symbol, trade_date) DO UPDATE SET
+               price = excluded.price, change_percent = excluded.change_percent, ingested_at = datetime('now')",
+            rusqlite::params![symbol, trade_date, price, pct],
+        )?;
+        cache.set_price(&CachedPrice {
+            symbol: symbol.clone(),
+            price: *price,
+            trade_date: trade_date.to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        });
+    }
+    Ok(marks)
+}
+
 pub fn min_buy_ngn_for(conn: &Connection, symbol: &str) -> Option<f64> {
     conn.query_row(
         "SELECT min_buy_ngn FROM busha_pairs WHERE symbol = ?1",
@@ -822,7 +888,7 @@ pub fn min_buy_ngn_for(conn: &Connection, symbol: &str) -> Option<f64> {
     .filter(|n| n.is_finite() && *n > 0.0)
 }
 
-fn persist_pairs(conn: &Connection, pairs: &[BushaPair]) -> Result<()> {
+pub fn persist_pairs(conn: &Connection, pairs: &[BushaPair]) -> Result<()> {
     conn.execute(
         "UPDATE instruments SET is_active = 0 WHERE sector = 'CRYPTO'",
         [],
@@ -958,9 +1024,33 @@ mod tests {
       "status":"success",
       "data":[
         {"currency":"KES","type":"fiat","trade":false,"available":{"amount":"0","currency":"KES"}},
-        {"currency":"NGN","type":"fiat","trade":true,"available":{"amount":"125000.50","currency":"NGN"}},
-        {"currency":"BTC","type":"crypto","trade":true,"available":{"amount":"0.01","fiat":{"amount":"935016.95","currency":"NGN"},"currency":"BTC"}},
-        {"currency":"USDT","type":"crypto","trade":false,"available":{"amount":"10","fiat":{"amount":"16000","currency":"NGN"},"currency":"USDT"}}
+        {"currency":"NGN","type":"fiat","trade":false,"available":{"amount":"125000.50","currency":"NGN"}},
+        {"currency":"USD","type":"fiat","trade":false,"available":{"amount":"0","currency":"USD"}},
+        {"currency":"BTC","type":"crypto","trade":false,"available":{"amount":"0.01","fiat":{"amount":"935016.95","currency":"NGN"},"currency":"BTC"}},
+        {"currency":"USDT","type":"crypto","trade":false,"available":{"amount":"10","fiat":{"amount":"16000","currency":"NGN"},"currency":"USDT"}},
+        {"currency":"ETH","type":"crypto","trade":false,"available":{"amount":"0","fiat":{"amount":"0","currency":"NGN"},"currency":"ETH"}}
+      ]
+    }"#;
+
+    /// Live-shaped capture: held coins have trade=false; zero rows and fiat wallets must not inflate MV.
+    const BALANCES_LIVE_BOOK: &str = r#"{
+      "status":"success",
+      "message":"Fetched balances successfully",
+      "data":[
+        {"currency":"KES","type":"fiat","trade":false,"available":{"amount":"0","fiat":{"amount":"0","currency":"NGN"},"currency":"KES"}},
+        {"currency":"NGN","type":"fiat","trade":false,"available":{"amount":"2869.01","fiat":{"amount":"2869.01","currency":"NGN"},"currency":"NGN"}},
+        {"currency":"USD","type":"fiat","trade":false,"available":{"amount":"0","fiat":{"amount":"0","currency":"NGN"},"currency":"USD"}},
+        {"currency":"ADA","type":"crypto","trade":false,"available":{"amount":"1.1","fiat":{"amount":"312.28","currency":"NGN"},"currency":"ADA"}},
+        {"currency":"ALICE","type":"crypto","trade":false,"available":{"amount":"1.417886","fiat":{"amount":"294.54","currency":"NGN"},"currency":"ALICE"}},
+        {"currency":"ARKM","type":"crypto","trade":false,"available":{"amount":"3.1","fiat":{"amount":"416.08","currency":"NGN"},"currency":"ARKM"}},
+        {"currency":"BTC","type":"crypto","trade":false,"available":{"amount":"0","fiat":{"amount":"0","currency":"NGN"},"currency":"BTC"}},
+        {"currency":"CHZ","type":"crypto","trade":false,"available":{"amount":"16.291202","fiat":{"amount":"295.52","currency":"NGN"},"currency":"CHZ"}},
+        {"currency":"ETH","type":"crypto","trade":false,"available":{"amount":"0","fiat":{"amount":"0","currency":"NGN"},"currency":"ETH"}},
+        {"currency":"FIL","type":"crypto","trade":false,"available":{"amount":"0.34154033","fiat":{"amount":"350","currency":"NGN"},"currency":"FIL"}},
+        {"currency":"MET","type":"crypto","trade":false,"available":{"amount":"1","fiat":{"amount":"302.14","currency":"NGN"},"currency":"MET"}},
+        {"currency":"TRX","type":"crypto","trade":false,"available":{"amount":"0.6","fiat":{"amount":"275.51","currency":"NGN"},"currency":"TRX"}},
+        {"currency":"USDC","type":"crypto","trade":false,"available":{"amount":"0","fiat":{"amount":"0","currency":"NGN"},"currency":"USDC"}},
+        {"currency":"USDT","type":"crypto","trade":false,"available":{"amount":"0","fiat":{"amount":"0","currency":"NGN"},"currency":"USDT"}}
       ]
     }"#;
 
@@ -1020,13 +1110,34 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_ngn_cash_and_tradable_crypto_only() {
+    fn parses_ngn_cash_and_held_crypto_ignoring_trade_flag() {
         let v: Value = serde_json::from_str(BALANCES).unwrap();
         let (cash, holds) = parse_balances(&v).unwrap();
         assert!((cash - 125000.50).abs() < 0.01);
-        assert_eq!(holds.len(), 1);
+        assert_eq!(holds.len(), 2);
         assert_eq!(holds[0].symbol, "BTC");
         assert!((holds[0].quantity - 0.01).abs() < 1e-9);
+        assert_eq!(holds[1].symbol, "USDT");
+        assert!((holds[1].current_value - 16_000.0).abs() < 0.01);
+        let mv: f64 = holds.iter().map(|h| h.current_value).sum();
+        assert!((mv - 951_016.95).abs() < 0.01);
+    }
+
+    #[test]
+    fn live_balances_book_matches_equity_bar() {
+        let v: Value = serde_json::from_str(BALANCES_LIVE_BOOK).unwrap();
+        let (cash, holds) = parse_balances(&v).unwrap();
+        assert!((cash - 2869.01).abs() < 0.01);
+        assert_eq!(holds.len(), 7);
+        let symbols: Vec<&str> = holds.iter().map(|h| h.symbol.as_str()).collect();
+        assert_eq!(
+            symbols,
+            vec!["ADA", "ALICE", "ARKM", "CHZ", "FIL", "MET", "TRX"]
+        );
+        assert!(!symbols.iter().any(|s| matches!(*s, "NGN" | "KES" | "USD" | "BTC" | "ETH" | "USDC" | "USDT")));
+        let mv: f64 = holds.iter().map(|h| h.current_value).sum();
+        assert!((mv - 2246.07).abs() < 0.02);
+        assert!((cash + mv - 5115.08).abs() < 0.02);
     }
 
     #[test]
@@ -1040,6 +1151,16 @@ mod tests {
         assert!((pairs[0].max_buy_ngn - 93_501_695.36).abs() < 0.01);
         assert_eq!(pairs[0].base_decimal, 8);
         assert_eq!(pairs[0].counter_decimal, 2);
+    }
+
+    #[test]
+    fn sell_marks_use_sell_price_not_buy_for_held() {
+        let pairs = parse_pairs(&serde_json::from_str(PAIRS).unwrap()).unwrap();
+        let marks = sell_marks_for_symbols(&pairs, &["BTC".into(), "ADA".into()]);
+        assert_eq!(marks.len(), 1);
+        assert!((marks["BTC"] - 88_919_802.32).abs() < 0.01);
+        assert!(marks["BTC"] < pairs[0].buy_price);
+        assert!(!marks.contains_key("ADA"));
     }
 
     #[test]

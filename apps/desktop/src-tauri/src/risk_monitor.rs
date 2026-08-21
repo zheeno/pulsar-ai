@@ -80,9 +80,8 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
     }
 
     let calendar = TradingCalendar::default();
-    if !crate::broker::busha_connected()
-        && !crate::runtime_util::market_activity_allowed(&calendar)
-    {
+    let crypto_mode = crate::broker::busha_connected();
+    if !crypto_mode && !crate::runtime_util::market_activity_allowed(&calendar) {
         return Ok(None);
     }
 
@@ -91,10 +90,6 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
         return Ok(None);
     };
 
-    let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
-    let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
-    let client =
-        crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
     let broker = crate::broker::open_live_broker(&settings);
 
     block_on_local(async {
@@ -139,29 +134,87 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
 
         let symbols: Vec<String> = lots.iter().map(|l| l.symbol.clone()).collect();
         let mut prices: HashMap<String, f64> = HashMap::new();
+        let today = calendar.today_wat();
 
-        match client.get_latest_quotes(&symbols).await {
-            Ok(quotes) => {
-                let _ = state.db.with_conn(|conn| {
-                    for q in &quotes {
-                        if q.last > 0.0 {
-                            let _ = crate::ingest::IngestionService::upsert_last_quote(
+        if crypto_mode {
+            // Busha is the sole market-data source in crypto mode — never Pulse.
+            match crate::busha::BushaClient::from_store() {
+                Ok(busha) => match busha.pairs_ngn().await {
+                    Ok(pairs) => {
+                        let _ = state.db.with_conn(|conn| crate::busha::persist_pairs(conn, &pairs));
+                        match state.db.with_conn(|conn| {
+                            crate::busha::apply_sell_marks(
                                 conn,
                                 &state.cache,
-                                q,
-                            );
-                            prices.insert(q.symbol.to_uppercase(), q.last);
+                                &pairs,
+                                &symbols,
+                                &today,
+                            )
+                        }) {
+                            Ok(marks) => {
+                                prices.extend(marks);
+                                tracing::debug!(
+                                    target: "risk_monitor",
+                                    n = prices.len(),
+                                    "busha sell marks applied"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "risk_monitor",
+                                    error = %e,
+                                    "failed to persist busha sell marks"
+                                );
+                            }
                         }
                     }
-                    Ok::<_, anyhow::Error>(())
-                });
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "risk_monitor",
+                            error = %e,
+                            "busha pairs refresh failed; falling back to cache/db"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "risk_monitor",
+                        error = %e,
+                        "busha client unavailable for risk marks"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "risk_monitor",
-                    error = %e,
-                    "pulse quote refresh failed; falling back to cache/db"
-                );
+        } else {
+            let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
+            let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
+            let client = crate::ngx::NgxPulseClient::from_settings(
+                &settings,
+                pulse_password,
+                pulse_api_key,
+            );
+            match client.get_latest_quotes(&symbols).await {
+                Ok(quotes) => {
+                    let _ = state.db.with_conn(|conn| {
+                        for q in &quotes {
+                            if q.last > 0.0 {
+                                let _ = crate::ingest::IngestionService::upsert_last_quote(
+                                    conn,
+                                    &state.cache,
+                                    q,
+                                );
+                                prices.insert(q.symbol.to_uppercase(), q.last);
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "risk_monitor",
+                        error = %e,
+                        "pulse quote refresh failed; falling back to cache/db"
+                    );
+                }
             }
         }
 
