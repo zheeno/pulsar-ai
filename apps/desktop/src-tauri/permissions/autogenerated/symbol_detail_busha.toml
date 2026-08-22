@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-symbol-detail-busha"
+description = "Enables the symbol_detail_busha command without any pre-configured scope."
+commands.allow = ["symbol_detail_busha"]
+
+[[permission]]
+identifier = "deny-symbol-detail-busha"
+description = "Denies the symbol_detail_busha command without any pre-configured scope."
+commands.deny = ["symbol_detail_busha"]

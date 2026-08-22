@@ -255,6 +255,7 @@ pub fn run() {
             commands::memory_delete,
             commands::symbol_detail,
             commands::symbol_detail_pulse,
+            commands::symbol_detail_busha,
             commands::get_strategy,
             commands::update_strategy,
             strategy_coach::strategy_coach_propose,

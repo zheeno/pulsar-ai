@@ -78,6 +78,36 @@ Tradable pairs against a counter currency, with live pricing. This is the market
 ```
 Note the visible spread: `buy_price` and `sell_price` differ (~5% in the sampled BTC/NGN pair) — Busha's "rate" isn't a single mid-market number, it's already spread-adjusted per side. Use `is_buy_supported`/`is_sell_supported` and the min/max fields to validate order size client-side before ever hitting `/quotes`.
 
+### `GET /v1/currencies/ohlc/{PAIR}?period={PERIOD}`
+Trend history for a tradable pair against NGN. `{PAIR}` is the pair id (e.g. `BTCNGN`, `ARKMNGN`). `{PERIOD}` is optional:
+
+| `period` | Meaning (observed) |
+|---|---|
+| `1d` | Intraday series (~5-minute bars for the last day) |
+| `1m` | ~1 month of history |
+| `1y` | ~1 year of history |
+| *(omit)* | All-time history |
+
+```json
+{
+  "status": "success",
+  "message": "OHLC fetched successfully",
+  "data": {
+    "symbol": "ARKMNGN",
+    "change": "3.73",
+    "high": "161.93",
+    "low": "140.5",
+    "market_cap": "0",
+    "price": "147.49",
+    "price_data": [
+      { "time": "2026-08-21T10:40:00Z", "price": "142.12" }
+    ]
+  }
+}
+```
+
+All numeric fields arrive as strings. Pulsar stores raw points in `busha_ohlc_points` (keyed by base symbol + period + timestamp), snapshot metadata in `busha_ohlc_meta`, and rolls daily closes into `price_history` for long-window indicators. Cache TTLs in-app: `1d` ≈ 5 min, `1m` ≈ 1 hr, `1y`/all-time ≈ 24 hr. Requires the same auth headers as other `api.busha.io` trading calls.
+
 ### `GET /v1/balances`
 Per-currency balance breakdown (fiat and crypto), including `available`, `pending`, `savings`, `investments`, `total`, each as `{amount, currency}` plus a nested `fiat` conversion. Also carries `trade`/`deposit`/`withdrawal` booleans per asset — check `trade: true` before offering a currency in Pulsar's trade UI, several sampled assets had `trade: false`.
 

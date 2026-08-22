@@ -174,6 +174,18 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
                                 );
                             }
                         }
+                        let _ = state.db.with_conn(|conn| {
+                            for sym in &symbols {
+                                if let Some(px) = crate::busha::latest_ohlc_price(
+                                    conn,
+                                    sym,
+                                    crate::busha::BushaOhlcPeriod::OneDay,
+                                ) {
+                                    prices.entry(sym.clone()).or_insert(px);
+                                }
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(

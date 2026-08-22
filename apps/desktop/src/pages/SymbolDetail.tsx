@@ -54,8 +54,27 @@ type SymbolDetail = {
     volume?: number | null;
     marketCap?: number | null;
     peRatio?: number | null;
+    high?: number | null;
+    low?: number | null;
   } | null;
   needsPulsePrices?: boolean;
+  needsBushaOhlc?: boolean;
+  assetClass?: 'crypto' | 'stocks';
+};
+
+type SymbolDetailBusha = {
+  symbol: string;
+  period: string;
+  prices: PricePoint[];
+  quote?: {
+    price?: number;
+    changePercent?: number | null;
+    high?: number;
+    low?: number;
+    marketCap?: number | null;
+  } | null;
+  source?: string;
+  error?: string | null;
 };
 
 type SymbolDetailPulse = {
@@ -71,13 +90,13 @@ export default function SymbolDetailPage() {
   const symbol = (rawSymbol || '').toUpperCase();
   const [data, setData] = useState<SymbolDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [pulseRefreshing, setPulseRefreshing] = useState(false);
+  const [bushaRefreshing, setBushaRefreshing] = useState(false);
 
   useEffect(() => {
     if (!symbol) return;
     let cancelled = false;
     setLoading(true);
-    setPulseRefreshing(false);
+    setBushaRefreshing(false);
     setData(null);
 
     api<SymbolDetail>('symbol_detail', { symbol })
@@ -86,9 +105,54 @@ export default function SymbolDetailPage() {
         setData(d);
         setLoading(false);
 
+        const missingCryptoStats =
+          d.assetClass === 'crypto'
+          && (d.pulseQuote?.high == null || d.pulseQuote?.low == null);
+
+        if (d.needsBushaOhlc || (d.assetClass === 'crypto' && (d.prices.length < 5 || missingCryptoStats))) {
+          setBushaRefreshing(true);
+          api<SymbolDetailBusha>('symbol_detail_busha', { symbol, period: '1d' })
+            .then((busha) => {
+              if (cancelled || busha.error) return;
+              setData((prev) => {
+                if (!prev || prev.symbol !== symbol) return prev;
+                const refreshChart = prev.needsBushaOhlc || prev.prices.length < 5;
+                const prevQuote = prev.pulseQuote ?? {};
+                const nextQuote = busha.quote
+                  ? {
+                      ...prevQuote,
+                      price: busha.quote.price ?? prevQuote.price,
+                      changePercent: busha.quote.changePercent ?? prevQuote.changePercent,
+                      high: busha.quote.high ?? prevQuote.high,
+                      low: busha.quote.low ?? prevQuote.low,
+                      marketCap: busha.quote.marketCap ?? prevQuote.marketCap,
+                      volume: null,
+                    }
+                  : prev.pulseQuote;
+                return {
+                  ...prev,
+                  found: prev.found || busha.prices.length > 0,
+                  prices: refreshChart && busha.prices.length > 0 ? busha.prices : prev.prices,
+                  latest: refreshChart && busha.prices.length > 0
+                    ? busha.prices[busha.prices.length - 1]
+                    : prev.latest,
+                  pulseQuote: nextQuote,
+                  needsBushaOhlc: false,
+                };
+              });
+            })
+            .catch(() => {
+              /* local data already shown */
+            })
+            .finally(() => {
+              if (!cancelled) setBushaRefreshing(false);
+            });
+          return;
+        }
+
         if (!d.needsPulsePrices) return;
 
-        setPulseRefreshing(true);
+        setBushaRefreshing(true);
         api<SymbolDetailPulse>('symbol_detail_pulse', { symbol })
           .then((pulse) => {
             if (cancelled || pulse.error) return;
@@ -110,7 +174,7 @@ export default function SymbolDetailPage() {
             /* local data already shown */
           })
           .finally(() => {
-            if (!cancelled) setPulseRefreshing(false);
+            if (!cancelled) setBushaRefreshing(false);
           });
       })
       .catch((e) => {
@@ -129,6 +193,31 @@ export default function SymbolDetailPage() {
 
   const price = data?.pulseQuote?.price ?? data?.latest?.price;
   const change = data?.pulseQuote?.changePercent ?? data?.latest?.changePercent;
+  const isCrypto = data?.assetClass === 'crypto';
+  const showVolume =
+    !isCrypto
+    && data?.pulseQuote?.volume != null
+    && Number(data.pulseQuote.volume) > 0;
+  const showMarketCap =
+    data?.pulseQuote?.marketCap != null
+    && Number(data.pulseQuote.marketCap) > 0;
+  const showHigh =
+    data?.pulseQuote?.high != null
+    && Number(data.pulseQuote.high) > 0;
+  const showLow =
+    data?.pulseQuote?.low != null
+    && Number(data.pulseQuote.low) > 0;
+  const showPe =
+    !isCrypto
+    && data?.pulseQuote?.peRatio != null
+    && Number(data.pulseQuote.peRatio) > 0;
+  const showStats =
+    showVolume
+    || showMarketCap
+    || showHigh
+    || showLow
+    || showPe
+    || !!data?.position;
 
   return (
     <div className="page">
@@ -145,9 +234,9 @@ export default function SymbolDetailPage() {
           <p style={{ margin: 0 }}>
             {data?.name || (loading ? '…' : 'Unknown instrument')}
             {data?.sector ? <span className="muted"> · {data.sector}</span> : null}
-            {pulseRefreshing ? (
+            {bushaRefreshing ? (
               <span className="muted" style={{ marginLeft: 8, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <IconSpinner /> refreshing history
+                <IconSpinner /> refreshing Busha history
               </span>
             ) : null}
           </p>
@@ -179,21 +268,45 @@ export default function SymbolDetailPage() {
         </div>
       ) : (
         <>
-          {(data.pulseQuote || data.position) && (
+          {showStats && (
             <div className="stat-grid">
-              {data.pulseQuote?.volume != null && (
+              {showHigh && (
                 <div className="stat-card">
-                  <div className="stat-card__label">Volume</div>
+                  <div className="stat-card__label">{isCrypto ? '24h high' : 'High'}</div>
                   <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
-                    {Number(data.pulseQuote.volume).toLocaleString()}
+                    {formatNaira(Number(data.pulseQuote!.high))}
                   </div>
                 </div>
               )}
-              {data.pulseQuote?.marketCap != null && (
+              {showLow && (
+                <div className="stat-card">
+                  <div className="stat-card__label">{isCrypto ? '24h low' : 'Low'}</div>
+                  <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
+                    {formatNaira(Number(data.pulseQuote!.low))}
+                  </div>
+                </div>
+              )}
+              {showVolume && (
+                <div className="stat-card">
+                  <div className="stat-card__label">Volume</div>
+                  <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
+                    {Number(data.pulseQuote!.volume).toLocaleString()}
+                  </div>
+                </div>
+              )}
+              {showMarketCap && (
                 <div className="stat-card">
                   <div className="stat-card__label">Market cap</div>
                   <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
-                    {formatNaira(data.pulseQuote.marketCap)}
+                    {formatNaira(Number(data.pulseQuote!.marketCap))}
+                  </div>
+                </div>
+              )}
+              {showPe && (
+                <div className="stat-card">
+                  <div className="stat-card__label">P/E ratio</div>
+                  <div className="stat-card__value mono" style={{ fontSize: '1.1rem' }}>
+                    {Number(data.pulseQuote!.peRatio).toFixed(2)}
                   </div>
                 </div>
               )}

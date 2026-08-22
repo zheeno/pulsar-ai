@@ -99,6 +99,8 @@ impl Database {
             .context("run busha cache migration")?;
         conn.execute_batch(include_str!("../../migrations/013_busha_pairs.sql"))
             .context("run busha pairs migration")?;
+        conn.execute_batch(include_str!("../../migrations/014_busha_ohlc.sql"))
+            .context("run busha ohlc migration")?;
         Self::add_column_if_missing(conn, "broker_orders", "venue", "TEXT NOT NULL DEFAULT 'wealth'")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;

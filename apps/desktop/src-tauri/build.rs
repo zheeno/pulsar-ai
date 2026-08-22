@@ -103,6 +103,7 @@ fn main() {
                 "memory_delete",
                 "symbol_detail",
                 "symbol_detail_pulse",
+                "symbol_detail_busha",
                 "get_strategy",
                 "update_strategy",
                 "strategy_coach_propose",

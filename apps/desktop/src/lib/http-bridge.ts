@@ -633,6 +633,24 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
           volume: 100000,
         },
         needsPulsePrices: false,
+        needsBushaOhlc: false,
+        assetClass: 'stocks',
+      } as T;
+    }
+
+    case 'symbol_detail_busha': {
+      const symbol = String(args?.symbol || 'BTC').toUpperCase();
+      return {
+        symbol,
+        period: String(args?.period || '1d'),
+        prices: [
+          { date: '2026-08-21T10:40:00Z', price: 142.12 },
+          { date: '2026-08-21T11:00:00Z', price: 143.19 },
+          { date: '2026-08-22T10:40:00Z', price: 147.53 },
+        ],
+        quote: { price: 147.49, changePercent: 3.73, high: 161.93, low: 140.5, marketCap: null },
+        source: 'busha_ohlc',
+        error: null,
       } as T;
     }
 

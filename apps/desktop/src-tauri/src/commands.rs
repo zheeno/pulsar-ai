@@ -1380,23 +1380,40 @@ pub fn symbol_detail(
 
             let latest = prices.last().cloned();
             let cached = state.cache.get_price(&symbol);
+            let is_crypto = crate::busha::is_crypto_symbol(conn, &symbol);
+            let ohlc_count: i64 = if is_crypto {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM busha_ohlc_points WHERE symbol = ?1 AND period = '1d'",
+                    [&symbol],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            };
             let quote_price = cached
                 .as_ref()
                 .map(|c| c.price)
                 .or_else(|| latest.as_ref().and_then(|p| p.get("price")).and_then(|v| v.as_f64()));
-            let pulse_quote = latest.as_ref().map(|last| {
-                serde_json::json!({
-                    "symbol": symbol,
-                    "name": instrument.as_ref().and_then(|(_, n, _)| n.clone()),
-                    "price": quote_price,
-                    "changePercent": last.get("changePercent").cloned().unwrap_or(serde_json::Value::Null),
-                    "volume": last.get("volume").cloned().unwrap_or(serde_json::Value::Null),
-                    "marketCap": last.get("marketCap").cloned().unwrap_or(serde_json::Value::Null),
-                    "peRatio": last.get("peRatio").cloned().unwrap_or(serde_json::Value::Null),
-                    "sector": instrument.as_ref().and_then(|(_, _, s)| s.clone()),
-                    "source": if cached.is_some() { "cache" } else { "local" },
+            let pulse_quote = if is_crypto {
+                Some(crate::busha::crypto_detail_quote(conn, &symbol, quote_price))
+            } else {
+                latest.as_ref().map(|last| {
+                    serde_json::json!({
+                        "symbol": symbol,
+                        "name": instrument.as_ref().and_then(|(_, n, _)| n.clone()),
+                        "price": quote_price,
+                        "changePercent": last.get("changePercent").cloned().unwrap_or(serde_json::Value::Null),
+                        "volume": last.get("volume").cloned().unwrap_or(serde_json::Value::Null),
+                        "marketCap": last.get("marketCap").cloned().unwrap_or(serde_json::Value::Null),
+                        "peRatio": last.get("peRatio").cloned().unwrap_or(serde_json::Value::Null),
+                        "sector": instrument.as_ref().and_then(|(_, _, s)| s.clone()),
+                        "source": if cached.is_some() { "cache" } else { "local" },
+                    })
                 })
-            });
+            };
+            let has_ohlc_meta =
+                is_crypto && crate::busha::has_ohlc_meta(conn, &symbol, crate::busha::BushaOhlcPeriod::OneDay);
 
             Ok(serde_json::json!({
                 "symbol": symbol,
@@ -1409,7 +1426,9 @@ pub fn symbol_detail(
                 "signals": signals,
                 "trades": trades,
                 "pulseQuote": pulse_quote,
-                "needsPulsePrices": prices.len() < 5,
+                "needsPulsePrices": !is_crypto && prices.len() < 5,
+                "needsBushaOhlc": is_crypto && (ohlc_count < 5 || !has_ohlc_meta),
+                "assetClass": if is_crypto { "crypto" } else { "stocks" },
             }))
         })
         .map_err(|e| e.to_string())
@@ -1498,6 +1517,145 @@ pub async fn symbol_detail_pulse(
             });
 
         Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Busha OHLC trend history for crypto symbols (never NGX Pulse).
+#[tauri::command]
+pub async fn symbol_detail_busha(
+    symbol: String,
+    period: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let symbol = symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return Err("Symbol is required".into());
+    }
+    let period = period
+        .as_deref()
+        .and_then(crate::busha::BushaOhlcPeriod::from_arg)
+        .unwrap_or(crate::busha::BushaOhlcPeriod::OneDay);
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        crate::runtime_util::block_on_local(async {
+            let is_crypto = state
+                .db
+                .with_conn(|conn| Ok(crate::busha::is_crypto_symbol(conn, &symbol)))
+                .map_err(|e| e.to_string())?;
+            if !is_crypto {
+                return Ok(serde_json::json!({
+                    "symbol": symbol,
+                    "period": period.as_str(),
+                    "prices": [],
+                    "quote": null,
+                    "source": "busha_ohlc",
+                    "error": format!("{symbol} is not a Busha crypto symbol"),
+                }));
+            }
+
+            let fresh = state
+                .db
+                .with_conn(|conn| {
+                    crate::busha::ohlc_meta_fresh(
+                        conn,
+                        &symbol,
+                        period,
+                        period.default_cache_secs(),
+                    )
+                })
+                .map_err(|e| e.to_string())?;
+
+            if !fresh {
+                match crate::busha::BushaClient::from_store() {
+                    Ok(client) => match client.ohlc_for_base(&symbol, period).await {
+                        Ok(snap) => {
+                            let _ = state.db.with_conn(|conn| {
+                                crate::busha::persist_ohlc_snapshot(conn, &snap, period)?;
+                                if matches!(
+                                    period,
+                                    crate::busha::BushaOhlcPeriod::OneMonth
+                                        | crate::busha::BushaOhlcPeriod::OneYear
+                                        | crate::busha::BushaOhlcPeriod::AllTime
+                                ) {
+                                    let _ = crate::busha::rollup_ohlc_to_daily_price_history(
+                                        conn, &symbol, period,
+                                    );
+                                }
+                                Ok(())
+                            });
+                        }
+                        Err(e) => {
+                            return Ok(serde_json::json!({
+                                "symbol": symbol,
+                                "period": period.as_str(),
+                                "prices": [],
+                                "quote": null,
+                                "source": "busha_ohlc",
+                                "error": e.to_string(),
+                            }));
+                        }
+                    },
+                    Err(e) => {
+                        return Ok(serde_json::json!({
+                            "symbol": symbol,
+                            "period": period.as_str(),
+                            "prices": [],
+                            "quote": null,
+                            "source": "busha_ohlc",
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+
+            state
+                .db
+                .with_conn(|conn| {
+                    let limit = match period {
+                        crate::busha::BushaOhlcPeriod::OneDay => 500_i64,
+                        crate::busha::BushaOhlcPeriod::OneMonth => 120,
+                        crate::busha::BushaOhlcPeriod::OneYear => 400,
+                        crate::busha::BushaOhlcPeriod::AllTime => 2000,
+                    };
+                    let pts = crate::busha::ohlc_points(conn, &symbol, period, limit)?;
+                    let mut prices: Vec<serde_json::Value> = pts
+                        .into_iter()
+                        .map(|(date, price)| {
+                            serde_json::json!({ "date": date, "price": price })
+                        })
+                        .collect();
+                    if prices.len() > 500 {
+                        let skip = prices.len() - 500;
+                        prices = prices.into_iter().skip(skip).collect();
+                    }
+                    let meta = crate::busha::ohlc_meta(conn, &symbol, period)?;
+                    let quote = meta.map(|(price, change_pct, high, low, market_cap)| {
+                        serde_json::json!({
+                            "price": price,
+                            "changePercent": change_pct,
+                            "high": high,
+                            "low": low,
+                            "marketCap": if market_cap > 0.0 {
+                                serde_json::Value::from(market_cap)
+                            } else {
+                                serde_json::Value::Null
+                            },
+                        })
+                    });
+                    Ok(serde_json::json!({
+                        "symbol": symbol,
+                        "period": period.as_str(),
+                        "prices": prices,
+                        "quote": quote,
+                        "source": "busha_ohlc",
+                        "error": null,
+                    }))
+                })
+                .map_err(|e| e.to_string())
+        })
     })
     .await
     .map_err(|e| e.to_string())?
