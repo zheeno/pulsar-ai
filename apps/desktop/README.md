@@ -45,6 +45,14 @@ npm run desktop:build:mac:intel
 
 If you see `cargo metadata ... No such file or directory`, Rust is not installed or the terminal has not loaded `~/.cargo/bin` — run `source "$HOME/.cargo/env"` and retry.
 
+### macOS 11 dev crash (`requestMediaCapturePermissionForOrigin`)
+
+On Intel Macs running **macOS 11.x**, `npm run desktop:dev` can panic at startup with:
+
+`failed overriding protocol method -[WKUIDelegate webView:requestMediaCapturePermissionForOrigin:...]: method not found`
+
+That WebKit API exists only on macOS 12.3+. The repo sets `[profile.dev.package.objc2] debug-assertions = false` in `src-tauri/Cargo.toml` so dev builds skip that check on macOS 11. Pull latest and rebuild. **Release builds** are unaffected.
+
 ### Which build to use
 
 | Recipient Mac | Build command | App arch | Bundled Node | Minimum macOS |

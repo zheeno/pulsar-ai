@@ -35,6 +35,11 @@ sha2 = "0.10"
 regex = "1"
 percent-encoding = "2"
 
+# macOS 11 dev: objc2 debug_assert panics when wry registers WKUIDelegate methods
+# that WebKit only added in macOS 12+ (see tauri-apps/tauri#11496).
+[profile.dev.package.objc2]
+debug-assertions = false
+
 [profile.release]
 panic = "abort"
 codegen-units = 1
