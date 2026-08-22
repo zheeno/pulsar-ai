@@ -26,7 +26,24 @@ npm run desktop:dev
 
 ## Ship (macOS)
 
-Requires Node.js 20+ on the **build machine** only. End users do **not** need Node installed — the release `.app` includes a bundled Node runtime for the AI agent.
+Requires **Node.js 20+** and **Rust (cargo)** on the **build machine** only. End users do **not** need Node or Rust installed.
+
+### Build machine setup (Intel Mac 11.x)
+
+```bash
+# 1. Xcode Command Line Tools
+xcode-select --install
+
+# 2. Rust (if cargo is missing)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# 3. Repo deps + build
+npm install
+npm run desktop:build:mac:intel
+```
+
+If you see `cargo metadata ... No such file or directory`, Rust is not installed or the terminal has not loaded `~/.cargo/bin` — run `source "$HOME/.cargo/env"` and retry.
 
 ### Which build to use
 

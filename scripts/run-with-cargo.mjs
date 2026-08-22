@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { assertCargo, withCargoPath } from "./cargo-env.mjs";
 
 const args = process.argv.slice(2);
 if (args.length === 0) {
@@ -8,13 +7,11 @@ if (args.length === 0) {
   process.exit(1);
 }
 
-const cargoBin = join(homedir(), ".cargo", "bin");
-const pathSep = process.platform === "win32" ? ";" : ":";
-const env = {
+const env = withCargoPath({
   ...process.env,
-  PATH: `${cargoBin}${pathSep}${process.env.PATH ?? ""}`,
   RUST_LOG: process.env.RUST_LOG ?? "info,ngx_pulse=debug",
-};
+});
+assertCargo(env);
 
 const [command, ...commandArgs] = args;
 const child = spawn(command, commandArgs, {

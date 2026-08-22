@@ -12,6 +12,7 @@ import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertCargo, withCargoPath } from "./cargo-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const desktopDir = join(root, "apps/desktop");
@@ -80,7 +81,8 @@ if (target.startsWith("win") && process.platform !== "win32") {
 }
 
 const macCargoTarget = resolveMacCargoTarget();
-const env = { ...process.env };
+const env = withCargoPath({ ...process.env });
+assertCargo(env);
 const args = ["tauri", "build", "--bundles", bundles];
 
 if (macCargoTarget) {

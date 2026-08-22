@@ -11,8 +11,19 @@ packages/shared  Shared Zod types / contracts
 ## Prerequisites
 
 - Node.js 20+
-- Rust stable (`rustup`)
-- macOS: Xcode Command Line Tools (needed to compile Tauri)
+- Rust stable (`rustup`) — **required for `npm run desktop:build*`**
+- macOS: Xcode Command Line Tools (`xcode-select --install`)
+
+If `tauri build` fails with `cargo metadata ... No such file or directory`, Rust is not installed or not on PATH. Install with:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version
+cargo --version
+```
+
+Then run the build again from a **new terminal** (or `source ~/.cargo/env` in the current one).
 
 ## Quick start
 
