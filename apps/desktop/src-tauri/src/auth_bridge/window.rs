@@ -17,6 +17,8 @@ pub fn spawn_auth_window<R: Runtime>(
     config: &BrokerAuthConfig,
     session_nonce: &str,
     window_label: &str,
+    window_title: Option<&str>,
+    focus: bool,
 ) -> Result<WebviewWindow<R>, String> {
     let login: Url = config
         .login_url
@@ -28,7 +30,9 @@ pub fn spawn_auth_window<R: Runtime>(
 
     let script = interceptor::render(config, session_nonce);
     let allowed = config.allowed_origins.clone();
-    let title = format!("Connect {}", config.display_name);
+    let title = window_title
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Connect {}", config.display_name));
     // Incognito + clear on teardown so reconnect always shows a real login form
     // and the interceptor can capture a fresh Bearer (not a stale cookie session).
 
@@ -80,7 +84,12 @@ pub fn spawn_auth_window<R: Runtime>(
         match child.build() {
             Ok(window) => {
                 bridge_child.register_window_label(&config_child.id, window.label().to_string());
-                attach_close_handler(&window, bridge_child.clone(), config_child.id.clone());
+                attach_close_handler(
+                    &app_for_child,
+                    &window,
+                    bridge_child.clone(),
+                    config_child.id.clone(),
+                );
                 NewWindowResponse::Create { window }
             }
             Err(e) => {
@@ -91,7 +100,7 @@ pub fn spawn_auth_window<R: Runtime>(
     });
 
     let window = builder.build().map_err(|e| e.to_string())?;
-    attach_close_handler(&window, bridge.clone(), config.id.clone());
+    attach_close_handler(app, &window, bridge.clone(), config.id.clone());
     start_cookie_poller(
         app.clone(),
         bridge.clone(),
@@ -99,14 +108,24 @@ pub fn spawn_auth_window<R: Runtime>(
         window_label.to_string(),
         session_nonce.to_string(),
     );
+    if focus {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
     Ok(window)
 }
 
-fn attach_close_handler<R: Runtime>(window: &WebviewWindow<R>, bridge: AuthBridge, broker_id: String) {
+fn attach_close_handler<R: Runtime>(
+    app: &AppHandle<R>,
+    window: &WebviewWindow<R>,
+    bridge: AuthBridge,
+    broker_id: String,
+) {
     let label = window.label().to_string();
+    let app = app.clone();
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
-            bridge.on_window_destroyed(&broker_id, &label);
+            bridge.on_window_destroyed(&app, &broker_id, &label);
         }
     });
 }
@@ -121,13 +140,8 @@ fn start_cookie_poller<R: Runtime>(
     let mut cookie_names = config.capture.cookie_names.clone();
     cookie_names.push(SIDECHANNEL_CAPTURE.into());
     tauri::async_runtime::spawn(async move {
-        let mut ticks = 0u32;
         loop {
             tokio::time::sleep(Duration::from_millis(400)).await;
-            ticks += 1;
-            if ticks > 1500 {
-                break;
-            }
             if !bridge.is_awaiting(&config.id) {
                 break;
             }

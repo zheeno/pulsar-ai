@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { HashRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import AppShell from './components/AppShell';
+import AuthBridgeSessionAlerts from './components/AuthBridgeSessionAlerts';
 import ErrorBoundary from './components/ErrorBoundary';
 import SplashScreen from './components/SplashScreen';
 import { api, type AppSettings } from './lib/api';
@@ -136,6 +137,7 @@ export default function App() {
     <HashRouter>
       <ErrorBoundary>
         <ToastProvider>
+          <AuthBridgeSessionAlerts />
           <CycleProvider>
             <div className="app-root">
               {browserMode && (

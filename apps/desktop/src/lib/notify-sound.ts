@@ -90,6 +90,32 @@ export function playNotificationSound(kind: NotifySoundKind): void {
   });
 }
 
+/** Loud multi-pulse cue when Busha session renewal window opens. */
+export function playSessionRenewalAlert(): void {
+  if (!notificationSoundsEnabled()) return;
+  lastPlayAt = Date.now();
+
+  const audio = audioContext();
+  if (!audio) return;
+
+  const resume = audio.state === 'suspended' ? audio.resume() : Promise.resolve();
+  void resume.then(() => {
+    const t0 = audio.currentTime + 0.01;
+    const pulses = [
+      { freq: 523, start: 0, gain: 0.14 },
+      { freq: 659, start: 0.28, gain: 0.16 },
+      { freq: 784, start: 0.56, gain: 0.18 },
+      { freq: 988, start: 0.84, gain: 0.2 },
+    ];
+    for (const pulse of pulses) {
+      tone(audio, pulse.freq, t0 + pulse.start, 0.22, pulse.gain, 'triangle');
+      tone(audio, pulse.freq * 0.5, t0 + pulse.start + 0.04, 0.18, pulse.gain * 0.35, 'sine');
+    }
+    tone(audio, 880, t0 + 1.15, 0.35, 0.12, 'sine');
+    tone(audio, 1108, t0 + 1.55, 0.4, 0.14, 'sine');
+  });
+}
+
 export function shouldPlaySoundForToast(kind: NotifySoundKind, explicit?: boolean): boolean {
   if (explicit === false) return false;
   if (explicit === true) return true;

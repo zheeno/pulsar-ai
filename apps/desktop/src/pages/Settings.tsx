@@ -428,10 +428,12 @@ export default function SettingsPage() {
     let unlistenExpired: (() => void) | undefined;
     let unlistenExpiring: (() => void) | undefined;
     void onExpired((event) => {
-      toast.warning(
-        `${event.brokerId === 'busha' ? 'Busha' : event.brokerId} session expired. Reconnect to resume trading — crypto mode stays on.`,
-        'Live broker',
-      );
+      if (event.brokerId !== 'busha') {
+        toast.warning(
+          `${event.brokerId} session expired. Reconnect to resume trading.`,
+          'Live broker',
+        );
+      }
       void listSessions()
         .then(setAuthBridgeAccounts)
         .catch(() => {});
@@ -439,14 +441,7 @@ export default function SettingsPage() {
     }).then((fn) => {
       unlistenExpired = fn;
     });
-    void onExpiring((event) => {
-      if (event.brokerId === 'busha') {
-        toast.warning(
-          'Busha session is expiring. Open Settings and tap Reconnect Busha to sign in again before live trading pauses.',
-          'Live broker',
-          { sound: true },
-        );
-      }
+    void onExpiring(() => {
       void listSessions()
         .then(setAuthBridgeAccounts)
         .catch(() => {});
@@ -823,6 +818,7 @@ export default function SettingsPage() {
       {bushaExpired ? (
         <div className="banner banner-warn" role="status" style={{ marginBottom: 16 }}>
           Busha session expired. Live crypto trading is paused — you are still in crypto mode (not NGX sandbox).
+          Sign in via the Busha login window, or tap Reconnect below.
           <button
             type="button"
             className="btn btn-primary"
@@ -1008,7 +1004,7 @@ export default function SettingsPage() {
         </p>
         {bushaExpired ? (
           <div className="banner banner-warn" style={{ marginBottom: 12 }} role="status">
-            Session expired. Live crypto trading is paused until you reconnect.
+            Session expired. Sign in via the Busha login window, or tap Reconnect below.
           </div>
         ) : null}
         <div className="profile-card__badges" style={{ marginBottom: 12 }}>

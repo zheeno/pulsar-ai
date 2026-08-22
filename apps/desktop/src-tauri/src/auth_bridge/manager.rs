@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Runtime, Url, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, Runtime, Url, WebviewWindow};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -12,7 +13,8 @@ use super::capture::{self, digest};
 use super::config::{self, origin_allowed, BrokerAuthConfig};
 use super::probe;
 use super::session::{
-    self, AuthSessionStatus, SessionStatusKind, EXPIRED_EVENT, EXPIRING_EVENT, RENEWAL_LEAD_SECS,
+    self, AuthSessionStatus, SessionStatusKind, EXPIRED_EVENT, EXPIRING_EVENT,
+    PROACTIVE_RENEW_GRACE_SECS, RENEWAL_LEAD_SECS,
 };
 use super::window as auth_window;
 
@@ -31,6 +33,14 @@ struct InFlight {
     labels: HashSet<String>,
     seen: HashSet<[u8; 32]>,
     tx: Option<oneshot::Sender<FinishReason>>,
+    proactive_renew: bool,
+    renew_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+enum AuthMode {
+    Manual,
+    ProactiveRenew { expires_at: DateTime<Utc> },
 }
 
 #[derive(Debug)]
@@ -75,6 +85,12 @@ pub fn clear_event_dedupe(broker_id: &str) {
     m.remove(&format!("expiring:{broker_id}"));
 }
 
+pub fn proactive_renew_timeout(expires_at: DateTime<Utc>) -> Duration {
+    let grace_end = expires_at + chrono::Duration::seconds(PROACTIVE_RENEW_GRACE_SECS);
+    let remaining = (grace_end - Utc::now()).num_seconds().max(1) as u64;
+    Duration::from_secs(remaining)
+}
+
 impl AuthBridge {
     pub fn new() -> Self {
         Self {
@@ -94,21 +110,104 @@ impl AuthBridge {
         self.inner.lock().inflight.contains_key(broker_id)
     }
 
-    pub fn on_window_destroyed(&self, broker_id: &str, label: &str) {
-        let tx = {
+    pub fn on_window_destroyed<R: Runtime>(&self, app: &AppHandle<R>, broker_id: &str, label: &str) {
+        enum Action {
+            Respawn {
+                config: BrokerAuthConfig,
+                session_nonce: String,
+                window_label: String,
+            },
+            Cancel(oneshot::Sender<FinishReason>),
+            None,
+        }
+
+        let action = {
             let mut inner = self.inner.lock();
             let Some(flight) = inner.inflight.get_mut(broker_id) else {
                 return;
             };
             flight.labels.remove(label);
-            if flight.labels.is_empty() {
-                inner.inflight.remove(broker_id).and_then(|mut f| f.tx.take())
+            if !flight.labels.is_empty() {
+                return;
+            }
+            if flight.proactive_renew {
+                if let Some(expires_at) = flight.renew_expires_at {
+                    let grace_end =
+                        expires_at + chrono::Duration::seconds(PROACTIVE_RENEW_GRACE_SECS);
+                    if Utc::now() < grace_end {
+                        let config = flight.config.clone();
+                        let session_nonce = flight.session_nonce.clone();
+                        let window_label = format!(
+                            "auth-bridge-{}-{}",
+                            config.id,
+                            &Uuid::new_v4().to_string()[..8]
+                        );
+                        flight.labels.insert(window_label.clone());
+                        Action::Respawn {
+                            config,
+                            session_nonce,
+                            window_label,
+                        }
+                    } else {
+                        inner
+                            .inflight
+                            .remove(broker_id)
+                            .and_then(|mut f| f.tx.take())
+                            .map(Action::Cancel)
+                            .unwrap_or(Action::None)
+                    }
+                } else {
+                    inner
+                        .inflight
+                        .remove(broker_id)
+                        .and_then(|mut f| f.tx.take())
+                        .map(Action::Cancel)
+                        .unwrap_or(Action::None)
+                }
             } else {
-                None
+                inner
+                    .inflight
+                    .remove(broker_id)
+                    .and_then(|mut f| f.tx.take())
+                    .map(Action::Cancel)
+                    .unwrap_or(Action::None)
             }
         };
-        if let Some(tx) = tx {
-            let _ = tx.send(FinishReason::Cancelled);
+
+        match action {
+            Action::Respawn {
+                config,
+                session_nonce,
+                window_label,
+            } => {
+                tracing::info!(
+                    target: "auth_bridge",
+                    broker = %config.id,
+                    "proactive renew window closed — reopening login"
+                );
+                let title = format!("Renew {} session", config.display_name);
+                if let Err(e) = auth_window::spawn_auth_window(
+                    app,
+                    self,
+                    &config,
+                    &session_nonce,
+                    &window_label,
+                    Some(&title),
+                    true,
+                ) {
+                    tracing::warn!(
+                        target: "auth_bridge",
+                        broker = %config.id,
+                        error = %e,
+                        "proactive renew respawn failed"
+                    );
+                    self.cancel_inflight(app, broker_id);
+                }
+            }
+            Action::Cancel(tx) => {
+                let _ = tx.send(FinishReason::Cancelled);
+            }
+            Action::None => {}
         }
     }
 
@@ -117,11 +216,45 @@ impl AuthBridge {
         app: &AppHandle<R>,
         broker_id: &str,
     ) -> Result<AuthSessionStatus, String> {
-        let config = config::get(broker_id).map_err(|e| e.to_string())?;
-        self.cancel_inflight(app, &config.id);
+        self.authenticate_with_mode(app, broker_id, AuthMode::Manual)
+            .await
+    }
 
-        // Always use a clean login URL. Cookie-backed renewUrl leaves the user in a
-        // logged-in Busha shell with no login form and no fresh Bearer to capture.
+    pub async fn authenticate_proactive_renew<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        broker_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<AuthSessionStatus, String> {
+        self.authenticate_with_mode(
+            app,
+            broker_id,
+            AuthMode::ProactiveRenew { expires_at },
+        )
+        .await
+    }
+
+    async fn authenticate_with_mode<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        broker_id: &str,
+        mode: AuthMode,
+    ) -> Result<AuthSessionStatus, String> {
+        let config = config::get(broker_id).map_err(|e| e.to_string())?;
+        if matches!(mode, AuthMode::Manual) {
+            self.cancel_inflight(app, &config.id);
+        }
+
+        let (proactive_renew, renew_expires_at, window_title, focus) = match &mode {
+            AuthMode::Manual => (false, None, None, false),
+            AuthMode::ProactiveRenew { expires_at } => (
+                true,
+                Some(*expires_at),
+                Some(format!("Renew {} session", config.display_name)),
+                true,
+            ),
+        };
+
         let session_nonce = Uuid::new_v4().to_string();
         let window_label = format!("auth-bridge-{}-{}", config.id, &session_nonce[..8]);
         let (tx, rx) = oneshot::channel();
@@ -138,13 +271,21 @@ impl AuthBridge {
                     labels,
                     seen: HashSet::new(),
                     tx: Some(tx),
+                    proactive_renew,
+                    renew_expires_at,
                 },
             );
         }
 
-        if let Err(e) =
-            auth_window::spawn_auth_window(app, self, &config, &session_nonce, &window_label)
-        {
+        if let Err(e) = auth_window::spawn_auth_window(
+            app,
+            self,
+            &config,
+            &session_nonce,
+            &window_label,
+            window_title.as_deref(),
+            focus,
+        ) {
             self.cancel_inflight(app, &config.id);
             return Err(e);
         }
@@ -152,13 +293,26 @@ impl AuthBridge {
         tracing::info!(
             target: "auth_bridge",
             broker = %config.id,
+            proactive = proactive_renew,
             "auth window opened"
         );
 
-        let timeout = Duration::from_millis(config.timeout_ms.max(5_000));
+        let timeout = match &mode {
+            AuthMode::Manual => Duration::from_millis(config.timeout_ms.max(5_000)),
+            AuthMode::ProactiveRenew { expires_at } => proactive_renew_timeout(*expires_at),
+        };
         let outcome = tokio::time::timeout(timeout, rx).await;
         match outcome {
-            Ok(Ok(FinishReason::Captured(status))) => Ok(status),
+            Ok(Ok(FinishReason::Captured(status))) => {
+                if proactive_renew {
+                    tracing::info!(
+                        target: "auth_bridge",
+                        broker = %config.id,
+                        "proactive re-auth succeeded"
+                    );
+                }
+                Ok(status)
+            }
             Ok(Ok(FinishReason::Cancelled)) => Err("Login cancelled.".into()),
             Ok(Ok(FinishReason::TimedOut)) => Err("Login timed out.".into()),
             Ok(Err(_)) => Err("Login cancelled.".into()),
@@ -338,6 +492,48 @@ pub fn notify_unauthorized<R: Runtime>(app: &AppHandle<R>, broker_id: &str) {
     tracing::info!(target: "auth_bridge", broker = %broker_id, "session unauthorized");
 }
 
+fn spawn_proactive_reauth<R: Runtime>(
+    app: AppHandle<R>,
+    broker_id: &str,
+    expires_at: DateTime<Utc>,
+) {
+    let bridge = {
+        let Some(state) = app.try_state::<AuthBridge>() else {
+            return;
+        };
+        if state.is_awaiting(broker_id) {
+            tracing::info!(
+                target: "auth_bridge",
+                broker = %broker_id,
+                "proactive re-auth skipped — auth already in flight"
+            );
+            return;
+        }
+        state.inner().clone()
+    };
+    let broker_id = broker_id.to_string();
+    tracing::info!(
+        target: "auth_bridge",
+        broker = %broker_id,
+        expires_at = %expires_at,
+        "proactive re-auth starting"
+    );
+    tauri::async_runtime::spawn(async move {
+        match bridge
+            .authenticate_proactive_renew(&app, &broker_id, expires_at)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                target: "auth_bridge",
+                broker = %broker_id,
+                error = %e,
+                "proactive re-auth failed"
+            ),
+        }
+    });
+}
+
 fn sweep_sessions<R: Runtime>(app: &AppHandle<R>) {
     let Ok(cfgs) = config::builtin_configs() else {
         return;
@@ -380,14 +576,14 @@ fn sweep_sessions<R: Runtime>(app: &AppHandle<R>) {
                             expires_at,
                         },
                     );
-                    // Do not auto-open Auth Bridge: a cookie-backed Busha shell stays
-                    // logged-in and never emits a fresh Bearer for capture. Soft-expire
-                    // + Settings Reconnect (clean login) is the reliable path.
+                    if cfg.id == "busha" {
+                        spawn_proactive_reauth(app.clone(), &cfg.id, expires_at);
+                    }
                     tracing::info!(
                         target: "auth_bridge",
                         broker = %cfg.id,
                         expires_at = %expires_at,
-                        "session expiring — reconnect required (no auto webview)"
+                        "session expiring — proactive renew triggered"
                     );
                 }
             }
@@ -461,6 +657,25 @@ mod tests {
         format!("http://127.0.0.1:{}", addr.port())
     }
 
+    #[test]
+    fn proactive_renew_timeout_uses_grace_not_config_timeout() {
+        let expires_at = Utc::now() + chrono::Duration::minutes(5);
+        let timeout = proactive_renew_timeout(expires_at);
+        let expected_secs = (expires_at + chrono::Duration::seconds(PROACTIVE_RENEW_GRACE_SECS)
+            - Utc::now())
+        .num_seconds()
+        .max(1) as u64;
+        assert!(timeout.as_secs() >= expected_secs.saturating_sub(2));
+        assert!(timeout.as_secs() <= expected_secs + 2);
+        assert!(timeout.as_secs() > 300);
+    }
+
+    #[test]
+    fn proactive_renew_not_awaiting_initially() {
+        let bridge = AuthBridge::new();
+        assert!(!bridge.is_awaiting("busha"));
+    }
+
     #[tokio::test]
     async fn capture_probe_store_round_trip_spa_bearer() {
         let url = serve_json(200, r#"{"email":"spa@example.com"}"#);
@@ -478,7 +693,7 @@ mod tests {
             probed.account_hint,
             probed.profile_id,
         )
-            .unwrap();
+        .unwrap();
         let stored = get_token("mock-spa").unwrap().unwrap();
         assert_eq!(stored, token);
         session::revoke("mock-spa").unwrap();

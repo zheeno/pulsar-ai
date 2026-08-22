@@ -11,6 +11,9 @@ pub const EXPIRING_EVENT: &str = "auth-bridge:expiring";
 /// Lead time before JWT `exp` to start a silent renew attempt.
 pub const RENEWAL_LEAD_SECS: i64 = 300;
 
+/// Extra time after JWT `exp` to keep a proactive renew webview open for in-flight logins.
+pub const PROACTIVE_RENEW_GRACE_SECS: i64 = 600;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionStatusKind {
