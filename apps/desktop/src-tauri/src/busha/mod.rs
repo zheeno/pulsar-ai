@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -81,7 +82,7 @@ pub struct BushaSizedFee {
 
 pub struct BushaClient {
     http: reqwest::Client,
-    token: String,
+    token: Mutex<String>,
     profile_id: String,
 }
 
@@ -93,9 +94,20 @@ impl BushaClient {
             .ok_or_else(|| anyhow!("Busha profile id is missing; reconnect Busha"))?;
         Ok(Self {
             http: crate::http_client::http_client()?,
-            token,
+            token: Mutex::new(token),
             profile_id,
         })
+    }
+
+    fn reload_token(&self) -> Result<()> {
+        let fresh = crate::auth_bridge::get_token("busha")?
+            .ok_or_else(|| anyhow!("Busha is not connected"))?;
+        *self.token.lock() = fresh;
+        Ok(())
+    }
+
+    fn bearer_token(&self) -> String {
+        self.token.lock().clone()
     }
 
     pub fn market_is_open(&self) -> Result<bool> {
@@ -129,10 +141,11 @@ impl BushaClient {
 
     fn headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        let auth = if self.token.to_ascii_lowercase().starts_with("bearer ") {
-            self.token.clone()
+        let token = self.bearer_token();
+        let auth = if token.to_ascii_lowercase().starts_with("bearer ") {
+            token
         } else {
-            format!("Bearer {}", self.token)
+            format!("Bearer {token}")
         };
         headers.insert(
             AUTHORIZATION,
@@ -169,6 +182,21 @@ impl BushaClient {
             .send()
             .await
             .context("Busha GET")?;
+        if response.status().as_u16() == 401 {
+            if crate::auth_bridge::refresh_busha_session().await.is_ok() {
+                let _ = self.reload_token();
+                let response = self
+                    .http
+                    .get(&url)
+                    .headers(self.headers()?)
+                    .send()
+                    .await
+                    .context("Busha GET retry")?;
+                return self.read_json(response).await;
+            }
+            let _ = crate::auth_bridge::session::mark_expired("busha");
+            return Err(anyhow!("Busha session expired. Sign in again."));
+        }
         self.read_json(response).await
     }
 
@@ -182,15 +210,27 @@ impl BushaClient {
             .send()
             .await
             .context("Busha POST")?;
+        if response.status().as_u16() == 401 {
+            if crate::auth_bridge::refresh_busha_session().await.is_ok() {
+                let _ = self.reload_token();
+                let response = self
+                    .http
+                    .post(&url)
+                    .headers(self.headers()?)
+                    .json(body)
+                    .send()
+                    .await
+                    .context("Busha POST retry")?;
+                return self.read_json(response).await;
+            }
+            let _ = crate::auth_bridge::session::mark_expired("busha");
+            return Err(anyhow!("Busha session expired. Sign in again."));
+        }
         self.read_json(response).await
     }
 
     async fn read_json(&self, response: reqwest::Response) -> Result<Value> {
         let status = response.status();
-            if status.as_u16() == 401 {
-            let _ = crate::auth_bridge::session::mark_expired("busha");
-            return Err(anyhow!("Busha session expired. Sign in again."));
-        }
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(anyhow!(busha_http_error(status.as_u16(), &text)));

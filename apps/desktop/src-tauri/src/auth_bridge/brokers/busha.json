@@ -19,7 +19,7 @@
   "capture": {
     "headerNames": ["authorization"],
     "headerPattern": "^Bearer\\s+([A-Za-z0-9._~+/=-]+)$",
-    "cookieNames": [],
+    "cookieNames": ["app__session"],
     "websocketUrlTokenParam": null
   },
   "probe": {

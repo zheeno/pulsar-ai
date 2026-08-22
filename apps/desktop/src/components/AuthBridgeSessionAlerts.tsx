@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
-import { onExpired, onExpiring } from './auth-bridge';
-import { playSessionRenewalAlert } from './notify-sound';
-import { useToast } from './toast';
+import { onExpired, onExpiring } from '../lib/auth-bridge';
+import { playSessionRenewalAlert } from '../lib/notify-sound';
+import { useToast } from '../lib/toast';
 
 /** Global Busha auth-bridge session alerts (any page). */
 export default function AuthBridgeSessionAlerts() {

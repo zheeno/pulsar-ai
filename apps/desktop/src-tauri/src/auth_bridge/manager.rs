@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, Url, WebviewWindow};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use super::busha_session::{self, BushaWebSession};
 use super::capture::{self, digest};
 use super::config::{self, origin_allowed, BrokerAuthConfig};
 use super::probe;
@@ -35,6 +36,7 @@ struct InFlight {
     tx: Option<oneshot::Sender<FinishReason>>,
     proactive_renew: bool,
     renew_expires_at: Option<DateTime<Utc>>,
+    busha_web: Option<BushaWebSession>,
 }
 
 #[derive(Debug)]
@@ -273,6 +275,7 @@ impl AuthBridge {
                     tx: Some(tx),
                     proactive_renew,
                     renew_expires_at,
+                    busha_web: None,
                 },
             );
         }
@@ -368,6 +371,31 @@ impl AuthBridge {
             }
         }
 
+        if config.id == "busha" && busha_session::is_app_session_cookie(header_name) {
+            match busha_session::parse_app_session_cookie(value) {
+                Ok(web) => {
+                    let mut inner = self.inner.lock();
+                    if let Some(flight) = inner.inflight.get_mut(&config.id) {
+                        flight.busha_web = Some(web);
+                    }
+                    tracing::info!(
+                        target: "auth_bridge",
+                        broker = %config.id,
+                        "captured Busha app__session for silent refresh"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "auth_bridge",
+                        broker = %config.id,
+                        error = %e,
+                        "failed to parse app__session cookie"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         let candidate = match capture::match_candidate(&config, header_name, value) {
             Ok(c) => c,
             Err(_) => {
@@ -408,12 +436,31 @@ impl AuthBridge {
             return Err("rejected".into());
         }
 
-        let status = session::persist_valid(
+        let mut busha_web = {
+            let inner = self.inner.lock();
+            inner
+                .inflight
+                .get(&config.id)
+                .and_then(|f| f.busha_web.clone())
+        };
+        if config.id == "busha" && busha_web.is_none() {
+            if let Some(web) = auth_window::read_busha_web_session(app, window_label) {
+                tracing::info!(
+                    target: "auth_bridge",
+                    broker = "busha",
+                    "captured Busha app__session at persist time"
+                );
+                busha_web = Some(web);
+            }
+        }
+
+        let status = session::persist_valid_with_web(
             &config,
             &candidate.header_name,
             &candidate.value,
             probed.account_hint,
             probed.profile_id,
+            busha_web,
         )
         .map_err(|e| e.to_string())?;
 
@@ -492,6 +539,45 @@ pub fn notify_unauthorized<R: Runtime>(app: &AppHandle<R>, broker_id: &str) {
     tracing::info!(target: "auth_bridge", broker = %broker_id, "session unauthorized");
 }
 
+fn spawn_silent_busha_refresh<R: Runtime>(
+    app: AppHandle<R>,
+    expires_at: DateTime<Utc>,
+) {
+    let epoch = expires_at.to_rfc3339();
+    if !should_emit("silent_refresh", "busha", &epoch) {
+        return;
+    }
+    tracing::info!(
+        target: "auth_bridge",
+        broker = "busha",
+        expires_at = %expires_at,
+        "silent Busha refresh starting"
+    );
+    tauri::async_runtime::spawn(async move {
+        match super::busha_refresh::refresh_busha_session().await {
+            Ok(_) => {
+                clear_event_dedupe("busha");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "auth_bridge",
+                    broker = "busha",
+                    error = %e,
+                    "silent Busha refresh failed — falling back to login window"
+                );
+                spawn_proactive_reauth(app.clone(), "busha", expires_at);
+                let _ = app.emit(
+                    EXPIRING_EVENT,
+                    ExpiringPayload {
+                        broker_id: "busha".into(),
+                        expires_at,
+                    },
+                );
+            }
+        }
+    });
+}
+
 fn spawn_proactive_reauth<R: Runtime>(
     app: AppHandle<R>,
     broker_id: &str,
@@ -542,6 +628,13 @@ fn sweep_sessions<R: Runtime>(app: &AppHandle<R>) {
         let status = session::status_for(&cfg);
         match status.status {
             SessionStatusKind::Expired => {
+                if cfg.id == "busha" && super::busha_refresh::can_silent_refresh_busha() {
+                    let expires_at = status
+                        .expires_at
+                        .unwrap_or_else(chrono::Utc::now);
+                    spawn_silent_busha_refresh(app.clone(), expires_at);
+                    continue;
+                }
                 let epoch = status
                     .expires_at
                     .map(|t| t.to_rfc3339())
@@ -568,6 +661,10 @@ fn sweep_sessions<R: Runtime>(app: &AppHandle<R>) {
                     continue;
                 }
                 let epoch = expires_at.to_rfc3339();
+                if cfg.id == "busha" && super::busha_refresh::can_silent_refresh_busha() {
+                    spawn_silent_busha_refresh(app.clone(), expires_at);
+                    continue;
+                }
                 if should_emit("expiring", &cfg.id, &epoch) {
                     let _ = app.emit(
                         EXPIRING_EVENT,
@@ -583,7 +680,7 @@ fn sweep_sessions<R: Runtime>(app: &AppHandle<R>) {
                         target: "auth_bridge",
                         broker = %cfg.id,
                         expires_at = %expires_at,
-                        "session expiring — proactive renew triggered"
+                        "session expiring — login window renew triggered"
                     );
                 }
             }

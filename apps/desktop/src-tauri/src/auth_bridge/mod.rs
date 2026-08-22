@@ -1,3 +1,5 @@
+mod busha_refresh;
+mod busha_session;
 mod capture;
 pub(crate) mod config;
 mod interceptor;
@@ -7,6 +9,8 @@ pub(crate) mod session;
 pub(crate) mod store;
 mod window;
 
+#[allow(unused_imports)]
+pub use busha_refresh::{can_silent_refresh_busha, refresh_busha_session};
 #[allow(unused_imports)]
 pub use manager::{get_token, notify_unauthorized, AuthBridge};
 #[allow(unused_imports)]

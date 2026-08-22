@@ -16,6 +16,13 @@ pub struct StoredCredential {
     pub account_hint: Option<String>,
     #[serde(default)]
     pub profile_id: Option<String>,
+    /// Signed `app__session` cookie value for Busha refresh-token POST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busha_session_cookie: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busha_csrf_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busha_refresh_token: Option<String>,
 }
 
 static TEST_STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -105,6 +112,9 @@ mod tests {
             expires_at: Utc::now() + Duration::hours(1),
             account_hint: Some("user@example.com".into()),
             profile_id: Some("prof_test".into()),
+            busha_session_cookie: None,
+            busha_csrf_token: None,
+            busha_refresh_token: None,
         };
         put("test-broker", &cred).unwrap();
         let loaded = get("test-broker").unwrap().unwrap();

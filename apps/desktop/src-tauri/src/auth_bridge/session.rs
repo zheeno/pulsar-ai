@@ -77,15 +77,39 @@ pub fn persist_valid(
     account_hint: Option<String>,
     profile_id: Option<String>,
 ) -> anyhow::Result<AuthSessionStatus> {
+    persist_valid_with_web(config, header_name, value, account_hint, profile_id, None)
+}
+
+pub fn persist_valid_with_web(
+    config: &BrokerAuthConfig,
+    header_name: &str,
+    value: &str,
+    account_hint: Option<String>,
+    profile_id: Option<String>,
+    web: Option<super::busha_session::BushaWebSession>,
+) -> anyhow::Result<AuthSessionStatus> {
     let expires_at = expiry_for(config, value);
-    let cred = StoredCredential {
+    let mut cred = StoredCredential {
         kind: "header".into(),
         header_name: header_name.to_string(),
         token: value.to_string(),
         expires_at,
         account_hint,
         profile_id,
+        busha_session_cookie: None,
+        busha_csrf_token: None,
+        busha_refresh_token: None,
     };
+    if config.id == "busha" {
+        if let Some(existing) = store::get(&config.id)? {
+            cred.busha_session_cookie = existing.busha_session_cookie;
+            cred.busha_csrf_token = existing.busha_csrf_token;
+            cred.busha_refresh_token = existing.busha_refresh_token;
+        }
+        if let Some(web) = web {
+            super::busha_refresh::apply_web_session(&mut cred, &web);
+        }
+    }
     store::put(&config.id, &cred)?;
     tracing::info!(
         target: "auth_bridge",
@@ -93,6 +117,7 @@ pub fn persist_valid(
         expires_at = %expires_at,
         hint_present = cred.account_hint.is_some(),
         profile_present = cred.profile_id.is_some(),
+        silent_refresh = cred.busha_session_cookie.is_some() && cred.busha_csrf_token.is_some(),
         "session stored"
     );
     Ok(status_for(config))

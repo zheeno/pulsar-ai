@@ -1000,6 +1000,7 @@ export default function SettingsPage() {
         <h2 id="busha-heading">Busha</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
           Cash and crypto lots come from Busha in NGN. Cycles place live transfers when live trading is on.
+          When connecting, check <strong>Keep me logged in</strong> on Busha so Pulsar can renew your session silently.
           Disconnect to leave crypto mode and restore NGX brokers.
         </p>
         {bushaExpired ? (

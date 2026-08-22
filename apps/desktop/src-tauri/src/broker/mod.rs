@@ -641,6 +641,9 @@ mod tests {
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
                 account_hint: Some("user".into()),
                 profile_id: Some("prof_test".into()),
+                busha_session_cookie: None,
+                busha_csrf_token: None,
+                busha_refresh_token: None,
             },
         )
         .unwrap();
@@ -667,6 +670,9 @@ mod tests {
                 expires_at: chrono::Utc::now() - chrono::Duration::minutes(5),
                 account_hint: Some("user".into()),
                 profile_id: Some("prof_test".into()),
+                busha_session_cookie: None,
+                busha_csrf_token: None,
+                busha_refresh_token: None,
             },
         )
         .unwrap();

@@ -5,6 +5,7 @@ use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Manager, Runtime, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 use uuid::Uuid;
 
+use super::busha_session::{self, BushaWebSession};
 use super::config::{origin_allowed, BrokerAuthConfig};
 use super::interceptor;
 use super::manager::AuthBridge;
@@ -220,6 +221,30 @@ pub(crate) fn first_matching_cookie(
     names: &[String],
 ) -> Option<(String, String)> {
     all_matching_cookies(cookies, names).into_iter().next()
+}
+
+/// Last-chance read before auth window teardown — avoids losing `app__session` when
+/// the Bearer interceptor wins the race against the cookie poller.
+pub fn read_busha_web_session<R: Runtime>(
+    app: &AppHandle<R>,
+    window_label: &str,
+) -> Option<BushaWebSession> {
+    let window = app.get_webview_window(window_label)?;
+    let names = vec!["app__session".into()];
+    for (_, value) in read_named_cookies(&window, &names) {
+        match busha_session::parse_app_session_cookie(&value) {
+            Ok(web) => return Some(web),
+            Err(e) => {
+                tracing::warn!(
+                    target: "auth_bridge",
+                    broker = "busha",
+                    error = %e,
+                    "failed to parse app__session at persist time"
+                );
+            }
+        }
+    }
+    None
 }
 
 pub fn teardown<R: Runtime>(app: &AppHandle<R>, labels: &HashSet<String>) {
