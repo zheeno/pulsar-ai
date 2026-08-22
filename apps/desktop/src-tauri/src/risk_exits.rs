@@ -243,6 +243,16 @@ pub fn sell_qty_for_exit(available: f64, fraction: f64) -> f64 {
 }
 
 pub fn sell_qty_for_exit_ex(available: f64, fraction: f64, whole_shares: bool) -> f64 {
+    sell_qty_for_exit_with_decimals(available, fraction, whole_shares, None)
+}
+
+/// Optional `crypto_decimals` (max 8 dp) floors fractional crypto exit sizes before quoting.
+pub fn sell_qty_for_exit_with_decimals(
+    available: f64,
+    fraction: f64,
+    whole_shares: bool,
+    crypto_decimals: Option<usize>,
+) -> f64 {
     if available <= 0.0 {
         return 0.0;
     }
@@ -254,12 +264,16 @@ pub fn sell_qty_for_exit_ex(available: f64, fraction: f64, whole_shares: bool) -
     if frac >= 1.0 - 1e-9 {
         return if whole_shares {
             available.floor().max(0.0)
+        } else if let Some(d) = crypto_decimals {
+            crate::busha::floor_crypto_amount(available, d)
         } else {
             available.max(0.0)
         };
     }
     let qty = if whole_shares {
         (available * frac).floor()
+    } else if let Some(d) = crypto_decimals {
+        crate::busha::floor_crypto_amount(available * frac, d)
     } else {
         available * frac
     };
@@ -269,6 +283,8 @@ pub fn sell_qty_for_exit_ex(available: f64, fraction: f64, whole_shares: bool) -
         0.0
     } else if whole_shares {
         qty.min(available.floor())
+    } else if let Some(d) = crypto_decimals {
+        qty.min(crate::busha::floor_crypto_amount(available, d))
     } else {
         qty.min(available)
     }
@@ -379,6 +395,10 @@ mod tests {
         assert_eq!(sell_qty_for_exit(80.0, 1.0), 80.0);
         assert_eq!(sell_qty_for_exit_ex(0.75, 1.0, false), 0.75);
         assert_eq!(sell_qty_for_exit_ex(1.75, 1.0, true), 1.0);
+        assert_eq!(
+            sell_qty_for_exit_with_decimals(12.345678912, 1.0, false, Some(8)),
+            12.34567891
+        );
     }
 
     #[test]
