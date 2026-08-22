@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-portfolio-quotes"
+description = "Enables the portfolio_quotes command without any pre-configured scope."
+commands.allow = ["portfolio_quotes"]
+
+[[permission]]
+identifier = "deny-portfolio-quotes"
+description = "Denies the portfolio_quotes command without any pre-configured scope."
+commands.deny = ["portfolio_quotes"]

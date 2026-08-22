@@ -80,7 +80,15 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
     }
 
     let calendar = TradingCalendar::default();
-    if !crate::runtime_util::market_activity_allowed(&calendar) {
+    let crypto_mode = crate::broker::crypto_mode();
+    if crate::broker::crypto_reconnect_required() {
+        tracing::info!(
+            target: "risk_monitor",
+            "skipped — Busha session expired, reconnect required"
+        );
+        return Ok(None);
+    }
+    if !crypto_mode && !crate::runtime_util::market_activity_allowed(&calendar) {
         return Ok(None);
     }
 
@@ -89,10 +97,6 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
         return Ok(None);
     };
 
-    let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
-    let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
-    let client =
-        crate::ngx::NgxPulseClient::from_settings(&settings, pulse_password, pulse_api_key);
     let broker = crate::broker::open_live_broker(&settings);
 
     block_on_local(async {
@@ -137,29 +141,87 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
 
         let symbols: Vec<String> = lots.iter().map(|l| l.symbol.clone()).collect();
         let mut prices: HashMap<String, f64> = HashMap::new();
+        let today = calendar.today_wat();
 
-        match client.get_latest_quotes(&symbols).await {
-            Ok(quotes) => {
-                let _ = state.db.with_conn(|conn| {
-                    for q in &quotes {
-                        if q.last > 0.0 {
-                            let _ = crate::ingest::IngestionService::upsert_last_quote(
+        if crypto_mode {
+            // Busha is the sole market-data source in crypto mode — never Pulse.
+            match crate::busha::BushaClient::from_store() {
+                Ok(busha) => match busha.pairs_ngn().await {
+                    Ok(pairs) => {
+                        let _ = state.db.with_conn(|conn| crate::busha::persist_pairs(conn, &pairs));
+                        match state.db.with_conn(|conn| {
+                            crate::busha::apply_sell_marks(
                                 conn,
                                 &state.cache,
-                                q,
-                            );
-                            prices.insert(q.symbol.to_uppercase(), q.last);
+                                &pairs,
+                                &symbols,
+                                &today,
+                            )
+                        }) {
+                            Ok(marks) => {
+                                prices.extend(marks);
+                                tracing::debug!(
+                                    target: "risk_monitor",
+                                    n = prices.len(),
+                                    "busha sell marks applied"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "risk_monitor",
+                                    error = %e,
+                                    "failed to persist busha sell marks"
+                                );
+                            }
                         }
                     }
-                    Ok::<_, anyhow::Error>(())
-                });
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "risk_monitor",
+                            error = %e,
+                            "busha pairs refresh failed; falling back to cache/db"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "risk_monitor",
+                        error = %e,
+                        "busha client unavailable for risk marks"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "risk_monitor",
-                    error = %e,
-                    "pulse quote refresh failed; falling back to cache/db"
-                );
+        } else {
+            let pulse_password = get_secret(SECRET_PULSE_PASSWORD)?;
+            let pulse_api_key = get_secret(SECRET_PULSE_API_KEY)?;
+            let client = crate::ngx::NgxPulseClient::from_settings(
+                &settings,
+                pulse_password,
+                pulse_api_key,
+            );
+            match client.get_latest_quotes(&symbols).await {
+                Ok(quotes) => {
+                    let _ = state.db.with_conn(|conn| {
+                        for q in &quotes {
+                            if q.last > 0.0 {
+                                let _ = crate::ingest::IngestionService::upsert_last_quote(
+                                    conn,
+                                    &state.cache,
+                                    q,
+                                );
+                                prices.insert(q.symbol.to_uppercase(), q.last);
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "risk_monitor",
+                        error = %e,
+                        "pulse quote refresh failed; falling back to cache/db"
+                    );
+                }
             }
         }
 
@@ -282,13 +344,17 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
 
         state.db.with_conn(|conn| {
             for exit in &candidates {
-                let qty = crate::risk_exits::sell_qty_for_exit(
+                let qty = crate::risk_exits::sell_qty_for_exit_ex(
                     lots
                         .iter()
                         .find(|l| l.symbol.eq_ignore_ascii_case(&exit.symbol))
                         .map(|l| l.quantity)
                         .unwrap_or(0.0),
                     exit.sell_fraction,
+                    broker
+                        .as_ref()
+                        .map(|s| s.id().whole_shares())
+                        .unwrap_or(true),
                 );
                 if qty <= 0.0 {
                     continue;
@@ -370,7 +436,6 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
             tracing::info!(
                 target: "risk_monitor",
                 signals = signal_ids.len(),
-                live_trading_enabled = settings.live_trading_enabled,
                 live_market_open,
                 skip_result,
                 "risk exits persisted but live execution skipped"
@@ -475,6 +540,9 @@ pub(crate) fn recent_unexecuted_rule_sell_id(
            AND model_name IN ('rules:stop-loss', 'rules:take-profit', 'rules:time-stop', 'rules:flatten')
            AND executed = 0
            AND generated_at >= datetime('now', '-24 hours')
+           AND COALESCE(risk_policy_result, '') NOT IN (
+             'BLOCKED_NOTIONAL', 'BLOCKED_NO_POSITION', 'BLOCKED_SYMBOL'
+           )
          ORDER BY generated_at DESC
          LIMIT 1",
         [symbol],
@@ -500,7 +568,8 @@ mod tests {
                 action TEXT,
                 model_name TEXT,
                 executed INTEGER,
-                generated_at TEXT
+                generated_at TEXT,
+                risk_policy_result TEXT
              );",
         )
         .unwrap();

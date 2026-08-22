@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { playNotificationSound, shouldPlaySoundForToast } from './notify-sound';
 
 export type ToastKind = 'success' | 'info' | 'warning' | 'error';
 
@@ -15,16 +16,23 @@ export type ToastInput = {
   message: string;
   title?: string;
   durationMs?: number;
+  /** Override default sound policy (info silent; success/warning/error play). */
+  sound?: boolean;
 };
 
 type ToastItem = ToastInput & { id: string };
 
+type ToastOptions = {
+  sound?: boolean;
+  durationMs?: number;
+};
+
 type ToastContextValue = {
   push: (toast: ToastInput) => void;
-  success: (message: string, title?: string) => void;
-  info: (message: string, title?: string) => void;
-  warning: (message: string, title?: string) => void;
-  error: (message: string, title?: string) => void;
+  success: (message: string, title?: string, opts?: ToastOptions) => void;
+  info: (message: string, title?: string, opts?: ToastOptions) => void;
+  warning: (message: string, title?: string, opts?: ToastOptions) => void;
+  error: (message: string, title?: string, opts?: ToastOptions) => void;
   dismiss: (id: string) => void;
 };
 
@@ -59,6 +67,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const id = uid();
       const item: ToastItem = { ...toast, id };
       setToasts((prev) => [...prev, item].slice(-5));
+      if (shouldPlaySoundForToast(toast.kind, toast.sound)) {
+        playNotificationSound(toast.kind);
+      }
       const duration = toast.durationMs ?? DEFAULT_DURATION[toast.kind];
       const timer = window.setTimeout(() => dismiss(id), duration);
       timers.current.set(id, timer);
@@ -70,10 +81,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     () => ({
       push,
       dismiss,
-      success: (message, title) => push({ kind: 'success', message, title }),
-      info: (message, title) => push({ kind: 'info', message, title }),
-      warning: (message, title) => push({ kind: 'warning', message, title }),
-      error: (message, title) => push({ kind: 'error', message, title }),
+      success: (message, title, opts) =>
+        push({ kind: 'success', message, title, sound: opts?.sound, durationMs: opts?.durationMs }),
+      info: (message, title, opts) =>
+        push({ kind: 'info', message, title, sound: opts?.sound, durationMs: opts?.durationMs }),
+      warning: (message, title, opts) =>
+        push({ kind: 'warning', message, title, sound: opts?.sound, durationMs: opts?.durationMs }),
+      error: (message, title, opts) =>
+        push({ kind: 'error', message, title, sound: opts?.sound, durationMs: opts?.durationMs }),
     }),
     [push, dismiss],
   );

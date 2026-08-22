@@ -71,6 +71,8 @@ function defaultSettings(): Settings {
     haltNewBuys: false,
     flattenOnDrawdownArmed: false,
     launchAtLogin: false,
+    assetClass: 'stocks',
+    cryptoSession: 'disconnected',
   };
 }
 
@@ -1157,6 +1159,13 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       saveSettingsLocal(s);
       return s as T;
     }
+
+    case 'auth_bridge_authenticate':
+    case 'auth_bridge_session':
+    case 'auth_bridge_list':
+    case 'auth_bridge_revoke':
+    case 'auth_bridge_submit_candidate':
+      throw new Error('Auth Bridge requires the Tauri desktop app');
 
     default:
       throw new Error(`Unknown command in browser mode: ${command}`);

@@ -2815,6 +2815,8 @@ dependencies = [
  "dotenvy",
  "keyring",
  "parking_lot",
+ "percent-encoding",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

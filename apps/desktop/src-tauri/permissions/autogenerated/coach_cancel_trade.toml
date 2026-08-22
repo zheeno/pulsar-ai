@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-coach-cancel-trade"
+description = "Enables the coach_cancel_trade command without any pre-configured scope."
+commands.allow = ["coach_cancel_trade"]
+
+[[permission]]
+identifier = "deny-coach-cancel-trade"
+description = "Denies the coach_cancel_trade command without any pre-configured scope."
+commands.deny = ["coach_cancel_trade"]

@@ -122,7 +122,12 @@ impl SignalGenerationService {
         let queued_buy_symbols = Self::queued_unexecuted_buy_symbols(conn)?;
         let pending_unexecuted = Self::pending_unexecuted_for_prompt(conn)?;
 
-        let mut universe_rows = Self::build_universe(conn, &held_symbols, &recent_set)?;
+        let mut universe_rows = Self::build_universe(
+            conn,
+            &held_symbols,
+            &recent_set,
+            venue.eq_ignore_ascii_case("busha"),
+        )?;
         universe_rows.retain(|row| {
             keep_unheld_for_llm(
                 held_symbols.contains(&row.symbol.to_uppercase()),
@@ -294,6 +299,7 @@ impl SignalGenerationService {
             min_n,
             remaining_budget,
             settings.halt_new_buys,
+            crate::broker::whole_shares_for_venue(&venue),
         );
 
         let min_buy_signals = MIN_BUY_TARGET.min(capacity.max_buy_signals);
@@ -323,6 +329,7 @@ impl SignalGenerationService {
                 "cycleBudgetPct": param_set.cycle_budget_pct,
                 "maxPositionPct": param_set.max_position_pct,
                 "minOrderNotional": crate::execution::min_order_notional_for_venue(&venue),
+                "assetClass": if venue.eq_ignore_ascii_case("busha") { "crypto" } else { "stocks" },
             },
             "diversification": {
                 "minBuySignals": min_buy_signals,
@@ -479,7 +486,7 @@ impl SignalGenerationService {
                     }
                     continue;
                 }
-                if !crate::ngx::is_valid_ticker(&symbol) {
+                if !crate::broker::is_valid_trade_symbol(&venue, &symbol) {
                     dropped_symbol += 1;
                     continue;
                 }
@@ -530,6 +537,7 @@ impl SignalGenerationService {
                     &model_name,
                     PORTFOLIO_PROMPT_VERSION,
                     settings.retain_raw_llm_logs,
+                    &venue,
                 )?;
                 if let Some(id) = signal_id {
                     signal_ids.push(id);
@@ -561,6 +569,7 @@ impl SignalGenerationService {
                     &model_name,
                     PORTFOLIO_PROMPT_VERSION,
                     settings.retain_raw_llm_logs,
+                    &venue,
                 )?;
                 if let Some(id) = signal_id {
                     signal_ids.push(id);
@@ -649,7 +658,7 @@ impl SignalGenerationService {
         let raw_response = result.get("rawResponse").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let model_name = result.get("modelName").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        Self::persist_signal(conn, &output, symbol, &prompt, &raw_response, &model_name, PROMPT_VERSION, settings.retain_raw_llm_logs)
+        Self::persist_signal(conn, &output, symbol, &prompt, &raw_response, &model_name, PROMPT_VERSION, settings.retain_raw_llm_logs, "sandbox")
     }
 
     fn persist_signal(
@@ -661,12 +670,13 @@ impl SignalGenerationService {
         model_name: &str,
         prompt_version: &str,
         retain_raw: bool,
+        venue: &str,
     ) -> Result<Option<String>> {
         let action = pick.get("action").and_then(|v| v.as_str()).unwrap_or("HOLD");
         let confidence = pick.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let rationale = pick.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
 
-        if symbol.is_empty() || !crate::ngx::is_valid_ticker(symbol) {
+        if symbol.is_empty() || !crate::broker::is_valid_trade_symbol(venue, symbol) {
             return Ok(None);
         }
 
@@ -718,6 +728,7 @@ impl SignalGenerationService {
             "coach:propose",
             PORTFOLIO_PROMPT_VERSION,
             false,
+            if crate::broker::crypto_mode() { "busha" } else { "sandbox" },
         )?;
         if let Some(ref sid) = id {
             let snap = json!({ "coachQty": quantity.max(0.0) });
@@ -752,6 +763,7 @@ impl SignalGenerationService {
             model_name,
             PORTFOLIO_PROMPT_VERSION,
             false,
+            if crate::broker::crypto_mode() { "busha" } else { "sandbox" },
         )?;
         if let Some(ref sid) = id {
             let snap = json!({ "sellFraction": sell_fraction.clamp(0.1, 1.0) });
@@ -823,13 +835,23 @@ impl SignalGenerationService {
         conn: &Connection,
         held_symbols: &std::collections::HashSet<String>,
         recent_symbols: &std::collections::HashSet<String>,
+        crypto: bool,
     ) -> Result<Vec<UniverseRow>> {
-        let sql = "SELECT i.symbol, i.sector, ph.price, ph.change_percent, ph.volume
+        let sql = if crypto {
+            "SELECT i.symbol, i.sector, ph.price, ph.change_percent, ph.volume
              FROM instruments i
              LEFT JOIN price_history ph ON ph.symbol = i.symbol AND ph.trade_date = (
                SELECT MAX(trade_date) FROM price_history WHERE symbol = i.symbol
              )
-             WHERE i.is_active = 1";
+             WHERE i.is_active = 1 AND i.sector = 'CRYPTO'"
+        } else {
+            "SELECT i.symbol, i.sector, ph.price, ph.change_percent, ph.volume
+             FROM instruments i
+             LEFT JOIN price_history ph ON ph.symbol = i.symbol AND ph.trade_date = (
+               SELECT MAX(trade_date) FROM price_history WHERE symbol = i.symbol
+             )
+             WHERE i.is_active = 1 AND (i.sector IS NULL OR i.sector != 'CRYPTO')"
+        };
 
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| {
@@ -1183,6 +1205,7 @@ fn compute_trade_capacity(
     min_order_notional: f64,
     remaining_budget: f64,
     halt_new_buys: bool,
+    whole_shares: bool,
 ) -> TradeCapacity {
     let drawdown_ok = daily_drawdown < param_set.max_daily_drawdown_pct;
     let capital_reason =
@@ -1200,12 +1223,14 @@ fn compute_trade_capacity(
                 cash + 1e-9 >= min_order_notional
                     && cycle_budget + 1e-9 >= min_order_notional
                     && crate::execution::RiskPolicyService::can_afford_one_share(cash, price, fee_pct)
-            } else {
+            } else if whole_shares {
                 crate::execution::RiskPolicyService::can_afford_one_share(
                     cycle_budget,
                     price,
                     fee_pct,
                 )
+            } else {
+                cycle_budget > 0.0 && price > 0.0
             }
         })
     };
@@ -1241,11 +1266,13 @@ fn compute_trade_capacity(
             reasons.push("daily drawdown limit");
         } else if let Some(reason) = capital_reason {
             reasons.push(reason);
-        } else if !can_afford {
+            } else if !can_afford {
             if min_order_notional > 0.0 {
                 reasons.push("cash below broker minimum order");
-            } else {
+            } else if whole_shares {
                 reasons.push("cycle cash budget cannot fund a whole share");
+            } else {
+                reasons.push("cycle cash budget cannot fund a trade");
             }
         }
         if !sell_allowed {
@@ -1586,17 +1613,33 @@ pub async fn run_cycle(
     cycle_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let mut warnings: Vec<String> = Vec::new();
-    let ingested = match crate::ingest::IngestionService::ingest_stocks(db, client, cache, calendar, true)
-        .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("Pulse stock ingest failed: {e}"));
-            0
+    let crypto = broker
+        .map(|s| s.id() == crate::broker::BrokerId::Busha)
+        .unwrap_or(false);
+    let ingested = if crypto {
+        match broker {
+            Some(crate::broker::BrokerSession::Busha(client)) => match client.ingest_universe(db).await {
+                Ok(n) => n,
+                Err(e) => {
+                    warnings.push(format!("Busha pair ingest failed: {e}"));
+                    0
+                }
+            },
+            _ => 0,
+        }
+    } else {
+        match crate::ingest::IngestionService::ingest_stocks(db, client, cache, calendar, true).await {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("Pulse stock ingest failed: {e}"));
+                0
+            }
         }
     };
-    if let Err(e) = crate::ingest::IngestionService::ingest_market(db, client, calendar, true).await {
-        warnings.push(format!("Pulse market ingest failed: {e}"));
+    if !crypto {
+        if let Err(e) = crate::ingest::IngestionService::ingest_market(db, client, calendar, true).await {
+            warnings.push(format!("Pulse market ingest failed: {e}"));
+        }
     }
     let trading_mode = if let Some(session) = broker {
         session.resolve_trading_mode(settings).await
@@ -1695,7 +1738,7 @@ pub async fn run_cycle(
         }
     }
 
-    if generated.universe_size > 0 && generated.universe_size <= 20 {
+    if !crypto && generated.universe_size > 0 && generated.universe_size <= 20 {
         warnings.push(format!(
             "Universe is only {} names (seed size). Pulse ingest may be incomplete.",
             generated.universe_size
@@ -1783,6 +1826,7 @@ pub async fn run_cycle(
         "warnings": warnings,
         "universeSize": generated.universe_size,
         "instrumentsIngested": ingested,
+        "assetClass": if crypto { "crypto" } else { "stocks" },
     }))
 }
 
@@ -2001,6 +2045,7 @@ mod tests {
             0.0,
             remaining_for(0.0, 0.0),
             false,
+            true,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -2034,6 +2079,7 @@ mod tests {
             0.0,
             remaining_for(1_000_000.0, 0.0),
             false,
+            true,
         );
         assert!(!cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -2069,6 +2115,7 @@ mod tests {
             0.0,
             remaining_for(1_000_000.0, 0.0),
             false,
+            true,
         );
         assert!(!cap.skip_llm);
         assert!(cap.buy_allowed);
@@ -2105,6 +2152,7 @@ mod tests {
             0.0,
             remaining_for(200.0, 0.0),
             false,
+            true,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -2140,6 +2188,7 @@ mod tests {
             crate::execution::BAMBOO_MIN_ORDER_NOTIONAL,
             remaining_for(16_750.0, crate::execution::BAMBOO_MIN_ORDER_NOTIONAL),
             false,
+            true,
         );
         assert!(cap.buy_allowed);
         assert_eq!(cap.max_buy_signals, 1);
@@ -2174,6 +2223,7 @@ mod tests {
             min_n,
             remaining_for(cash, min_n),
             false,
+            true,
         );
         assert!(!cap.buy_allowed);
         assert!(cap.buys_disabled);
@@ -2209,6 +2259,7 @@ mod tests {
             min_n,
             remaining,
             false,
+            true,
         );
         assert!(cap.buy_allowed);
         assert!(!cap.buys_disabled);
@@ -2244,6 +2295,7 @@ mod tests {
             min_n,
             remaining_for(cash, min_n),
             false,
+            true,
         );
         assert!(!cap.skip_llm);
         assert!(cap.buys_disabled);
@@ -2317,6 +2369,7 @@ mod tests {
             &HashSet::new(),
             0.0,
             remaining_for(1_000_000.0, 0.0),
+            true,
             true,
         );
         assert!(!cap.buy_allowed);

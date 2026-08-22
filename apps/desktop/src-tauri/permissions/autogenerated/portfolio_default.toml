@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-portfolio-default"
+description = "Enables the portfolio_default command without any pre-configured scope."
+commands.allow = ["portfolio_default"]
+
+[[permission]]
+identifier = "deny-portfolio-default"
+description = "Denies the portfolio_default command without any pre-configured scope."
+commands.deny = ["portfolio_default"]

@@ -6,8 +6,7 @@ use uuid::Uuid;
 use crate::cache::PriceCache;
 use crate::db::Database;
 use crate::intents;
-use crate::ngx::is_valid_ticker;
-use crate::broker::{insert_broker_order, BrokerSession};
+use crate::broker::{insert_broker_order, is_valid_trade_symbol, BrokerSession};
 use crate::settings::AppSettings;
 use crate::wealth::TradingMode;
 
@@ -18,10 +17,14 @@ pub const MAX_SIGNAL_BUYS: usize = 15;
 pub const MAX_SIGNAL_SELLS: usize = 15;
 /// Bamboo NGX market orders reject notionals below this floor.
 pub const BAMBOO_MIN_ORDER_NOTIONAL: f64 = 5_000.0;
+/// Typical Busha NGN conversion floor (~₦250). Per-pair mins/maxes from `/v1/pairs` override this.
+pub const BUSHA_MIN_ORDER_NOTIONAL: f64 = 250.0;
 
 pub fn min_order_notional_for_venue(venue: &str) -> f64 {
     if venue.eq_ignore_ascii_case("bamboo") {
         BAMBOO_MIN_ORDER_NOTIONAL
+    } else if venue.eq_ignore_ascii_case("busha") {
+        BUSHA_MIN_ORDER_NOTIONAL
     } else {
         0.0
     }
@@ -134,6 +137,7 @@ impl RiskPolicyService {
         fee_pct: f64,
         target_notional: Option<f64>,
         min_order_notional: f64,
+        whole_shares: bool,
     ) -> (String, f64) {
         if signal.action == "HOLD" {
             return ("BLOCKED_OTHER".into(), 0.0);
@@ -178,6 +182,7 @@ impl RiskPolicyService {
                 param_set.max_position_pct,
                 fee_pct,
                 min_order_notional,
+                whole_shares,
             );
         }
 
@@ -223,23 +228,37 @@ impl RiskPolicyService {
         max_position_pct: f64,
         fee_pct: f64,
         min_order_notional: f64,
+        whole_shares: bool,
     ) -> (String, f64) {
         if current_price <= 0.0 || target_notional <= 0.0 {
             return ("BLOCKED_CASH".into(), 0.0);
         }
-        let mut quantity = (target_notional / current_price).floor();
+        let lot = if whole_shares { 1.0 } else { 1e-8 };
+        let mut quantity = if whole_shares {
+            (target_notional / current_price).floor()
+        } else {
+            target_notional / current_price
+        };
         if min_order_notional > 0.0 {
-            let min_qty = (min_order_notional / current_price).ceil();
+            let min_qty = if whole_shares {
+                (min_order_notional / current_price).ceil()
+            } else {
+                min_order_notional / current_price
+            };
             if min_qty > quantity {
                 quantity = min_qty;
             }
         }
-        if quantity < 1.0 {
+        if quantity + 1e-12 < lot {
             return ("BLOCKED_CASH".into(), 0.0);
         }
         let max_qty_by_exposure = if total_equity > 0.0 {
             let max_value = total_equity * max_position_pct - position_value;
-            (max_value.max(0.0) / current_price).floor()
+            if whole_shares {
+                (max_value.max(0.0) / current_price).floor()
+            } else {
+                (max_value.max(0.0) / current_price).max(0.0)
+            }
         } else {
             0.0
         };
@@ -247,11 +266,15 @@ impl RiskPolicyService {
         if min_order_notional <= 0.0 || min_order_notional <= position_cap_notional + 1e-9 {
             quantity = quantity.min(max_qty_by_exposure);
         }
-        if quantity < 1.0 {
+        if quantity + 1e-12 < lot {
             return ("BLOCKED_EXPOSURE".into(), 0.0);
         }
-        quantity = Self::cap_qty_by_cash(quantity, current_price, cash_balance, fee_pct);
-        if quantity < 1.0 {
+        quantity = if whole_shares {
+            Self::cap_qty_by_cash(quantity, current_price, cash_balance, fee_pct)
+        } else {
+            Self::cap_qty_by_cash_frac(quantity, current_price, cash_balance, fee_pct)
+        };
+        if quantity + 1e-12 < lot {
             return ("BLOCKED_CASH".into(), 0.0);
         }
         let notional = quantity * current_price;
@@ -283,6 +306,18 @@ impl RiskPolicyService {
             return 0.0;
         }
         let max_qty = (cash / unit_cost).floor();
+        qty.min(max_qty).max(0.0)
+    }
+
+    pub fn cap_qty_by_cash_frac(qty: f64, price: f64, cash: f64, fee_pct: f64) -> f64 {
+        if price <= 0.0 || qty <= 0.0 || cash <= 0.0 {
+            return 0.0;
+        }
+        let unit_cost = price * (1.0 + fee_pct.max(0.0));
+        if unit_cost <= 0.0 {
+            return 0.0;
+        }
+        let max_qty = cash / unit_cost;
         qty.min(max_qty).max(0.0)
     }
 
@@ -490,6 +525,7 @@ impl ExecutionService {
                             daily_drawdown,
                             min_n,
                             remaining,
+                            venue.as_deref().unwrap_or("sandbox"),
                         )?;
                         Ok((targets, None))
                     })?;
@@ -584,7 +620,10 @@ impl ExecutionService {
             let Some((symbol, action, confidence, snapshot)) = signal else {
                 return Ok(None);
             };
-            if !is_valid_ticker(&symbol) {
+            if !is_valid_trade_symbol(
+                broker.map(|s| s.id().as_str()).unwrap_or("sandbox"),
+                &symbol,
+            ) {
                 conn.execute(
                     "UPDATE signals SET risk_policy_result = 'BLOCKED_SYMBOL' WHERE id = ?1",
                     [signal_id],
@@ -630,7 +669,7 @@ impl ExecutionService {
 
         if trading_mode == TradingMode::Live {
             let client = broker.ok_or_else(|| anyhow::anyhow!("Live broker session required"))?;
-            let instrument = client.resolve_instrument(&symbol).await?;
+            let instrument = client.resolve_instrument_for_side(&symbol, &action).await?;
             let broker_quote = instrument.quote;
             if broker_quote <= 0.0 {
                 return Err(anyhow::anyhow!("No broker price for {symbol}"));
@@ -652,6 +691,7 @@ impl ExecutionService {
                     .copied()
                     .unwrap_or(0.0);
                 if quote_deviation_applies(&action)
+                    && client.id() != crate::broker::BrokerId::Busha
                     && pulse_price > 0.0
                     && !quote_within_deviation(pulse_price, broker_quote)
                 {
@@ -701,11 +741,23 @@ impl ExecutionService {
                     fee_pct,
                     buy_target_notional,
                     min_order_notional_for_venue(client.id().as_str()),
+                    client.id().whole_shares(),
                 );
                 if result == "APPROVED" && action == "SELL" {
                     let frac = sell_fraction_from_snapshot(&snapshot);
-                    quantity = crate::risk_exits::sell_qty_for_exit(quantity, frac);
-                    if quantity < 1.0 {
+                    quantity = crate::risk_exits::sell_qty_for_exit_ex(
+                        quantity,
+                        frac,
+                        client.id().whole_shares(),
+                    );
+                    if client.id().whole_shares() && quantity < 1.0 {
+                        conn.execute(
+                            "UPDATE signals SET risk_policy_result = 'BLOCKED_NO_POSITION' WHERE id = ?1",
+                            [signal_id],
+                        )?;
+                        return Ok(None);
+                    }
+                    if !client.id().whole_shares() && quantity <= 0.0 {
                         conn.execute(
                             "UPDATE signals SET risk_policy_result = 'BLOCKED_NO_POSITION' WHERE id = ?1",
                             [signal_id],
@@ -720,11 +772,25 @@ impl ExecutionService {
                 if result != "APPROVED" || quantity <= 0.0 {
                     return Ok(None);
                 }
-                if action == "SELL" {
+                // Full-lot exits go in one order (stocks + crypto). The 25% equity
+                // throttle only applies to partial / discretionary sells that would
+                // otherwise dump the book across many names without confirmation.
+                let full_lot_exit = action == "SELL"
+                    && sell_fraction_from_snapshot(&snapshot) >= 1.0 - 1e-9;
+                if action == "SELL" && !full_lot_exit {
                     let cap = current_equity * MAX_LIQUIDATION_PCT;
-                    if !allow_bulk_liquidation && *cycle_sell_notional + quantity * broker_quote > cap {
-                        quantity = ((cap - *cycle_sell_notional).max(0.0) / broker_quote).floor();
-                        if quantity < 1.0 {
+                    if !allow_bulk_liquidation
+                        && *cycle_sell_notional + quantity * broker_quote > cap
+                    {
+                        let mut capped =
+                            ((cap - *cycle_sell_notional).max(0.0) / broker_quote).max(0.0);
+                        if client.id().whole_shares() {
+                            capped = capped.floor();
+                        }
+                        quantity = capped;
+                        if (client.id().whole_shares() && quantity < 1.0)
+                            || (!client.id().whole_shares() && quantity <= 0.0)
+                        {
                             anyhow::bail!("Bulk liquidation requires extra confirmation");
                         }
                     }
@@ -774,6 +840,7 @@ impl ExecutionService {
                     fee.total_price,
                     fee.price_per_share,
                     fee.available_quantity,
+                    client.id().whole_shares(),
                 ) {
                     Ok(q) => q,
                     Err(msg) => {
@@ -821,6 +888,7 @@ impl ExecutionService {
                         fee.total_price,
                         fee.price_per_share,
                         fee.available_quantity,
+                        client.id().whole_shares(),
                     ) {
                         Ok(q) => q,
                         Err(msg) => {
@@ -858,7 +926,9 @@ impl ExecutionService {
                         };
                     }
                 }
-                if quantity < 1.0 || spendable + 1e-9 < fee.total_price {
+                if (client.id().whole_shares() && quantity < 1.0)
+                    || spendable + 1e-9 < fee.total_price
+                {
                     let msg = format!(
                         "Insufficient brokerage balance for {symbol} (have ₦{:.2}, need ₦{:.2}, qty {}, available {})",
                         spendable,
@@ -874,7 +944,7 @@ impl ExecutionService {
             }
 
             let min_n = min_order_notional_for_venue(client.id().as_str());
-            if action == "BUY" && min_n > 0.0 {
+            if action == "BUY" && min_n > 0.0 && client.id().whole_shares() {
                 let pps = fee.price_per_share.max(broker_quote);
                 if pps > 0.0 && fee.total_price + 1e-9 < min_n {
                     let need = (min_n / pps).ceil();
@@ -914,10 +984,30 @@ impl ExecutionService {
             }
 
             if fee.total_price.max(quantity * broker_quote) > settings.max_live_notional {
-                db.with_conn(|conn| {
-                    intents::mark_terminal(conn, &intent.id, "rejected", None, Some("notional cap"))
-                })?;
-                return Err(anyhow::anyhow!("Live notional exceeds configured cap"));
+                // Full-lot SELLs must still go through in one order so exits are not
+                // rejected / retried in fee-multiplying chunks.
+                let full_lot_exit = action == "SELL"
+                    && sell_fraction_from_snapshot(&snapshot) >= 1.0 - 1e-9;
+                if !full_lot_exit {
+                    db.with_conn(|conn| {
+                        intents::mark_terminal(
+                            conn,
+                            &intent.id,
+                            "rejected",
+                            None,
+                            Some("notional cap"),
+                        )
+                    })?;
+                    return Err(anyhow::anyhow!("Live notional exceeds configured cap"));
+                }
+                tracing::info!(
+                    target: "execution",
+                    symbol = %symbol,
+                    quantity,
+                    notional = fee.total_price.max(quantity * broker_quote),
+                    cap = settings.max_live_notional,
+                    "full-lot SELL exceeds max_live_notional; submitting anyway"
+                );
             }
 
             db.with_conn(|conn| intents::mark_submitted(conn, &intent.id, None))?;
@@ -968,6 +1058,7 @@ impl ExecutionService {
                     &order,
                     fill_price,
                     Some(fee.fee),
+                    client.id().as_str(),
                 )?;
                 let state = if order.status == "executed" {
                     "filled"
@@ -1055,6 +1146,7 @@ impl ExecutionService {
                 fee_pct,
                 buy_target_notional,
                 0.0,
+                true,
             );
             conn.execute(
                 "UPDATE signals SET risk_policy_result = ?1 WHERE id = ?2",
@@ -1064,9 +1156,10 @@ impl ExecutionService {
                 return Ok(false);
             }
             if action == "SELL" {
-                quantity = crate::risk_exits::sell_qty_for_exit(
+                quantity = crate::risk_exits::sell_qty_for_exit_ex(
                     quantity,
                     sell_fraction_from_snapshot(&snapshot),
+                    true,
                 );
                 if quantity < 1.0 {
                     return Ok(false);
@@ -1236,6 +1329,7 @@ impl ExecutionService {
             daily_drawdown,
             0.0,
             remaining,
+            "sandbox",
         )
     }
 
@@ -1249,8 +1343,9 @@ impl ExecutionService {
         daily_drawdown: f64,
         min_notional: f64,
         remaining_budget: f64,
+        venue: &str,
     ) -> Result<std::collections::HashMap<String, f64>> {
-        let mut qualified: Vec<(String, f64)> = Vec::new();
+        let mut qualified: Vec<(String, f64, String)> = Vec::new();
 
         for signal_id in signal_ids {
             let signal: Option<(String, String, f64)> = conn
@@ -1266,7 +1361,7 @@ impl ExecutionService {
             if action != "BUY" {
                 continue;
             }
-            if !is_valid_ticker(&symbol) {
+            if !is_valid_trade_symbol(venue, &symbol) {
                 conn.execute(
                     "UPDATE signals SET risk_policy_result = 'BLOCKED_SYMBOL' WHERE id = ?1",
                     [signal_id],
@@ -1298,7 +1393,7 @@ impl ExecutionService {
                 )?;
                 continue;
             }
-            qualified.push((signal_id.clone(), confidence));
+            qualified.push((signal_id.clone(), confidence, symbol));
         }
 
         qualified.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1306,41 +1401,65 @@ impl ExecutionService {
         if budget <= 0.0 {
             return Ok(std::collections::HashMap::new());
         }
-        let max_n = max_buys_for_min_notional(
-            budget,
-            min_notional,
-            qualified.len().min(MAX_SIGNAL_BUYS),
-        );
+        let mut kept: Vec<(String, f64, f64)> = Vec::new();
+        let mut reserved = 0.0;
+        for (id, conf, symbol) in qualified {
+            let pair_min = if venue.eq_ignore_ascii_case("busha") {
+                crate::busha::min_buy_ngn_for(conn, &symbol).unwrap_or(min_notional)
+            } else {
+                min_notional
+            };
+            if pair_min > 0.0 && budget + 1e-9 < pair_min {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_NOTIONAL' WHERE id = ?1",
+                    [&id],
+                )?;
+                continue;
+            }
+            if pair_min > 0.0 && budget - reserved + 1e-9 < pair_min {
+                conn.execute(
+                    "UPDATE signals SET risk_policy_result = 'BLOCKED_NOTIONAL' WHERE id = ?1",
+                    [&id],
+                )?;
+                continue;
+            }
+            kept.push((id, conf, pair_min));
+            reserved += pair_min.max(0.0);
+        }
+        let max_n = kept.len().min(MAX_SIGNAL_BUYS);
         if max_n == 0 {
             return Ok(std::collections::HashMap::new());
         }
-        qualified.truncate(max_n);
+        kept.truncate(max_n);
         let weights = RiskPolicyService::confidence_weights(
-            &qualified.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+            &kept.iter().map(|(_, c, _)| *c).collect::<Vec<_>>(),
         );
         let mut out = std::collections::HashMap::new();
-        if min_notional <= 0.0 {
-            for ((signal_id, _), weight) in qualified.into_iter().zip(weights.into_iter()) {
-                out.insert(signal_id, budget * weight);
-            }
-            return Ok(out);
-        }
-        let mut rows: Vec<(String, f64)> = qualified
+        let mut rows: Vec<(String, f64, f64)> = kept
             .into_iter()
             .zip(weights)
-            .map(|((id, _), w)| (id, (budget * w).max(min_notional)))
+            .map(|((id, _, pair_min), w)| {
+                let floor = pair_min.max(0.0);
+                let sized = if floor <= 0.0 {
+                    budget * w
+                } else {
+                    (budget * w).max(floor)
+                };
+                (id, sized, floor)
+            })
             .collect();
         loop {
-            let sum: f64 = rows.iter().map(|(_, n)| *n).sum();
+            let sum: f64 = rows.iter().map(|(_, n, _)| *n).sum();
             if sum <= cash + 1e-9 || rows.is_empty() {
                 break;
             }
             if rows.len() == 1 {
-                if cash + 1e-9 < min_notional {
+                let floor = rows[0].2;
+                if floor > 0.0 && cash + 1e-9 < floor {
                     rows.clear();
                 } else {
-                    rows[0].1 = cash.min(budget.max(min_notional));
-                    if rows[0].1 + 1e-9 < min_notional {
+                    rows[0].1 = cash.min(budget.max(floor));
+                    if floor > 0.0 && rows[0].1 + 1e-9 < floor {
                         rows.clear();
                     }
                 }
@@ -1348,12 +1467,11 @@ impl ExecutionService {
             }
             rows.pop();
             let n = rows.len() as f64;
-            let each = (budget / n).max(min_notional);
             for row in rows.iter_mut() {
-                row.1 = each;
+                row.1 = (budget / n).max(row.2);
             }
         }
-        for (id, n) in rows {
+        for (id, n, _) in rows {
             out.insert(id, n);
         }
         Ok(out)
@@ -1530,16 +1648,24 @@ pub(crate) fn fit_live_buy_qty(
     total_price: f64,
     price_per_share: f64,
     available_quantity: f64,
+    whole_shares: bool,
 ) -> Result<f64, String> {
-    let mut qty = requested.floor();
-    if qty < 1.0 {
+    let lot = if whole_shares { 1.0 } else { 1e-8 };
+    let mut qty = if whole_shares {
+        requested.floor()
+    } else {
+        requested
+    };
+    if qty + 1e-12 < lot {
         return Err("Cannot size a whole share".into());
     }
-    if available_quantity >= 1.0 {
+    if whole_shares && available_quantity >= 1.0 {
         qty = qty.min(available_quantity.floor());
+    } else if !whole_shares && available_quantity > 0.0 && available_quantity.is_finite() {
+        qty = qty.min(available_quantity);
     }
     if spendable + 1e-9 < total_price {
-        let per_share = if requested >= 1.0 && total_price > 0.0 {
+        let per_share = if requested >= lot && total_price > 0.0 {
             total_price / requested
         } else if price_per_share > 0.0 {
             price_per_share
@@ -1551,10 +1677,15 @@ pub(crate) fn fit_live_buy_qty(
                 "Insufficient brokerage balance (have ₦{spendable:.2}, need ₦{total_price:.2})"
             ));
         }
-        qty = (spendable / per_share).floor().min(qty);
+        let fitted = spendable / per_share;
+        qty = if whole_shares {
+            fitted.floor().min(qty)
+        } else {
+            fitted.min(qty)
+        };
     }
-    if qty < 1.0 {
-        if available_quantity > 0.0 && available_quantity < 1.0 {
+    if qty + 1e-12 < lot {
+        if available_quantity > 0.0 && available_quantity < lot {
             return Err(format!("Bamboo available_quantity is {available_quantity}"));
         }
         return Err(format!(
@@ -1578,7 +1709,7 @@ pub fn classify_live_execution_error(msg: &str) -> &'static str {
         "BLOCKED_QUOTE_DEVIATION"
     } else if m.contains("drawdown") {
         "BLOCKED_DRAWDOWN"
-    } else if m.contains("notional") || m.contains("bulk liquidation") {
+    } else if m.contains("notional") || m.contains("bulk liquidation") || m.contains("below min") {
         "BLOCKED_NOTIONAL"
     } else if m.contains("transaction pin") {
         "BLOCKED_PIN_MISSING"
@@ -1670,19 +1801,19 @@ mod tests {
 
     #[test]
     fn fit_buy_does_not_walk_qty_when_available_is_zero() {
-        let q = super::fit_live_buy_qty(252.0, 16_750.0, 405.0, 1.61, 0.0).unwrap();
+        let q = super::fit_live_buy_qty(252.0, 16_750.0, 405.0, 1.61, 0.0, true).unwrap();
         assert_eq!(q, 252.0);
     }
 
     #[test]
     fn fit_buy_caps_to_available_in_one_step() {
-        let q = super::fit_live_buy_qty(252.0, 16_750.0, 405.0, 1.61, 3.7).unwrap();
+        let q = super::fit_live_buy_qty(252.0, 16_750.0, 405.0, 1.61, 3.7, true).unwrap();
         assert_eq!(q, 3.0);
     }
 
     #[test]
     fn fit_buy_scales_to_cash_in_one_step() {
-        let q = super::fit_live_buy_qty(325.0, 200.0, 445.0, 1.37, f64::MAX).unwrap();
+        let q = super::fit_live_buy_qty(325.0, 200.0, 445.0, 1.37, f64::MAX, true).unwrap();
         assert_eq!(q, (200.0f64 / (445.0 / 325.0)).floor());
         assert!(q >= 1.0);
         assert!(q < 325.0);
@@ -1696,6 +1827,17 @@ mod tests {
         assert_eq!(super::live_buy_budget(4_000.0, 0.20, super::BAMBOO_MIN_ORDER_NOTIONAL), 0.0);
         assert_eq!(super::live_buy_budget(50_000.0, 0.20, super::BAMBOO_MIN_ORDER_NOTIONAL), 10_000.0);
         assert_eq!(super::max_buys_for_min_notional(10_000.0, super::BAMBOO_MIN_ORDER_NOTIONAL, 15), 2);
+    }
+
+    #[test]
+    fn busha_venue_uses_ngn_conversion_floor() {
+        assert_eq!(super::min_order_notional_for_venue("busha"), super::BUSHA_MIN_ORDER_NOTIONAL);
+        let budget = super::live_buy_budget(4_748.07, 0.20, super::BUSHA_MIN_ORDER_NOTIONAL);
+        assert!(budget + 1e-9 >= super::BUSHA_MIN_ORDER_NOTIONAL);
+        assert_eq!(
+            super::max_buys_for_min_notional(budget, super::BUSHA_MIN_ORDER_NOTIONAL, 15),
+            3
+        );
     }
 
     #[test]
@@ -1797,6 +1939,7 @@ mod tests {
             0.10,
             0.0,
             super::BAMBOO_MIN_ORDER_NOTIONAL,
+            true,
         );
         assert_eq!(result, "APPROVED");
         assert!(qty * 1.61 + 1e-9 >= super::BAMBOO_MIN_ORDER_NOTIONAL);
@@ -1844,10 +1987,10 @@ mod tests {
 
         let price = 50.0;
         let (r0, q0) = RiskPolicyService::size_buy_from_notional(
-            n0, price, cash, cash, 0.0, param_set.max_position_pct, 0.0, 0.0,
+            n0, price, cash, cash, 0.0, param_set.max_position_pct, 0.0, 0.0, true,
         );
         let (r1, q1) = RiskPolicyService::size_buy_from_notional(
-            n1, price, cash, cash, 0.0, param_set.max_position_pct, 0.0, 0.0,
+            n1, price, cash, cash, 0.0, param_set.max_position_pct, 0.0, 0.0, true,
         );
         assert_eq!(r0, "APPROVED");
         assert_eq!(r1, "APPROVED");
@@ -1869,7 +2012,7 @@ mod tests {
         let budget = cash * RiskPolicyService::clamp_cycle_budget_pct(param_set.cycle_budget_pct);
         assert!((budget - 20_000.0).abs() < 1e-9);
         let (result, qty) = RiskPolicyService::size_buy_from_notional(
-            budget, 50.0, cash, cash, 0.0, param_set.max_position_pct, 0.0, 0.0,
+            budget, 50.0, cash, cash, 0.0, param_set.max_position_pct, 0.0, 0.0, true,
         );
         assert_eq!(result, "APPROVED");
         assert_eq!(qty, 400.0); // 20000/50
@@ -1891,6 +2034,7 @@ mod tests {
             param_set.max_position_pct,
             0.0,
             0.0,
+            true,
         );
         assert_eq!(result, "BLOCKED_EXPOSURE");
         assert_eq!(qty, 0.0);
@@ -1899,10 +2043,19 @@ mod tests {
     #[test]
     fn whole_share_floor_blocks_tiny_notional() {
         let (result, qty) = RiskPolicyService::size_buy_from_notional(
-            40.0, 50.0, 1_000_000.0, 1_000_000.0, 0.0, 0.25, 0.0, 0.0,
+            40.0, 50.0, 1_000_000.0, 1_000_000.0, 0.0, 0.25, 0.0, 0.0, true,
         );
         assert_eq!(result, "BLOCKED_CASH");
         assert_eq!(qty, 0.0);
+    }
+
+    #[test]
+    fn fractional_size_allows_sub_share_crypto() {
+        let (result, qty) = RiskPolicyService::size_buy_from_notional(
+            650.0, 124.78, 125_000.0, 125_000.0, 0.0, 0.25, 0.0, 0.0, false,
+        );
+        assert_eq!(result, "APPROVED");
+        assert!(qty > 5.0 && qty < 6.0);
     }
 
     #[test]
@@ -1932,6 +2085,7 @@ mod tests {
             0.01,
             Some(50_000.0),
             0.0,
+            true,
         );
         let (sell_result, sell_qty) = RiskPolicyService::evaluate(
             &sell,
@@ -1943,6 +2097,7 @@ mod tests {
             0.01,
             None,
             0.0,
+            true,
         );
         assert_eq!(buy_result, "BLOCKED_DRAWDOWN");
         assert_eq!(sell_result, "APPROVED");
@@ -1970,6 +2125,7 @@ mod tests {
             0.01,
             None,
             0.0,
+            true,
         );
         assert_eq!(result, "APPROVED");
         assert_eq!(qty, 100.0);
@@ -1995,6 +2151,7 @@ mod tests {
             0.01,
             None,
             0.0,
+            true,
         );
         assert_eq!(result, "BLOCKED_NO_POSITION");
         assert_eq!(qty, 0.0);
@@ -2030,6 +2187,7 @@ mod tests {
             0.0015,
             None,
             0.0,
+            true,
         );
         assert_eq!(result, "APPROVED");
         assert_eq!(qty, 102.0);
@@ -2154,6 +2312,7 @@ mod tests {
             0.0,
             Some(5_000.0),
             5_000.0,
+            true,
         );
         assert_eq!(buy.0, "BLOCKED_DRAWDOWN");
     }

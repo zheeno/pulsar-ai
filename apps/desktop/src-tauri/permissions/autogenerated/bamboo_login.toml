@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bamboo-login"
+description = "Enables the bamboo_login command without any pre-configured scope."
+commands.allow = ["bamboo_login"]
+
+[[permission]]
+identifier = "deny-bamboo-login"
+description = "Denies the bamboo_login command without any pre-configured scope."
+commands.deny = ["bamboo_login"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pulse-profile"
+description = "Enables the pulse_profile command without any pre-configured scope."
+commands.allow = ["pulse_profile"]
+
+[[permission]]
+identifier = "deny-pulse-profile"
+description = "Denies the pulse_profile command without any pre-configured scope."
+commands.deny = ["pulse_profile"]

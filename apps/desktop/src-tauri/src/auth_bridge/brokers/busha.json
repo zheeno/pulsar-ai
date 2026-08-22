@@ -1,0 +1,38 @@
+{
+  "id": "busha",
+  "displayName": "Busha",
+  "loginUrl": "https://app.busha.io/login",
+  "allowedOrigins": [
+    "https://app.busha.io",
+    "https://www.busha.io",
+    "https://busha.io",
+    "https://api.busha.co",
+    "https://api.busha.io",
+    "https://api.ben.busha.team",
+    "https://*.busha.co",
+    "https://*.busha.io",
+    "https://*.busha.team",
+    "https://accounts.google.com",
+    "https://accounts.youtube.com",
+    "https://www.google.com"
+  ],
+  "capture": {
+    "headerNames": ["authorization"],
+    "headerPattern": "^Bearer\\s+([A-Za-z0-9._~+/=-]+)$",
+    "cookieNames": ["app__session"],
+    "websocketUrlTokenParam": null
+  },
+  "probe": {
+    "method": "GET",
+    "url": "https://api.ben.busha.team/v3/profiles",
+    "expectStatus": [200, 201],
+    "jsonPathHint": "email",
+    "headers": {
+      "accept": "*/*",
+      "origin": "https://app.busha.io",
+      "referer": "https://app.busha.io/"
+    }
+  },
+  "timeoutMs": 300000,
+  "fallbackTtlSecs": 1800
+}

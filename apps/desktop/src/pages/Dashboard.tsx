@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -64,6 +64,9 @@ function normalizePortfolio(raw: RawPortfolio): PortfolioData {
       ?? null,
     stale: Boolean((raw as { stale?: boolean }).stale),
     tradingMode: (raw as { tradingMode?: string }).tradingMode || 'sandbox',
+    assetClass: (raw as { assetClass?: string }).assetClass
+      || ((raw as { brokerId?: string }).brokerId === 'busha' ? 'crypto' : 'stocks'),
+    cryptoSession: (raw as { cryptoSession?: string }).cryptoSession ?? undefined,
     brokerId: (raw as { brokerId?: string }).brokerId ?? null,
     brokerName: (raw as { brokerName?: string }).brokerName ?? null,
     tradingVerified: raw.tradingVerified ?? raw.wealthStatus?.tradingVerified,
@@ -131,12 +134,23 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [cycleBusy, setCycleBusy] = useState(false);
+  const [cycleConfirmOpen, setCycleConfirmOpen] = useState(false);
+  const cycleConfirmTitleId = useId();
 
   useEffect(() => {
     void loadData();
     const interval = setInterval(() => void loadData(), 30000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (!cycleConfirmOpen) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape' && !cycleBusy) setCycleConfirmOpen(false);
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [cycleConfirmOpen, cycleBusy]);
 
   useEffect(() => {
     if (loading && !data) return;
@@ -328,7 +342,13 @@ export default function DashboardPage() {
       }
     } finally {
       setCycleBusy(false);
+      setCycleConfirmOpen(false);
     }
+  }
+
+  function closeCycleConfirm() {
+    if (cycleBusy) return;
+    setCycleConfirmOpen(false);
   }
 
   const cycleBlocked = cycleRunning || cycleBusy;
@@ -362,17 +382,29 @@ export default function DashboardPage() {
     if (usage?.authMode === 'session' && data) {
       const live = data.tradingMode === 'live';
       const broker = data.brokerName || 'broker';
+      if (data.cryptoSession === 'expiredNeedsReconnect' || data.tradingMode === 'paused') {
+        return {
+          level: 'warn' as const,
+          title: 'Busha session expired',
+          sub: 'Live crypto trading is paused. You are still in crypto mode — reconnect Busha to resume (not NGX sandbox).',
+          live: false,
+        };
+      }
       return {
         level: 'ok' as const,
         title: 'Systems healthy',
         sub: live
-          ? (data.tradingVerified
+          ? (data.assetClass === 'crypto'
+            ? 'Busha is connected. Home shows NGN cash and crypto holdings; cycles place live Busha transfers when live trading is on.'
+            : (data.tradingVerified
             ? `NGX Pulse is active. Home shows your ${broker} brokerage cash and holdings; cycles can place live market orders.`
             : (data.wealthStatus?.message
-              || `${broker} connected — Home shows brokerage cash and holdings. Complete trading verification to enable live orders.`))
+              || `${broker} connected — Home shows brokerage cash and holdings. Complete trading verification to enable live orders.`)))
           : data.wealthError
             ? `${broker} connected but portfolio sync failed: ${data.wealthError}`
-            : 'NGX Pulse session is active and your sandbox portfolio is ready. Connect a live broker in Settings to go live.',
+            : data.assetClass === 'crypto'
+              ? 'Busha crypto mode is on. Enable live trading in Settings to place orders.'
+              : 'NGX Pulse session is active and your sandbox portfolio is ready. Connect a live broker in Settings to go live.',
         live: true,
       };
     }
@@ -409,12 +441,28 @@ export default function DashboardPage() {
           <div className="status-hero__meta">
             {status.live && <span className="live-dot" title="Live session" />}
             {status.live ? 'Protected · Live' : status.level === 'bad' ? 'Issue detected' : 'Review required'}
-            {market ? (
+            {market && data?.assetClass !== 'crypto' ? (
               <>
                 <span className="status-hero__meta-sep" aria-hidden>·</span>
                 <span className={`status-pill ${marketChipClass}`} style={{ padding: '2px 8px', fontSize: '0.72rem' }}>
                   {market.phase === 'open' && <span className="live-dot" aria-hidden />}
                   {marketPhaseLabel(market.phase)}
+                </span>
+              </>
+            ) : data?.assetClass === 'crypto' ? (
+              <>
+                <span className="status-hero__meta-sep" aria-hidden>·</span>
+                <span
+                  className={`status-pill ${
+                    data.cryptoSession === 'expiredNeedsReconnect' || data.tradingMode === 'paused'
+                      ? 'status-pill--warn'
+                      : 'status-pill--ok'
+                  }`}
+                  style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                >
+                  {data.cryptoSession === 'expiredNeedsReconnect' || data.tradingMode === 'paused'
+                    ? 'Crypto · Expired'
+                    : 'Crypto · 24h'}
                 </span>
               </>
             ) : null}
@@ -436,14 +484,21 @@ export default function DashboardPage() {
                 >
                   {data.tradingMode === 'live'
                     ? (data.tradingVerified === false ? (data.brokerName || 'Broker') : 'Live trader')
-                    : 'Sandbox'}
+                    : data.tradingMode === 'paused'
+                      ? 'Paused'
+                      : 'Sandbox'}
                 </span>
               </>
             ) : null}
           </div>
           <h1 className="status-hero__title">{status.title}</h1>
           <p className="status-hero__sub">{status.sub}</p>
-          {market ? (
+          {(data?.cryptoSession === 'expiredNeedsReconnect' || data?.tradingMode === 'paused') ? (
+            <p className="status-hero__sub" style={{ marginTop: 8 }}>
+              <Link to="/settings">Reconnect Busha in Settings</Link>
+            </p>
+          ) : null}
+          {market && data?.assetClass !== 'crypto' ? (
             <p className="status-hero__market muted">
               {market.nowWat}
               {market.pulseStatus ? ` · Pulse: ${market.pulseStatus}` : ''}
@@ -452,13 +507,20 @@ export default function DashboardPage() {
                 ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : data.tradingMode === 'live' ? ` · ${data.brokerName || 'Broker'}` : ' · Pulse'}`
                 : ''}
             </p>
+          ) : data?.assetClass === 'crypto' ? (
+            <p className="status-hero__market muted">
+              Busha crypto book in NGN
+              {data?.quotesAsOf
+                ? ` · Quoted ${formatQuoteClock(data.quotesAsOf)}${data.stale ? ' · Stale' : ' · Busha'}`
+                : ''}
+            </p>
           ) : null}
         </div>
         <button
           type="button"
           className="btn btn-primary"
           disabled={cycleBlocked || !!error}
-          onClick={() => void runCycle()}
+          onClick={() => setCycleConfirmOpen(true)}
         >
           {cycleBlocked && <IconSpinner />}
           {cycleBlocked ? 'Cycle running…' : 'Run trading cycle'}
@@ -618,6 +680,66 @@ export default function DashboardPage() {
           </div>
         </div>
       )}
+
+      {cycleConfirmOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) closeCycleConfirm();
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={cycleConfirmTitleId}
+          >
+            <div className="modal__header">
+              <div>
+                <h2 id={cycleConfirmTitleId}>Run trading cycle?</h2>
+                <p className="muted" style={{ margin: '6px 0 0', fontSize: 13, lineHeight: 1.45 }}>
+                  {data?.cryptoSession === 'expiredNeedsReconnect' || data?.tradingMode === 'paused'
+                    ? 'Busha session is expired. This cycle will not place live crypto orders until you reconnect.'
+                    : data?.tradingMode === 'live' && data?.assetClass === 'crypto'
+                      ? 'This runs a full crypto cycle on Busha. If live trading is on in Settings, approved signals can place real NGN transfers.'
+                      : data?.tradingMode === 'live'
+                        ? `This runs a full cycle on ${data.brokerName || 'your live broker'}. If live trading is on in Settings, approved signals can place real market orders.`
+                        : 'This generates signals and sandbox fills only. Connect a live broker and enable live trading in Settings to place real orders.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal__close"
+                aria-label="Close"
+                onClick={closeCycleConfirm}
+                disabled={cycleBusy}
+              >
+                ×
+              </button>
+            </div>
+            <div className="btn-row">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={cycleBusy}
+                onClick={closeCycleConfirm}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={cycleBusy || cycleRunning}
+                onClick={() => void runCycle()}
+              >
+                {cycleBusy ? <IconSpinner /> : null}
+                {cycleBusy ? 'Starting…' : 'Run cycle'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

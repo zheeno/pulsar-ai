@@ -115,6 +115,7 @@ pub fn logout(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let _ = delete_secret(SECRET_PULSE_API_KEY);
     let _ = delete_secret(SECRET_LLM_API_KEY);
     crate::wealth::WealthClient::clear_local_secrets();
+    crate::auth_bridge::revoke_all();
     state
         .db
         .with_conn(clear_session_settings)
@@ -245,13 +246,81 @@ pub(crate) fn load_portfolio_default_sync(state: &Arc<AppState>) -> Result<serde
         if let Some(obj) = value.as_object_mut() {
             obj.insert("tradingMode".into(), serde_json::json!("sandbox"));
             obj.insert(
-                "brokerId".into(),
-                serde_json::json!(crate::broker::BrokerId::parse(&settings.selected_broker).as_str()),
+                "assetClass".into(),
+                serde_json::json!(crate::broker::asset_class().as_str()),
             );
             obj.insert(
-                "brokerName".into(),
-                serde_json::json!(crate::broker::BrokerId::parse(&settings.selected_broker).short_name()),
+                "cryptoSession".into(),
+                serde_json::json!(crate::broker::crypto_session().as_str()),
             );
+            if crate::broker::crypto_mode() {
+                obj.insert("brokerId".into(), serde_json::json!("busha"));
+                obj.insert("brokerName".into(), serde_json::json!("Busha"));
+            } else {
+                obj.insert(
+                    "brokerId".into(),
+                    serde_json::json!(
+                        crate::broker::BrokerId::parse(&settings.selected_broker).as_str()
+                    ),
+                );
+                obj.insert(
+                    "brokerName".into(),
+                    serde_json::json!(
+                        crate::broker::BrokerId::parse(&settings.selected_broker).short_name()
+                    ),
+                );
+            }
+        }
+
+        if crate::broker::crypto_reconnect_required() {
+            if let Ok(Some(book)) = crate::busha::BushaSyncService::load(&state.db) {
+                let status = crate::wealth::WealthProfileStatus {
+                    ok: false,
+                    connected: false,
+                    email: None,
+                    trading_profile: None,
+                    trading_verified: false,
+                    trading_mode: "paused".into(),
+                    brokerage_balance: Some(book.brokerage_balance),
+                    available_balance: None,
+                    current_balance: None,
+                    base_url: String::new(),
+                    message: "Busha session expired. Reconnect to resume live crypto trading."
+                        .into(),
+                    display_name: Some("Busha".into()),
+                    has_session: false,
+                };
+                let mut payload = live_portfolio_payload(
+                    &id,
+                    &summary,
+                    &book,
+                    &status,
+                    true,
+                    wealth_pnl_today(state, "busha", book.profit),
+                    crate::broker::BrokerId::Busha,
+                );
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("tradingMode".into(), serde_json::json!("paused"));
+                    obj.insert(
+                        "cryptoSession".into(),
+                        serde_json::json!("expiredNeedsReconnect"),
+                    );
+                    obj.insert("assetClass".into(), serde_json::json!("crypto"));
+                }
+                return Ok(payload);
+            }
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("tradingMode".into(), serde_json::json!("paused"));
+                obj.insert(
+                    "wealthStatus".into(),
+                    serde_json::json!({
+                        "ok": false,
+                        "connected": false,
+                        "message": "Busha session expired. Reconnect to resume live crypto trading."
+                    }),
+                );
+            }
+            return Ok(value);
         }
 
         let Some(session) = crate::broker::open_live_broker(&settings) else {
@@ -429,6 +498,7 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
                 "quotedSymbols": Vec::<String>::new(),
                 "stale": collapsed,
                 "tradingMode": trading_mode,
+                "assetClass": crate::broker::asset_class().as_str(),
                 "brokerId": live_broker.as_str(),
                 "brokerName": live_broker.short_name(),
                 "portfolio": {
@@ -540,6 +610,7 @@ pub async fn portfolio_quotes(state: State<'_, Arc<AppState>>) -> Result<serde_j
             "quotedSymbols": quoted_symbols,
             "stale": stale,
             "tradingMode": trading_mode,
+            "assetClass": crate::broker::asset_class().as_str(),
             "portfolio": {
                 "id": id,
                 "cash_balance": cash,
@@ -606,6 +677,8 @@ fn live_portfolio_payload(
         "unrealized_pnl": unrealized_pnl,
         "quotesAsOf": book.synced_at,
         "tradingMode": "live",
+        "assetClass": broker_id.as_str().eq_ignore_ascii_case("busha").then_some("crypto").unwrap_or("stocks"),
+        "cryptoSession": crate::broker::crypto_session().as_str(),
         "brokerId": broker_id.as_str(),
         "brokerName": broker_id.short_name(),
         "tradingVerified": status.trading_verified,
@@ -800,6 +873,9 @@ pub fn set_selected_broker(
     state: State<'_, Arc<AppState>>,
 ) -> Result<AppSettings, String> {
     let id = crate::broker::BrokerId::parse(&payload.broker_id);
+    if id == crate::broker::BrokerId::Busha {
+        return state.db.with_conn(get_settings).map_err(|e| e.to_string());
+    }
     state
         .db
         .with_conn(|conn| crate::settings::set_selected_broker(conn, id.as_str()))
@@ -814,7 +890,7 @@ pub fn portfolio_performance(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let venue = venue.unwrap_or_else(|| "sandbox".into());
-    if venue == "wealth" || venue == "sandbox" || venue == "bamboo" {
+    if venue == "wealth" || venue == "sandbox" || venue == "bamboo" || venue == "busha" {
         return state
             .db
             .with_conn(|conn| crate::portfolio::EquityCurveService::get_curve(conn, &venue))
@@ -944,7 +1020,22 @@ pub async fn cycle_run(
         let client = NgxPulseClient::from_settings(&settings, password, api_key);
         let broker = crate::broker::open_live_broker(&settings);
         let calendar = TradingCalendar::default();
-        if !crate::runtime_util::market_activity_allowed(&calendar) {
+        if crate::broker::crypto_reconnect_required() {
+            let msg = "Busha session expired. Reconnect in Settings to continue crypto trading.";
+            let payload = serde_json::json!({
+                "ok": false,
+                "source": "manual",
+                "signals": 0,
+                "executed": 0,
+                "warnings": [],
+                "error": msg,
+            });
+            let _ = app.emit("cycle:complete", payload.clone());
+            return Err(msg.into());
+        }
+        if !crate::broker::crypto_mode()
+            && !crate::runtime_util::market_activity_allowed(&calendar)
+        {
             let payload = serde_json::json!({
                 "ok": false,
                 "source": "manual",

@@ -98,6 +98,8 @@ export interface AppSettings {
   haltNewBuys?: boolean;
   flattenOnDrawdownArmed?: boolean;
   launchAtLogin?: boolean;
+  assetClass?: 'stocks' | 'crypto' | string;
+  cryptoSession?: 'connected' | 'expiredNeedsReconnect' | 'disconnected' | string;
 }
 
 export interface PortfolioData {
@@ -110,6 +112,8 @@ export interface PortfolioData {
   quotesAsOf?: string | null;
   stale?: boolean;
   tradingMode?: 'sandbox' | 'live' | string;
+  assetClass?: 'stocks' | 'crypto' | string;
+  cryptoSession?: 'connected' | 'expiredNeedsReconnect' | 'disconnected' | string;
   brokerId?: string | null;
   brokerName?: string | null;
   tradingVerified?: boolean;

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { IconSignals, IconSpinner } from '../components/Icons';
-import { api } from '../lib/api';
+import { api, type AppSettings } from '../lib/api';
 import { useToast } from '../lib/toast';
 
 interface Signal {
@@ -34,9 +34,13 @@ export default function SignalsPage() {
   const [signals, setSignals] = useState<Signal[]>([]);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [cryptoMode, setCryptoMode] = useState(false);
 
   useEffect(() => {
     void loadSignals();
+    void api<AppSettings>('settings_get')
+      .then((s) => setCryptoMode(s.assetClass === 'crypto'))
+      .catch(() => undefined);
   }, []);
 
   async function loadSignals() {
@@ -69,7 +73,7 @@ export default function SignalsPage() {
       <header className="page-header">
         <div>
           <h1>Signals</h1>
-          <p>Model recommendations for the NGX sandbox. Generate a fresh batch when ready.</p>
+          <p>Model recommendations for {cryptoMode ? 'Busha NGN crypto pairs' : 'the NGX sandbox'}. Generate a fresh batch when ready.</p>
         </div>
         <button type="button" className="btn btn-primary" onClick={() => void generate()} disabled={loading}>
           {loading && <IconSpinner />}

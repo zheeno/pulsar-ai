@@ -95,6 +95,11 @@ impl Database {
         Self::add_column_if_missing(conn, "cycle_audits", "executed_ids", "TEXT")?;
         conn.execute_batch(include_str!("../../migrations/011_coach_sessions.sql"))
             .context("run coach sessions migration")?;
+        conn.execute_batch(include_str!("../../migrations/012_busha.sql"))
+            .context("run busha cache migration")?;
+        conn.execute_batch(include_str!("../../migrations/013_busha_pairs.sql"))
+            .context("run busha pairs migration")?;
+        Self::add_column_if_missing(conn, "broker_orders", "venue", "TEXT NOT NULL DEFAULT 'wealth'")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
         Ok(())

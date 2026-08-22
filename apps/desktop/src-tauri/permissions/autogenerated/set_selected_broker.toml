@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-selected-broker"
+description = "Enables the set_selected_broker command without any pre-configured scope."
+commands.allow = ["set_selected_broker"]
+
+[[permission]]
+identifier = "deny-set-selected-broker"
+description = "Denies the set_selected_broker command without any pre-configured scope."
+commands.deny = ["set_selected_broker"]

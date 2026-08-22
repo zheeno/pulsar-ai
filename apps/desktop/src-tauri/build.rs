@@ -71,8 +71,70 @@ fn main() {
     emit_pulse_env("NGX_PULSE_SUPABASE_URL", &file_env);
     emit_pulse_env("NGX_PULSE_SUPABASE_ANON_KEY", &file_env);
     embed_agent_worker(&manifest_dir);
+    generate_auth_bridge(&manifest_dir);
 
-    tauri_build::build()
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(
+            tauri_build::AppManifest::new().commands(&[
+                "ping",
+                "settings_get",
+                "settings_set",
+                "confidence_journal",
+                "list_cycle_audits",
+                "logout",
+                "test_pulse_login",
+                "test_llm",
+                "llm_status",
+                "pulse_profile",
+                "complete_onboarding",
+                "portfolio_default",
+                "portfolio_quotes",
+                "portfolio_performance",
+                "usage_ngx_pulse",
+                "market_status",
+                "cycle_status",
+                "cycle_run",
+                "cycle_ingest",
+                "generate_signals",
+                "list_signals",
+                "list_trades",
+                "memory_list",
+                "memory_search",
+                "memory_delete",
+                "symbol_detail",
+                "symbol_detail_pulse",
+                "get_strategy",
+                "update_strategy",
+                "strategy_coach_propose",
+                "strategy_coach_apply",
+                "coach_list_sessions",
+                "coach_get_session",
+                "coach_new_session",
+                "coach_delete_session",
+                "coach_turn",
+                "coach_execute_trade",
+                "coach_cancel_trade",
+                "export_database",
+                "app_data_dir",
+                "reset_local_data",
+                "wealth_login",
+                "wealth_verify_2fa",
+                "wealth_profile",
+                "wealth_logout",
+                "bamboo_login",
+                "bamboo_profile",
+                "bamboo_logout",
+                "broker_list",
+                "set_selected_broker",
+                "auth_bridge_authenticate",
+                "auth_bridge_session",
+                "auth_bridge_list",
+                "auth_bridge_revoke",
+                "auth_bridge_submit_candidate",
+            ]),
+        ),
+    )
+    .expect("tauri build");
 }
 
 fn embed_agent_worker(manifest_dir: &Path) {
@@ -104,4 +166,89 @@ fn embed_agent_worker(manifest_dir: &Path) {
     fs::write(&dest, b"// agent worker not bundled in this debug build\n")
         .expect("write placeholder agent worker");
     println!("cargo:rustc-env=AGENT_WORKER_SHA256=");
+}
+
+fn generate_auth_bridge(manifest_dir: &Path) {
+    let brokers_dir = manifest_dir.join("src/auth_bridge/brokers");
+    println!("cargo:rerun-if-changed={}", brokers_dir.display());
+
+    let mut files: Vec<String> = Vec::new();
+    let mut ipc_urls: Vec<String> = vec![
+        "http://127.0.0.1:*/*".into(),
+        "http://localhost:*/*".into(),
+    ];
+    if let Ok(entries) = fs::read_dir(&brokers_dir) {
+        let mut names: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        names.sort_by_key(|e| e.file_name());
+        for entry in names {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            println!("cargo:rerun-if-changed={}", path.display());
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            files.push(name.clone());
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(origins) = v.get("allowedOrigins").and_then(|x| x.as_array()) {
+                        for origin in origins {
+                            let Some(o) = origin.as_str() else { continue };
+                            if is_idp_origin(o) {
+                                continue;
+                            }
+                            let pattern = origin_to_url_pattern(o);
+                            if !ipc_urls.contains(&pattern) {
+                                ipc_urls.push(pattern);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut rust = String::from(
+        "pub fn embedded_broker_json() -> &'static [&'static str] {\n    &[\n",
+    );
+    for name in &files {
+        rust.push_str(&format!(
+            "        include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/auth_bridge/brokers/{name}\")),\n"
+        ));
+    }
+    rust.push_str("    ]\n}\n");
+    fs::write(out_dir.join("auth_bridge_brokers.rs"), rust).expect("write auth_bridge_brokers.rs");
+
+    let cap = serde_json::json!({
+        "$schema": "../gen/schemas/desktop-schema.json",
+        "identifier": "auth-bridge",
+        "description": "Remote partner login webviews may only submit a capture candidate",
+        "windows": ["auth-bridge-*"],
+        "local": false,
+        "remote": { "urls": ipc_urls },
+        "permissions": ["allow-auth-bridge-submit-candidate"]
+    });
+    let cap_path = manifest_dir.join("capabilities/auth-bridge.json");
+    let pretty = serde_json::to_string_pretty(&cap).unwrap() + "\n";
+    if fs::read_to_string(&cap_path).unwrap_or_default() != pretty {
+        fs::write(&cap_path, pretty).expect("write auth-bridge capability");
+    }
+}
+
+fn is_idp_origin(origin: &str) -> bool {
+    let o = origin.to_ascii_lowercase();
+    o.contains("google.")
+        || o.contains("youtube.com")
+        || o.contains("apple.com")
+        || o.contains("facebook.com")
+        || o.contains("microsoftonline")
+}
+
+fn origin_to_url_pattern(origin: &str) -> String {
+    let o = origin.trim().trim_end_matches('/');
+    if o.ends_with("/*") {
+        o.to_string()
+    } else {
+        format!("{o}/*")
+    }
 }
