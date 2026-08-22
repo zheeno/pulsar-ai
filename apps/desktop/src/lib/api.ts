@@ -1,8 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { httpInvoke } from './http-bridge';
 
-function isTauri(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export function isTauri(): boolean {
+  if (typeof window === 'undefined') return false;
+  if ('__TAURI_INTERNALS__' in window) return true;
+  if ('__TAURI__' in window) return true;
+  return window.location.protocol === 'tauri:' || window.location.hostname === 'tauri.localhost';
 }
 
 /**

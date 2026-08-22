@@ -4,7 +4,7 @@ import AppShell from './components/AppShell';
 import AuthBridgeSessionAlerts from './components/AuthBridgeSessionAlerts';
 import ErrorBoundary from './components/ErrorBoundary';
 import SplashScreen from './components/SplashScreen';
-import { api, type AppSettings } from './lib/api';
+import { api, isTauri, type AppSettings } from './lib/api';
 import { SessionContext } from './lib/session';
 import { ToastProvider } from './lib/toast';
 import { CycleProvider } from './lib/cycle';
@@ -23,19 +23,32 @@ type PulseAuthReport = {
   message: string;
 };
 
+const BOOT_TIMEOUT_MS = 12_000;
+const BOOT_TIMEOUT_MESSAGE = 'Startup timed out while contacting the desktop backend.';
+
+function withBootTimeout<T>(promise: Promise<T>): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      window.setTimeout(() => reject(new Error(BOOT_TIMEOUT_MESSAGE)), BOOT_TIMEOUT_MS);
+    }),
+  ]);
+}
+
 function AppRoutes() {
   const navigate = useNavigate();
   const [ready, setReady] = useState(false);
   const [splashDone, setSplashDone] = useState(false);
   const [needsOnboarding, setNeedsOnboarding] = useState(true);
   const [bootMessage, setBootMessage] = useState('Igniting Pulsar…');
+  const [bootError, setBootError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function boot() {
       try {
-        const s = await api<AppSettings>('settings_get');
+        const s = await withBootTimeout(api<AppSettings>('settings_get'));
         if (cancelled) return;
 
         if (!s.onboardingComplete) {
@@ -45,7 +58,7 @@ function AppRoutes() {
         }
 
         setBootMessage('Verifying NGX Pulse session…');
-        const report = await api<PulseAuthReport>('test_pulse_login');
+        const report = await withBootTimeout(api<PulseAuthReport>('test_pulse_login'));
         if (cancelled) return;
 
         if (!report.ok || report.authMode !== 'session') {
@@ -65,8 +78,12 @@ function AppRoutes() {
         setBootMessage('Ready');
         setNeedsOnboarding(false);
         setReady(true);
-      } catch {
+      } catch (err) {
         if (cancelled) return;
+        const message =
+          err instanceof Error ? err.message : 'Could not reach the desktop backend.';
+        setBootError(message);
+        setBootMessage('Startup issue — opening setup…');
         setNeedsOnboarding(true);
         setReady(true);
       }
@@ -95,7 +112,7 @@ function AppRoutes() {
     return (
       <SplashScreen
         ready={ready}
-        message={bootMessage}
+        message={bootError ? `${bootMessage} ${bootError}` : bootMessage}
         onFinished={finishSplash}
       />
     );
@@ -131,7 +148,7 @@ function AppRoutes() {
 }
 
 export default function App() {
-  const browserMode = typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window);
+  const browserMode = typeof window !== 'undefined' && !isTauri();
 
   return (
     <HashRouter>

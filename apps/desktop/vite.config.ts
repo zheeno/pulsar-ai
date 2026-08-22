@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 
 export default defineConfig({
+  // Tauri serves the webview from a custom protocol; absolute `/assets/...` URLs 404 in release builds.
+  base: './',
   plugins: [react()],
   resolve: {
     alias: {
@@ -16,7 +18,8 @@ export default defineConfig({
   },
   envPrefix: ['VITE_', 'TAURI_'],
   build: {
-    target: 'es2021',
+    // macOS 11 WebKit (Safari 14) — es2021 can emit syntax older engines reject.
+    target: 'es2020',
     minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
     sourcemap: !!process.env.TAURI_DEBUG,
   },
