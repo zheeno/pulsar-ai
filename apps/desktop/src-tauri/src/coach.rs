@@ -539,6 +539,37 @@ fn get_price_history(conn: &Connection, symbol: &str, days: i64) -> Result<Value
     if !crate::broker::is_valid_trade_symbol(venue, symbol) {
         return Ok(json!({ "ok": false, "error": format!("invalid ticker {symbol}") }));
     }
+
+    if crate::broker::crypto_mode() && crate::busha::is_crypto_symbol(conn, symbol) {
+        let period = if days <= 2 {
+            crate::busha::BushaOhlcPeriod::OneDay
+        } else {
+            crate::busha::BushaOhlcPeriod::OneMonth
+        };
+        let limit = days.max(1).min(500);
+        let points = crate::busha::ohlc_points(conn, symbol, period, limit)?;
+        if !points.is_empty() {
+            let bars: Vec<Value> = points
+                .into_iter()
+                .map(|(date, close)| {
+                    json!({
+                        "date": date,
+                        "close": close,
+                        "changePercent": null,
+                        "volume": null,
+                    })
+                })
+                .collect();
+            return Ok(json!({
+                "ok": true,
+                "symbol": symbol,
+                "bars": bars,
+                "count": bars.len(),
+                "source": "busha_ohlc",
+            }));
+        }
+    }
+
     let mut stmt = conn.prepare(
         "SELECT trade_date, price, change_percent, volume FROM price_history
          WHERE symbol = ?1 ORDER BY trade_date DESC LIMIT ?2",
@@ -561,7 +592,7 @@ fn get_price_history(conn: &Connection, symbol: &str, days: i64) -> Result<Value
             "error": format!("No price history for {symbol}"),
         }));
     }
-    Ok(json!({ "ok": true, "symbol": symbol, "bars": bars, "count": bars.len() }))
+    Ok(json!({ "ok": true, "symbol": symbol, "bars": bars, "count": bars.len(), "source": "price_history" }))
 }
 
 fn run_symbol_screen(conn: &Connection, args: &Value) -> Result<Value> {

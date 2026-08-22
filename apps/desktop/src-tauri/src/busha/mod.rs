@@ -12,6 +12,9 @@ use crate::wealth::{
     WealthWallet,
 };
 
+mod ohlc;
+pub use ohlc::*;
+
 const BASE_URL: &str = "https://api.busha.io";
 const ORIGIN: &str = "https://app.busha.io";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
@@ -262,6 +265,7 @@ impl BushaClient {
         source_amount: f64,
         decimals: Option<usize>,
         floor_amount: bool,
+        amount_str: Option<&str>,
     ) -> Result<BushaQuote> {
         let body = quote_body_with_decimals(
             source_currency,
@@ -269,6 +273,7 @@ impl BushaClient {
             source_amount,
             decimals,
             floor_amount,
+            amount_str,
         );
         tracing::debug!(
             target: "busha",
@@ -347,6 +352,7 @@ impl BushaClient {
         side: &str,
         quantity: f64,
         price: f64,
+        sell_full_lot: bool,
     ) -> Result<(BushaSizedFee, BushaFeeQuote)> {
         let base = symbol.trim().to_uppercase();
         let buy = side.eq_ignore_ascii_case("BUY");
@@ -360,18 +366,51 @@ impl BushaClient {
         }
         let mut decimals: Option<usize> = None;
         let mut floor_amount = false;
+        let mut wallet_qty = 0.0_f64;
         if let Ok(pairs) = self.pairs_ngn().await {
             if let Some(p) = pair_for(&pairs, &base) {
                 if buy {
                     source_amount = apply_pair_quote_limits(true, source_amount, price, p)?;
                     decimals = Some(p.counter_decimal);
                 } else {
-                    // Never raise a SELL above what the wallet can spend — meet_floor used to
-                    // bump dust bags past `available` and Busha returned insufficient balance.
-                    let available = self.available_crypto(&base).await.unwrap_or(source_amount);
-                    source_amount = apply_sell_quote_limits(source_amount, price, p, available)?;
-                    decimals = Some(p.base_decimal);
+                    let (available, raw) = self
+                        .wallet_crypto_amount(&base)
+                        .await
+                        .unwrap_or((source_amount, format_amount_floor(source_amount, crypto_decimals(p))));
+                    let d = crypto_decimals(p);
+                    let wallet_str = truncate_amount_str(&raw, d);
+                    wallet_qty = parse_amount_str(&wallet_str);
+                    if wallet_qty <= 0.0 {
+                        wallet_qty = floor_crypto_amount(available, d);
+                    }
+                    let requested = if sell_full_lot { wallet_qty } else { quantity };
+                    let (qty, quote_str) = size_crypto_sell(
+                        &wallet_str,
+                        requested,
+                        price,
+                        p,
+                        sell_full_lot,
+                    )?;
+                    source_amount = qty;
+                    decimals = Some(d);
                     floor_amount = true;
+                    let (source, target) = (base.as_str(), "NGN");
+                    let quote = self
+                        .create_quote(
+                            source,
+                            target,
+                            source_amount,
+                            decimals,
+                            floor_amount,
+                            Some(&quote_str),
+                        )
+                        .await?;
+                    return Ok(build_sized_fee_from_quote(
+                        &quote,
+                        price,
+                        buy,
+                        wallet_qty,
+                    ));
                 }
             }
         }
@@ -381,7 +420,7 @@ impl BushaClient {
             (base.as_str(), "NGN")
         };
         let quote = self
-            .create_quote(source, target, source_amount, decimals, floor_amount)
+            .create_quote(source, target, source_amount, decimals, floor_amount, None)
             .await?;
         let fee = BushaFeeQuote {
             quote_id: quote.id.clone(),
@@ -416,21 +455,109 @@ impl BushaClient {
                 quantity: qty,
                 price_per_share: pps,
                 total_price: total,
-                available_quantity: f64::MAX,
+                available_quantity: if buy {
+                    f64::MAX
+                } else if wallet_qty > 0.0 {
+                    wallet_qty
+                } else {
+                    qty
+                },
             },
             fee,
         ))
     }
 
-    async fn available_crypto(&self, currency: &str) -> Result<f64> {
-        let (cash, holdings) = self.balances().await?;
-        let _ = cash;
+    /// Read live wallet balance for a crypto code (amount string + parsed f64).
+    pub async fn wallet_crypto_amount(&self, currency: &str) -> Result<(f64, String)> {
+        let v = self.get_json("/v1/balances").await?;
         let code = currency.trim().to_uppercase();
-        Ok(holdings
-            .iter()
-            .find(|h| h.symbol.eq_ignore_ascii_case(&code))
-            .map(|h| h.quantity)
-            .unwrap_or(0.0))
+        let arr = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| anyhow!("balances missing data"))?;
+        for item in arr {
+            let cur = item
+                .get("currency")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_uppercase();
+            if cur != code {
+                continue;
+            }
+            let raw = item
+                .pointer("/available/amount")
+                .and_then(|a| a.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    format_amount_decimals(item.get("available").map(money).unwrap_or(0.0), 8)
+                });
+            return Ok((parse_amount_str(&raw), raw));
+        }
+        Ok((0.0, "0".into()))
+    }
+
+    /// After a full-lot sell, attempt one dust sweep if remainder is still tradable.
+    pub async fn try_sweep_crypto_remainder(
+        &self,
+        symbol: &str,
+        price: f64,
+    ) -> Result<Option<BushaTransfer>> {
+        let base = symbol.trim().to_uppercase();
+        let pairs = self.pairs_ngn().await?;
+        let p = pair_for(&pairs, &base)
+            .ok_or_else(|| anyhow!("No Busha NGN pair for {base}"))?;
+        let (_, raw) = self.wallet_crypto_amount(&base).await?;
+        let d = crypto_decimals(p);
+        let wallet_str = truncate_amount_str(&raw, d);
+        let rem = parse_amount_str(&wallet_str);
+        if rem <= 0.0 {
+            return Ok(None);
+        }
+        if is_untradeable_dust(rem, p, price) {
+            tracing::info!(
+                target: "busha",
+                symbol = %base,
+                remainder = rem,
+                "untradeable crypto dust remains after full exit"
+            );
+            return Ok(None);
+        }
+        let (sized, quote_str) = size_crypto_sell(&wallet_str, rem, price, p, true)?;
+        let quote = self
+            .create_quote(
+                &base,
+                "NGN",
+                sized,
+                Some(d),
+                true,
+                Some(&quote_str),
+            )
+            .await?;
+        let fee = BushaFeeQuote {
+            quote_id: quote.id.clone(),
+            expires_at: quote.expires_at,
+            source_amount: quote.source_amount,
+            target_amount: quote.target_amount,
+            rate: quote.rate,
+            side: quote.side.clone(),
+            source_currency: quote.source_currency.clone(),
+            target_currency: quote.target_currency.clone(),
+        };
+        tracing::info!(
+            target: "busha",
+            symbol = %base,
+            qty = sized,
+            "sweeping tradable crypto remainder"
+        );
+        Ok(Some(self.place_and_await_fill(&fee, &base).await?))
+    }
+
+    async fn available_crypto(&self, currency: &str) -> Result<f64> {
+        Ok(self
+            .wallet_crypto_amount(currency)
+            .await
+            .map(|(n, _)| n)?)
     }
 
     pub async fn place_and_await_fill(
@@ -475,7 +602,7 @@ fn urlencoding_lite(s: &str) -> String {
 }
 
 pub fn quote_body(source: &str, target: &str, source_amount: f64) -> Value {
-    quote_body_with_decimals(source, target, source_amount, None, false)
+    quote_body_with_decimals(source, target, source_amount, None, false, None)
 }
 
 pub fn quote_body_with_decimals(
@@ -484,6 +611,7 @@ pub fn quote_body_with_decimals(
     source_amount: f64,
     decimals: Option<usize>,
     floor_amount: bool,
+    amount_str: Option<&str>,
 ) -> Value {
     let places = decimals.unwrap_or_else(|| {
         if source.eq_ignore_ascii_case("NGN") {
@@ -492,16 +620,114 @@ pub fn quote_body_with_decimals(
             8
         }
     });
-    let amount = if floor_amount {
-        format_amount_floor(source_amount, places)
-    } else {
-        format_amount_decimals(source_amount, places)
-    };
+    let amount = amount_str.map(str::to_string).unwrap_or_else(|| {
+        if floor_amount {
+            format_amount_floor(source_amount, places)
+        } else {
+            format_amount_decimals(source_amount, places)
+        }
+    });
     json!({
         "source_currency": source,
         "target_currency": target,
         "source_amount": amount,
     })
+}
+
+/// Truncate a wallet amount string to at most `max_decimals` without float drift.
+pub fn truncate_amount_str(raw: &str, max_decimals: usize) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return "0".into();
+    }
+    let d = max_decimals.min(12);
+    if let Some((int, frac)) = s.split_once('.') {
+        let frac_trunc = if frac.len() > d { &frac[..d] } else { frac };
+        let mut out = if frac_trunc.is_empty() {
+            int.to_string()
+        } else {
+            format!("{int}.{frac_trunc}")
+        };
+        while out.contains('.') && out.ends_with('0') {
+            out.pop();
+        }
+        if out.ends_with('.') {
+            out.pop();
+        }
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+fn build_sized_fee_from_quote(
+    quote: &BushaQuote,
+    price: f64,
+    buy: bool,
+    wallet_qty: f64,
+) -> (BushaSizedFee, BushaFeeQuote) {
+    let fee = BushaFeeQuote {
+        quote_id: quote.id.clone(),
+        expires_at: quote.expires_at,
+        source_amount: quote.source_amount,
+        target_amount: quote.target_amount,
+        rate: quote.rate,
+        side: quote.side.clone(),
+        source_currency: quote.source_currency.clone(),
+        target_currency: quote.target_currency.clone(),
+    };
+    let qty = if buy {
+        quote.target_amount
+    } else {
+        quote.source_amount
+    };
+    let total = if buy {
+        quote.source_amount
+    } else {
+        quote.target_amount
+    };
+    let pps = if quote.rate > 0.0 {
+        quote.rate
+    } else if qty > 0.0 {
+        total / qty
+    } else {
+        price
+    };
+    (
+        BushaSizedFee {
+            fee: 0.0,
+            quantity: qty,
+            price_per_share: pps,
+            total_price: total,
+            available_quantity: if buy {
+                f64::MAX
+            } else if wallet_qty > 0.0 {
+                wallet_qty
+            } else {
+                qty
+            },
+        },
+        fee,
+    )
+}
+
+/// Size a crypto SELL using the wallet amount string as source of truth.
+pub fn size_crypto_sell(
+    wallet_str: &str,
+    requested: f64,
+    price: f64,
+    pair: &BushaPair,
+    full_lot: bool,
+) -> Result<(f64, String)> {
+    let d = crypto_decimals(pair);
+    let wallet = parse_amount_str(wallet_str);
+    let qty = apply_sell_quote_limits(requested, price, pair, wallet, full_lot)?;
+    let quote_str = if full_lot && (wallet - qty).abs() < 1e-12 {
+        wallet_str.to_string()
+    } else {
+        format_amount_floor(qty, d)
+    };
+    Ok((qty, quote_str))
 }
 
 /// Raise `amount` to the pair's posted min, using that pair's decimal places.
@@ -531,21 +757,77 @@ pub fn floor_amount_decimals(n: f64, decimals: usize) -> f64 {
     (n * factor).floor() / factor
 }
 
+pub const MAX_CRYPTO_DECIMALS: usize = 8;
+pub fn effective_crypto_decimals(decimals: usize) -> usize {
+    decimals.min(MAX_CRYPTO_DECIMALS)
+}
+
+pub fn crypto_decimals(pair: &BushaPair) -> usize {
+    effective_crypto_decimals(pair.base_decimal)
+}
+
+pub fn crypto_lot_size(decimals: usize) -> f64 {
+    10_f64.powi(-(effective_crypto_decimals(decimals) as i32))
+}
+
+/// Floor a wallet amount using string-first parsing to reduce float drift.
+pub fn floor_crypto_amount_str(raw: &str, decimals: usize) -> f64 {
+    let d = effective_crypto_decimals(decimals);
+    let n = parse_amount_str(raw);
+    floor_amount_decimals(n, d)
+}
+
+pub fn floor_crypto_amount(n: f64, decimals: usize) -> f64 {
+    floor_amount_decimals(n, effective_crypto_decimals(decimals))
+}
+
+/// True when a balance is positive but below Busha min sell thresholds.
+pub fn is_untradeable_dust(qty: f64, pair: &BushaPair, mark_price: f64) -> bool {
+    if !qty.is_finite() || qty <= 0.0 {
+        return false;
+    }
+    let px = if pair.sell_price > 0.0 {
+        pair.sell_price
+    } else {
+        mark_price
+    };
+    if pair.min_sell_base > 0.0 && qty + 1e-12 < pair.min_sell_base {
+        return true;
+    }
+    if px > 0.0 && pair.min_sell_ngn > 0.0 && qty * px + 1e-12 < pair.min_sell_ngn {
+        return true;
+    }
+    false
+}
+
 /// Size a SELL without ever quoting more than `available` (floored to pair decimals).
+/// Partial sells subtract one quantum (`eps`) to avoid insufficient-balance rejects.
+/// Full-lot sells use the exact floored wallet balance (no intentional dust).
 pub fn apply_sell_quote_limits(
     requested: f64,
     price: f64,
     pair: &BushaPair,
     available: f64,
+    full_lot: bool,
 ) -> Result<f64> {
+    let d = crypto_decimals(pair);
     let px = if pair.sell_price > 0.0 {
         pair.sell_price
     } else {
         price
     };
-    // Leave one quantum so float / lock dust does not trip insufficient balance.
-    let eps = 10_f64.powi(-(pair.base_decimal.min(12) as i32));
-    let mut qty = floor_amount_decimals(requested.min(available) - eps, pair.base_decimal);
+    let wallet = floor_crypto_amount(available, d);
+    let cap = if full_lot {
+        wallet
+    } else {
+        requested.min(wallet)
+    };
+    let mut qty = if full_lot {
+        wallet
+    } else {
+        let eps = crypto_lot_size(d);
+        floor_crypto_amount((cap - eps).max(0.0), d)
+    };
     if qty <= 0.0 {
         return Err(anyhow!(
             "Busha {} sell size is zero after flooring available {:.8}",
@@ -554,10 +836,10 @@ pub fn apply_sell_quote_limits(
         ));
     }
     if pair.max_sell_base > 0.0 && qty > pair.max_sell_base + 1e-12 {
-        qty = floor_amount_decimals(pair.max_sell_base, pair.base_decimal);
+        qty = floor_crypto_amount(pair.max_sell_base, d);
     }
     if px > 0.0 && pair.max_sell_ngn > 0.0 && qty * px > pair.max_sell_ngn + 1e-9 {
-        qty = floor_amount_decimals(pair.max_sell_ngn / px, pair.base_decimal);
+        qty = floor_crypto_amount(pair.max_sell_ngn / px, d);
     }
     if pair.min_sell_base > 0.0 && qty + 1e-12 < pair.min_sell_base {
         return Err(anyhow!(
@@ -610,7 +892,7 @@ pub fn apply_pair_quote_limits(
         Ok(ngn)
     } else {
         // Legacy path without wallet clamp — prefer `apply_sell_quote_limits`.
-        let mut qty = meet_floor(source_amount, pair.min_sell_base, pair.base_decimal);
+        let mut qty = meet_floor(source_amount, pair.min_sell_base, crypto_decimals(pair));
         let px = if pair.sell_price > 0.0 {
             pair.sell_price
         } else {
@@ -620,7 +902,7 @@ pub fn apply_pair_quote_limits(
             qty = meet_floor(
                 pair.min_sell_ngn / px,
                 pair.min_sell_base,
-                pair.base_decimal,
+                crypto_decimals(pair),
             );
         }
         if pair.max_sell_base > 0.0 && qty > pair.max_sell_base + 1e-12 {
@@ -949,7 +1231,7 @@ fn parse_decimal_places(v: Option<&Value>) -> usize {
         Some(Value::Number(n)) => n.as_u64().unwrap_or(8) as usize,
         _ => 8,
     }
-    .min(12)
+    .min(MAX_CRYPTO_DECIMALS)
 }
 
 fn pair_for<'a>(pairs: &'a [BushaPair], symbol: &str) -> Option<&'a BushaPair> {
@@ -1026,6 +1308,36 @@ pub fn min_buy_ngn_for(conn: &Connection, symbol: &str) -> Option<f64> {
     )
     .ok()
     .filter(|n| n.is_finite() && *n > 0.0)
+}
+
+/// True when a held qty is positive but below cached Busha min-sell thresholds.
+pub fn is_untradeable_dust_db(
+    conn: &Connection,
+    symbol: &str,
+    qty: f64,
+    mark_price: f64,
+) -> bool {
+    if !qty.is_finite() || qty <= 0.0 {
+        return false;
+    }
+    let row: Option<(f64, f64, f64)> = conn
+        .query_row(
+            "SELECT min_sell_base, min_sell_ngn, sell_price FROM busha_pairs WHERE symbol = ?1",
+            [symbol.trim().to_uppercase()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+    let Some((min_base, min_ngn, sell_px)) = row else {
+        return false;
+    };
+    let px = if sell_px > 0.0 { sell_px } else { mark_price };
+    if min_base > 0.0 && qty + 1e-12 < min_base {
+        return true;
+    }
+    if px > 0.0 && min_ngn > 0.0 && qty * px + 1e-12 < min_ngn {
+        return true;
+    }
+    false
 }
 
 pub fn persist_pairs(conn: &Connection, pairs: &[BushaPair]) -> Result<()> {
@@ -1355,11 +1667,83 @@ mod tests {
         assert!(usdt_q + 1e-9 >= 2619.76);
         let sell = apply_pair_quote_limits(false, 1.0, 1385.34, &usdt).unwrap();
         assert!(sell + 1e-9 >= 2.06);
-        let clamped = apply_sell_quote_limits(1.0, 1385.34, &usdt, 1.0);
+        let clamped = apply_sell_quote_limits(1.0, 1385.34, &usdt, 1.0, false);
         assert!(clamped.is_err(), "must not bump sell above available wallet qty");
-        let ok = apply_sell_quote_limits(5.0, 1385.34, &usdt, 5.0).unwrap();
+        let ok = apply_sell_quote_limits(5.0, 1385.34, &usdt, 5.0, false).unwrap();
         assert!(ok + 1e-9 >= 2.06);
         assert!(ok <= 5.0);
+        let full = apply_sell_quote_limits(5.0, 1385.34, &usdt, 5.0, true).unwrap();
+        assert!((full - 5.0).abs() < 1e-9, "full-lot should sell exact floored wallet qty");
+        let dust = 0.001;
+        assert!(is_untradeable_dust(dust, &usdt, 1385.34));
+        let partial = apply_sell_quote_limits(5.0, 1385.34, &usdt, 5.00000001, false).unwrap();
+        assert!(partial < 5.00000001);
+    }
+
+    #[test]
+    fn full_lot_sells_wallet_not_requested_cap() {
+        let ada = BushaPair {
+            id: "ADANGN".into(),
+            base: "ADA".into(),
+            counter: "NGN".into(),
+            buy_price: 300.0,
+            sell_price: 295.0,
+            is_buy_supported: true,
+            is_sell_supported: true,
+            min_buy_ngn: 500.0,
+            min_buy_base: 1.0,
+            min_sell_ngn: 500.0,
+            min_sell_base: 1.0,
+            max_buy_ngn: 1_000_000.0,
+            max_buy_base: 10_000.0,
+            max_sell_ngn: 1_000_000.0,
+            max_sell_base: 10_000.0,
+            base_decimal: 8,
+            counter_decimal: 2,
+            percentage_change: 0.0,
+        };
+        let wallet = 10.5;
+        let requested = 10.0;
+        let full = apply_sell_quote_limits(requested, 295.0, &ada, wallet, true).unwrap();
+        assert!(
+            (full - wallet).abs() < 1e-9,
+            "full-lot must sell entire wallet, not min(requested, wallet)"
+        );
+    }
+
+    #[test]
+    fn truncate_amount_str_avoids_float_drift() {
+        assert_eq!(truncate_amount_str("12.345678912", 8), "12.34567891");
+        assert_eq!(truncate_amount_str("10.50000000", 8), "10.5");
+    }
+
+    #[test]
+    fn full_lot_does_not_leave_eps_dust() {
+        let ada = BushaPair {
+            id: "ADANGN".into(),
+            base: "ADA".into(),
+            counter: "NGN".into(),
+            buy_price: 300.0,
+            sell_price: 295.0,
+            is_buy_supported: true,
+            is_sell_supported: true,
+            min_buy_ngn: 500.0,
+            min_buy_base: 1.0,
+            min_sell_ngn: 500.0,
+            min_sell_base: 1.0,
+            max_buy_ngn: 1_000_000.0,
+            max_buy_base: 10_000.0,
+            max_sell_ngn: 1_000_000.0,
+            max_sell_base: 10_000.0,
+            base_decimal: 8,
+            counter_decimal: 2,
+            percentage_change: 0.0,
+        };
+        let held = 12.34567891_f64;
+        let full = apply_sell_quote_limits(held, 295.0, &ada, held, true).unwrap();
+        assert!((full - 12.34567891).abs() < 1e-8);
+        let partial = apply_sell_quote_limits(held, 295.0, &ada, held, false).unwrap();
+        assert!(partial < full);
     }
 
     #[test]

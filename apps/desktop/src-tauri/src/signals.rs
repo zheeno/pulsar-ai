@@ -1695,6 +1695,80 @@ pub async fn run_cycle(
             (None, "sandbox", Vec::new())
         };
 
+    if crypto {
+        if let Some(crate::broker::BrokerSession::Busha(client)) = broker {
+            use std::collections::HashSet;
+            use crate::busha::{ingest_ohlc_for_symbols, symbols_needing_ohlc, BushaOhlcPeriod};
+
+            let mut held: Vec<String> = live_holdings.iter().map(|l| l.symbol.clone()).collect();
+            if held.is_empty() {
+                held = db
+                    .with_conn(|conn| {
+                        let lots = SignalGenerationService::sandbox_lots(conn, None)?;
+                        Ok(lots.into_iter().map(|l| l.symbol).collect::<Vec<_>>())
+                    })
+                    .unwrap_or_default();
+            }
+            let held_set: HashSet<String> = held.iter().map(|s| s.to_uppercase()).collect();
+            let symbols = db
+                .with_conn(|conn| symbols_needing_ohlc(conn, &held, 40))
+                .unwrap_or(held.clone());
+
+            match ingest_ohlc_for_symbols(
+                client,
+                db,
+                &symbols,
+                BushaOhlcPeriod::OneDay,
+                BushaOhlcPeriod::OneDay.default_cache_secs(),
+                &held_set,
+            )
+            .await
+            {
+                Ok(report) => {
+                    if report.fetched > 0 {
+                        tracing::info!(
+                            target: "busha",
+                            fetched = report.fetched,
+                            skipped = report.skipped_cache,
+                            failed = report.failed.len(),
+                            "OHLC 1d ingest complete"
+                        );
+                    }
+                    if !report.failed.is_empty() {
+                        warnings.push(format!(
+                            "Busha OHLC 1d failed for {} symbol(s).",
+                            report.failed.len()
+                        ));
+                    }
+                }
+                Err(e) => warnings.push(format!("Busha OHLC 1d ingest error: {e}")),
+            }
+
+            if !held.is_empty() {
+                match ingest_ohlc_for_symbols(
+                    client,
+                    db,
+                    &held,
+                    BushaOhlcPeriod::OneMonth,
+                    BushaOhlcPeriod::OneMonth.default_cache_secs(),
+                    &held_set,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        if !report.failed.is_empty() {
+                            warnings.push(format!(
+                                "Busha OHLC 1m failed for {} held symbol(s).",
+                                report.failed.len()
+                            ));
+                        }
+                    }
+                    Err(e) => warnings.push(format!("Busha OHLC 1m ingest error: {e}")),
+                }
+            }
+        }
+    }
+
     let generated = SignalGenerationService::generate_for_portfolio(
         db,
         agent,

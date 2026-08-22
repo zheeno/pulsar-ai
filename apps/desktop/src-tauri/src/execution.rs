@@ -676,6 +676,10 @@ impl ExecutionService {
             }
             let wallet = client.get_wallet().await?;
             let snap = client.get_portfolio().await?;
+            let sell_frac = sell_fraction_from_snapshot(&snapshot);
+            let full_lot_exit = action == "SELL" && sell_frac >= 1.0 - 1e-9;
+            let sell_full_lot =
+                full_lot_exit && client.id() == crate::broker::BrokerId::Busha;
             let current_equity = {
                 let mv = if snap.stock_value > 0.0 {
                     snap.stock_value
@@ -744,12 +748,25 @@ impl ExecutionService {
                     client.id().whole_shares(),
                 );
                 if result == "APPROVED" && action == "SELL" {
-                    let frac = sell_fraction_from_snapshot(&snapshot);
-                    quantity = crate::risk_exits::sell_qty_for_exit_ex(
-                        quantity,
-                        frac,
-                        client.id().whole_shares(),
-                    );
+                    let crypto_d = if client.id() == crate::broker::BrokerId::Busha {
+                        Some(crate::busha::MAX_CRYPTO_DECIMALS)
+                    } else {
+                        None
+                    };
+                    quantity = if crypto_d.is_some() {
+                        crate::risk_exits::sell_qty_for_exit_with_decimals(
+                            quantity,
+                            sell_frac,
+                            client.id().whole_shares(),
+                            crypto_d,
+                        )
+                    } else {
+                        crate::risk_exits::sell_qty_for_exit_ex(
+                            quantity,
+                            sell_frac,
+                            client.id().whole_shares(),
+                        )
+                    };
                     if client.id().whole_shares() && quantity < 1.0 {
                         conn.execute(
                             "UPDATE signals SET risk_policy_result = 'BLOCKED_NO_POSITION' WHERE id = ?1",
@@ -772,11 +789,29 @@ impl ExecutionService {
                 if result != "APPROVED" || quantity <= 0.0 {
                     return Ok(None);
                 }
+                if action == "SELL" && client.id() == crate::broker::BrokerId::Busha {
+                    if crate::busha::is_untradeable_dust_db(
+                        conn,
+                        &symbol,
+                        quantity,
+                        broker_quote,
+                    ) {
+                        conn.execute(
+                            "UPDATE signals SET risk_policy_result = 'BLOCKED_UNTRADEABLE_DUST' WHERE id = ?1",
+                            [signal_id],
+                        )?;
+                        tracing::info!(
+                            target: "execution",
+                            symbol = %symbol,
+                            qty = quantity,
+                            "skip Busha sell — untradeable crypto dust"
+                        );
+                        return Ok(None);
+                    }
+                }
                 // Full-lot exits go in one order (stocks + crypto). The 25% equity
                 // throttle only applies to partial / discretionary sells that would
                 // otherwise dump the book across many names without confirmation.
-                let full_lot_exit = action == "SELL"
-                    && sell_fraction_from_snapshot(&snapshot) >= 1.0 - 1e-9;
                 if action == "SELL" && !full_lot_exit {
                     let cap = current_equity * MAX_LIQUIDATION_PCT;
                     if !allow_bulk_liquidation
@@ -816,7 +851,7 @@ impl ExecutionService {
             };
 
             let mut fee = match client
-                .calculate_fee(&instrument, &action, quantity, broker_quote)
+                .calculate_fee(&instrument, &action, quantity, broker_quote, sell_full_lot)
                 .await
             {
                 Ok(f) => f,
@@ -833,6 +868,9 @@ impl ExecutionService {
                     return Err(e);
                 }
             };
+            if action == "SELL" {
+                quantity = fee.quantity;
+            }
             if action == "BUY" {
                 let target = match fit_live_buy_qty(
                     quantity,
@@ -863,7 +901,7 @@ impl ExecutionService {
                     );
                     quantity = target;
                     fee = match client
-                        .calculate_fee(&instrument, &action, quantity, broker_quote)
+                        .calculate_fee(&instrument, &action, quantity, broker_quote, false)
                         .await
                     {
                         Ok(f) => f,
@@ -907,7 +945,7 @@ impl ExecutionService {
                     if target + 1e-9 < quantity {
                         quantity = target;
                         fee = match client
-                            .calculate_fee(&instrument, &action, quantity, broker_quote)
+                            .calculate_fee(&instrument, &action, quantity, broker_quote, false)
                             .await
                         {
                             Ok(f) => f,
@@ -951,7 +989,7 @@ impl ExecutionService {
                     if need > quantity {
                         quantity = need;
                         fee = match client
-                            .calculate_fee(&instrument, &action, quantity, broker_quote)
+                            .calculate_fee(&instrument, &action, quantity, broker_quote, false)
                             .await
                         {
                             Ok(f) => f,
@@ -1049,12 +1087,13 @@ impl ExecutionService {
 
             db.with_conn(|conn| {
                 let fill_price = order.unit_price.or(order.quote_price).or(Some(broker_quote));
+                let fill_qty = fee.quantity;
                 insert_broker_order(
                     conn,
                     Some(signal_id),
                     &symbol,
                     &action,
-                    quantity,
+                    fill_qty,
                     &order,
                     fill_price,
                     Some(fee.fee),
@@ -1090,7 +1129,7 @@ impl ExecutionService {
                         signal_id,
                         &symbol,
                         &action,
-                        quantity,
+                        fill_qty,
                         px,
                         fee.fee,
                         client.id().as_str(),
@@ -1101,7 +1140,7 @@ impl ExecutionService {
             })?;
 
             if action == "SELL" {
-                *cycle_sell_notional += quantity * broker_quote;
+                *cycle_sell_notional += fee.quantity * broker_quote;
             }
             if order.status == "rejected" {
                 return Err(anyhow::anyhow!(
@@ -1118,6 +1157,19 @@ impl ExecutionService {
                     order.status,
                     order.id
                 ));
+            }
+            if sell_full_lot && action == "SELL" {
+                if let Err(e) = client
+                    .try_sweep_crypto_remainder(&symbol, broker_quote)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "execution",
+                        symbol = %symbol,
+                        error = %e,
+                        "crypto dust sweep failed after full-lot sell"
+                    );
+                }
             }
             return Ok(true);
         }
@@ -1709,6 +1761,8 @@ pub fn classify_live_execution_error(msg: &str) -> &'static str {
         "BLOCKED_QUOTE_DEVIATION"
     } else if m.contains("drawdown") {
         "BLOCKED_DRAWDOWN"
+    } else if m.contains("untradeable") && m.contains("dust") {
+        "BLOCKED_UNTRADEABLE_DUST"
     } else if m.contains("notional") || m.contains("bulk liquidation") || m.contains("below min") {
         "BLOCKED_NOTIONAL"
     } else if m.contains("transaction pin") {

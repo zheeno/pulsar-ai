@@ -416,6 +416,7 @@ impl BrokerSession {
         side: &str,
         quantity: f64,
         price: f64,
+        sell_full_lot: bool,
     ) -> Result<BrokerFeeQuote> {
         match self {
             Self::Wealth(client) => {
@@ -453,7 +454,7 @@ impl BrokerSession {
             }
             Self::Busha(client) => {
                 let (fee, busha) = client
-                    .calculate_fee(&instrument.symbol, side, quantity, price)
+                    .calculate_fee(&instrument.symbol, side, quantity, price, sell_full_lot)
                     .await?;
                 Ok(BrokerFeeQuote {
                     fee: fee.fee,
@@ -503,6 +504,17 @@ impl BrokerSession {
                 let transfer = client.place_and_await_fill(calc, &instrument.symbol).await?;
                 Ok(BrokerOrder::from_busha(&transfer, quote))
             }
+        }
+    }
+
+    /// After a full-lot crypto exit, sell any tradable remainder left in the wallet.
+    pub async fn try_sweep_crypto_remainder(&self, symbol: &str, price: f64) -> Result<()> {
+        match self {
+            Self::Busha(client) => {
+                let _ = client.try_sweep_crypto_remainder(symbol, price).await?;
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 

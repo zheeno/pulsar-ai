@@ -453,6 +453,12 @@
           "markdownDescription": "Enables the symbol_detail command without any pre-configured scope."
         },
         {
+          "description": "Enables the symbol_detail_busha command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-symbol-detail-busha",
+          "markdownDescription": "Enables the symbol_detail_busha command without any pre-configured scope."
+        },
+        {
           "description": "Enables the symbol_detail_pulse command without any pre-configured scope.",
           "type": "string",
           "const": "allow-symbol-detail-pulse",
@@ -781,6 +787,12 @@
           "type": "string",
           "const": "deny-symbol-detail",
           "markdownDescription": "Denies the symbol_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the symbol_detail_busha command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-symbol-detail-busha",
+          "markdownDescription": "Denies the symbol_detail_busha command without any pre-configured scope."
         },
         {
           "description": "Denies the symbol_detail_pulse command without any pre-configured scope.",

@@ -174,6 +174,18 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
                                 );
                             }
                         }
+                        let _ = state.db.with_conn(|conn| {
+                            for sym in &symbols {
+                                if let Some(px) = crate::busha::latest_ohlc_price(
+                                    conn,
+                                    sym,
+                                    crate::busha::BushaOhlcPeriod::OneDay,
+                                ) {
+                                    prices.entry(sym.clone()).or_insert(px);
+                                }
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -308,6 +320,42 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
                 }
             };
 
+        if trading_mode == TradingMode::Live {
+            if broker
+                .as_ref()
+                .is_some_and(|s| s.id() == crate::broker::BrokerId::Busha)
+            {
+                let _ = state.db.with_conn(|conn| {
+                    lots.retain(|lot| {
+                        let px = prices
+                            .get(&lot.symbol.to_uppercase())
+                            .copied()
+                            .or(lot.last_price)
+                            .unwrap_or(lot.avg_cost);
+                        let dust = crate::busha::is_untradeable_dust_db(
+                            conn,
+                            &lot.symbol,
+                            lot.quantity,
+                            px,
+                        );
+                        if dust {
+                            tracing::info!(
+                                target: "risk_monitor",
+                                symbol = %lot.symbol,
+                                qty = lot.quantity,
+                                "skip untradeable crypto dust"
+                            );
+                        }
+                        !dust
+                    });
+                    Ok::<(), anyhow::Error>(())
+                })?;
+                if lots.is_empty() {
+                    return Ok(None);
+                }
+            }
+        }
+
         let candidates = crate::risk_exits::evaluate_position_exits_full(
             &lots,
             crate::risk_exits::ExitParams {
@@ -344,20 +392,49 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
 
         state.db.with_conn(|conn| {
             for exit in &candidates {
-                let qty = crate::risk_exits::sell_qty_for_exit_ex(
-                    lots
-                        .iter()
-                        .find(|l| l.symbol.eq_ignore_ascii_case(&exit.symbol))
-                        .map(|l| l.quantity)
-                        .unwrap_or(0.0),
-                    exit.sell_fraction,
-                    broker
-                        .as_ref()
-                        .map(|s| s.id().whole_shares())
-                        .unwrap_or(true),
-                );
+                let lot_qty = lots
+                    .iter()
+                    .find(|l| l.symbol.eq_ignore_ascii_case(&exit.symbol))
+                    .map(|l| l.quantity)
+                    .unwrap_or(0.0);
+                let whole_shares = broker
+                    .as_ref()
+                    .map(|s| s.id().whole_shares())
+                    .unwrap_or(true);
+                let crypto_d = broker
+                    .as_ref()
+                    .filter(|s| s.id() == crate::broker::BrokerId::Busha)
+                    .map(|_| crate::busha::MAX_CRYPTO_DECIMALS);
+                let qty = if crypto_d.is_some() {
+                    crate::risk_exits::sell_qty_for_exit_with_decimals(
+                        lot_qty,
+                        exit.sell_fraction,
+                        whole_shares,
+                        crypto_d,
+                    )
+                } else {
+                    crate::risk_exits::sell_qty_for_exit_ex(lot_qty, exit.sell_fraction, whole_shares)
+                };
                 if qty <= 0.0 {
                     continue;
+                }
+                if broker
+                    .as_ref()
+                    .is_some_and(|s| s.id() == crate::broker::BrokerId::Busha)
+                {
+                    let px = prices
+                        .get(&exit.symbol.to_uppercase())
+                        .copied()
+                        .unwrap_or(0.0);
+                    if crate::busha::is_untradeable_dust_db(conn, &exit.symbol, qty, px) {
+                        tracing::info!(
+                            target: "risk_monitor",
+                            symbol = %exit.symbol,
+                            qty,
+                            "skip exit — untradeable crypto dust"
+                        );
+                        continue;
+                    }
                 }
 
                 let pending = intents::pending_sell_qty_on(
@@ -541,7 +618,7 @@ pub(crate) fn recent_unexecuted_rule_sell_id(
            AND executed = 0
            AND generated_at >= datetime('now', '-24 hours')
            AND COALESCE(risk_policy_result, '') NOT IN (
-             'BLOCKED_NOTIONAL', 'BLOCKED_NO_POSITION', 'BLOCKED_SYMBOL'
+             'BLOCKED_NOTIONAL', 'BLOCKED_NO_POSITION', 'BLOCKED_SYMBOL', 'BLOCKED_UNTRADEABLE_DUST'
            )
          ORDER BY generated_at DESC
          LIMIT 1",
