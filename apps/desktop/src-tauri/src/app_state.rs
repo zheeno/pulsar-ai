@@ -14,11 +14,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Database, worker_path: PathBuf) -> Arc<Self> {
+    pub fn new(db: Database, worker_path: PathBuf, node_bin: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             db,
             cache: PriceCache::new(2400),
-            agent: AgentBridge::new(worker_path),
+            agent: AgentBridge::new(worker_path, node_bin),
             cycle_running: AtomicBool::new(false),
         })
     }

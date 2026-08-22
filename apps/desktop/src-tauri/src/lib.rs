@@ -185,6 +185,7 @@ pub fn run() {
             let resource_dir = app.path().resource_dir().ok();
             let mut env_extras = Vec::new();
             let mut worker_extras = Vec::new();
+            let mut node_extras = Vec::new();
             for rel in ["app.env", "resources/app.env"] {
                 if let Ok(p) = app.path().resolve(rel, BaseDirectory::Resource) {
                     env_extras.push(p);
@@ -193,6 +194,11 @@ pub fn run() {
             for rel in ["agent-worker.cjs", "resources/agent-worker.cjs"] {
                 if let Ok(p) = app.path().resolve(rel, BaseDirectory::Resource) {
                     worker_extras.push(p);
+                }
+            }
+            for rel in ["node/bin/node", "node/node.exe", "resources/node/bin/node", "resources/node/node.exe"] {
+                if let Ok(p) = app.path().resolve(rel, BaseDirectory::Resource) {
+                    node_extras.push(p);
                 }
             }
             if let Some(ref dir) = resource_dir {
@@ -208,7 +214,14 @@ pub fn run() {
 
             let worker_path =
                 crate::agent::resolve_worker_path(resource_dir.as_deref(), &worker_extras, Some(&app_data));
-            tracing::info!(worker = %worker_path.display(), exists = worker_path.is_file(), "agent worker path");
+            let node_bin = crate::agent::resolve_node_bin(resource_dir.as_deref(), &node_extras);
+            tracing::info!(
+                worker = %worker_path.display(),
+                exists = worker_path.is_file(),
+                node = %node_bin.display(),
+                node_exists = node_bin.is_file(),
+                "agent runtime paths"
+            );
             let db = Database::open(&app_data).expect("open database");
             let settings = db.with_conn(get_settings).unwrap_or_default();
             crate::secrets::log_broker_restore_probe(
@@ -218,7 +231,7 @@ pub fn run() {
             db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
                 .expect("seed database");
 
-            let state = AppState::new(db, worker_path);
+            let state = AppState::new(db, worker_path, node_bin);
             app.manage(state.clone());
             app.manage(crate::auth_bridge::AuthBridge::new());
             crate::auth_bridge::start_expiry_watcher(app.handle().clone());
