@@ -31,6 +31,7 @@ pub fn is_tool_message(msg: &Value) -> bool {
 pub struct AgentBridge {
     child: Arc<Mutex<Option<AgentProcess>>>,
     worker_path: PathBuf,
+    node_bin: PathBuf,
 }
 
 struct AgentProcess {
@@ -40,10 +41,11 @@ struct AgentProcess {
 }
 
 impl AgentBridge {
-    pub fn new(worker_path: PathBuf) -> Self {
+    pub fn new(worker_path: PathBuf, node_bin: PathBuf) -> Self {
         Self {
             child: Arc::new(Mutex::new(None)),
             worker_path,
+            node_bin,
         }
     }
 
@@ -155,12 +157,13 @@ impl AgentBridge {
         let line = serde_json::to_string(&payload)?;
         let child = self.child.clone();
         let worker_path = self.worker_path.clone();
+        let node_bin = self.node_bin.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = (|| {
                 let mut guard = child.lock().unwrap();
                 if guard.is_none() {
-                    *guard = Some(spawn_worker(&worker_path)?);
+                    *guard = Some(spawn_worker(&worker_path, &node_bin)?);
                 }
                 let process = guard.as_mut().unwrap();
                 // Always LF: writeln! emits CRLF on Windows, which can leave `\r` on
@@ -271,13 +274,7 @@ fn dispatch_agent_tool(
     }
 }
 
-fn resolve_node_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("NGX_NODE_BIN") {
-        let p = PathBuf::from(&path);
-        if p.is_file() {
-            return p;
-        }
-    }
+fn resolve_system_node_bin() -> PathBuf {
     #[cfg(windows)]
     {
         return resolve_node_bin_windows();
@@ -296,6 +293,51 @@ fn resolve_node_bin() -> PathBuf {
         }
         PathBuf::from("node")
     }
+}
+
+/// Prefer bundled Node from app resources, then NGX_NODE_BIN, then system PATH.
+pub fn resolve_node_bin(resource_dir: Option<&Path>, extras: &[PathBuf]) -> PathBuf {
+    if let Ok(path) = std::env::var("NGX_NODE_BIN") {
+        let p = PathBuf::from(&path);
+        if p.is_file() {
+            tracing::info!(node = %p.display(), "using NGX_NODE_BIN");
+            return p;
+        }
+    }
+
+    for candidate in bundled_node_candidates(resource_dir, extras) {
+        if candidate.is_file() {
+            tracing::info!(node = %candidate.display(), "using bundled Node runtime");
+            return candidate;
+        }
+    }
+
+    let system = resolve_system_node_bin();
+    tracing::info!(node = %system.display(), "using system Node runtime");
+    system
+}
+
+pub fn bundled_node_candidates(resource_dir: Option<&Path>, extras: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = extras.to_vec();
+    let push = |out: &mut Vec<PathBuf>, p: PathBuf| {
+        if !out.iter().any(|e| e == &p) {
+            out.push(p);
+        }
+    };
+    for name in ["node/bin/node", "node/node.exe"] {
+        for c in bundled_resource_candidates(resource_dir, name) {
+            push(&mut out, c);
+        }
+        for c in exe_resource_candidates(name) {
+            push(&mut out, c);
+        }
+    }
+    if cfg!(debug_assertions) {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        push(&mut out, manifest.join("resources/node/bin/node"));
+        push(&mut out, manifest.join("resources/node/node.exe"));
+    }
+    out
 }
 
 #[cfg(windows)]
@@ -350,9 +392,13 @@ fn path_for_node(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
+fn spawn_worker(path: &Path, node_bin: &Path) -> Result<AgentProcess> {
     verify_bundled_worker(path)?;
-    let node = resolve_node_bin();
+    let node = if node_bin.is_file() {
+        node_bin.to_path_buf()
+    } else {
+        resolve_system_node_bin()
+    };
     let node_arg = path_for_node(path);
     let mut child = Command::new(&node)
         .arg(&node_arg)
@@ -362,7 +408,7 @@ fn spawn_worker(path: &PathBuf) -> Result<AgentProcess> {
         .spawn()
         .with_context(|| {
             format!(
-                "spawn agent worker with {} — install Node.js 20+ or set NGX_NODE_BIN",
+                "spawn agent worker with {} — bundled Node missing; install Node.js 20+ or set NGX_NODE_BIN",
                 node.display()
             )
         })?;
@@ -514,6 +560,15 @@ mod tests {
         assert!(rendered.iter().any(|p| p.ends_with("/resources/agent-worker.cjs")));
         assert!(rendered.iter().any(|p| p.contains("/_up_/resources/agent-worker.cjs")));
         assert!(rendered.iter().any(|p| p.ends_with("/agent-worker.cjs") && !p.contains("/_up_/")));
+    }
+
+    #[test]
+    fn bundled_node_candidates_include_mac_and_win_layouts() {
+        let dir = Path::new("/Applications/Pulsar AI.app/Contents/Resources");
+        let c = bundled_node_candidates(Some(dir), &[]);
+        let rendered: Vec<String> = c.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
+        assert!(rendered.iter().any(|p| p.ends_with("/node/bin/node")));
+        assert!(rendered.iter().any(|p| p.ends_with("/node/node.exe")));
     }
 
     #[test]

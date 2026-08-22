@@ -15,6 +15,8 @@
     "desktop:ui": "npm run dev -w @ngx/desktop",
     "desktop:build": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs current",
     "desktop:build:mac": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs mac",
+    "desktop:build:mac:intel": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs mac-intel",
+    "desktop:build:mac:arm": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs mac-arm",
     "desktop:build:win": "node scripts/run-with-cargo.mjs node scripts/tauri-build.mjs win",
     "desktop:prepare": "node scripts/prepare-desktop-resources.mjs",
     "agent:build": "npm run build -w @ngx/shared && npm run build -w @ngx/agent && node scripts/prepare-desktop-resources.mjs",
