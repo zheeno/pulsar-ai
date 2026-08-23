@@ -81,6 +81,17 @@ async function loadEnvFile() {
   }
 }
 
+async function writeIfChanged(filePath, content) {
+  try {
+    const existing = await readFile(filePath, 'utf8');
+    if (existing === content) return false;
+  } catch {
+    /* missing */
+  }
+  await writeFile(filePath, content, 'utf8');
+  return true;
+}
+
 async function downloadFile(url, dest) {
   const res = await fetch(url);
   if (!res.ok || !res.body) {
@@ -211,21 +222,28 @@ async function main() {
   // Bundle shared from TypeScript source. Resolving @ngx/shared via package.json
   // "main" (dist/) silently ships a stale AgentRequestSchema — e.g. rejecting
   // strategy_coach with invalid_union_discriminator while worker.ts handles it.
-  await build({
+  const result = await build({
     entryPoints: [workerEntry],
     bundle: true,
     platform: 'node',
     format: 'cjs',
-    outfile: workerOut,
+    write: false,
     logLevel: 'info',
     absWorkingDir: root,
     alias: {
       '@ngx/shared': sharedSrc,
     },
   });
-
-  const bundled = await readFile(workerOut, 'utf8');
+  const bundled = result.outputFiles?.[0]?.text;
+  if (!bundled) {
+    throw new Error('esbuild produced no agent worker output');
+  }
   await assertWorkerOps(bundled);
+  if (await writeIfChanged(workerOut, bundled)) {
+    console.log(`[prepare-desktop-resources] wrote ${workerOut}`);
+  } else {
+    console.log(`[prepare-desktop-resources] unchanged ${workerOut}`);
+  }
 
   const fileEnv = await loadEnvFile();
   const pick = (key, fallback = '') => process.env[key] || fileEnv[key] || fallback;
@@ -238,7 +256,11 @@ async function main() {
     'APP_ENV=production',
     '',
   ];
-  await writeFile(appEnvOut, lines.join('\n'), 'utf8');
+  if (await writeIfChanged(appEnvOut, lines.join('\n'))) {
+    console.log(`[prepare-desktop-resources] wrote ${appEnvOut}`);
+  } else {
+    console.log(`[prepare-desktop-resources] unchanged ${appEnvOut}`);
+  }
 
   if (!pick('NGX_PULSE_SUPABASE_URL') || !pick('NGX_PULSE_SUPABASE_ANON_KEY')) {
     console.warn(
@@ -248,8 +270,6 @@ async function main() {
 
   await bundleNodeRuntime();
 
-  console.log(`[prepare-desktop-resources] wrote ${workerOut}`);
-  console.log(`[prepare-desktop-resources] wrote ${appEnvOut}`);
 }
 
 main().catch((err) => {

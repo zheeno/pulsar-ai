@@ -102,4 +102,4 @@ export const STRATEGY_COACH_PROMPT_VERSION = 'v4.1.1';
 
 export * from './types';
 export * from './desktop';
-export * from './coach-format';
+export { applyCoachHardBreaks, formatCoachNote, formatCoachSummary } from './coach-format';

@@ -12,8 +12,23 @@ import {
   testLlmConnection,
 } from './llm';
 
+process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+  // Parent (`tauri dev` rebuild / app exit) closed the pipe — exit quietly.
+  if (err.code === 'EPIPE') {
+    process.exit(0);
+  }
+});
+
 function respond(response: AgentResponse): void {
-  process.stdout.write(`${JSON.stringify(response)}\n`);
+  try {
+    process.stdout.write(`${JSON.stringify(response)}\n`);
+  } catch (err) {
+    const code = err && typeof err === 'object' && 'code' in err ? (err as NodeJS.ErrnoException).code : '';
+    if (code === 'EPIPE') {
+      process.exit(0);
+    }
+    throw err;
+  }
 }
 
 const pendingLines: string[] = [];

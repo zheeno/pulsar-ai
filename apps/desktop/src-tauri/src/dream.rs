@@ -13,7 +13,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::app_state::{AppState, CycleGateGuard};
+use crate::app_state::{AppState, BookBusyGuard};
 use crate::calendar::TradingCalendar;
 use crate::memory;
 use crate::outcomes::{classify_close, hold_hours_as_of, signal_model};
@@ -63,7 +63,7 @@ impl DreamReport {
     }
 }
 
-/// Pure gates. Callers still acquire `CycleGateGuard` before `consolidate`.
+/// Pure gates. Callers still acquire `BookBusyGuard` before `consolidate`.
 pub fn dream_should_run(gate: &DreamGate) -> Result<(), &'static str> {
     if !gate.enabled {
         return Err("disabled");
@@ -336,7 +336,7 @@ fn tick_dream(_app: &AppHandle, state: &Arc<AppState>) -> Result<DreamReport> {
     let last_at = state.db.with_conn(|conn| Ok(last_dream_at(conn)))?;
     let crypto_mode = crate::broker::crypto_mode();
     let market_open = TradingCalendar::default().is_market_open();
-    let cycle_busy = state.is_cycle_running();
+    let cycle_busy = state.is_book_busy() || state.is_cycle_running();
     let gate = DreamGate {
         enabled: settings.dream_enabled,
         onboarding_complete: settings.onboarding_complete,
@@ -351,7 +351,7 @@ fn tick_dream(_app: &AppHandle, state: &Arc<AppState>) -> Result<DreamReport> {
         return Ok(DreamReport::skipped(reason, 0, 0));
     }
 
-    let Some(_lock) = CycleGateGuard::acquire(state.clone()) else {
+    let Some(_lock) = BookBusyGuard::acquire(state.clone()) else {
         return Ok(DreamReport::skipped("cycle_busy", 0, 0));
     };
 

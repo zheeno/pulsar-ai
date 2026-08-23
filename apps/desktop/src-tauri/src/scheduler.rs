@@ -16,22 +16,22 @@ const SCHEDULER_POLL_SECS: u64 = 30;
 pub const FAIL_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Whether the scheduler should start a cycle now.
+///
+/// A fresh process (`last_success_at` is `None` and no fail) waits a full
+/// `interval` from `started_at`. Opening the app must not fire a trade cycle.
 pub fn cycle_due(
     last_success_at: Option<Instant>,
     last_fail_at: Option<Instant>,
+    started_at: Instant,
     interval: Duration,
     now: Instant,
     fail_backoff: Duration,
 ) -> bool {
     if let Some(fail) = last_fail_at {
-        if now.saturating_duration_since(fail) < fail_backoff {
-            return false;
-        }
+        return now.saturating_duration_since(fail) >= fail_backoff;
     }
-    match last_success_at {
-        None => true,
-        Some(last) => now.saturating_duration_since(last) >= interval,
-    }
+    let anchor = last_success_at.unwrap_or(started_at);
+    now.saturating_duration_since(anchor) >= interval
 }
 
 /// Hard failures must not consume the success interval timer.
@@ -57,8 +57,11 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
     let app_cycle = app.clone();
     let state_cycle = state.clone();
     tauri::async_runtime::spawn(async move {
+        let started_at = Instant::now();
         let mut ticker = tokio::time::interval(Duration::from_secs(SCHEDULER_POLL_SECS));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // tokio::interval fires immediately; skip it so launch does not race the UI.
+        ticker.tick().await;
         let mut last_success_at: Option<Instant> = None;
         let mut last_fail_at: Option<Instant> = None;
 
@@ -82,6 +85,7 @@ pub fn start_scheduler(app: AppHandle, state: Arc<AppState>) {
             if !cycle_due(
                 last_success_at,
                 last_fail_at,
+                started_at,
                 interval,
                 Instant::now(),
                 FAIL_BACKOFF,
@@ -256,10 +260,11 @@ mod tests {
         let t0 = Instant::now();
         let fail = Some(t0);
         let interval = Duration::from_secs(1800);
-        assert!(!cycle_due(None, fail, interval, t0, FAIL_BACKOFF));
+        assert!(!cycle_due(None, fail, t0, interval, t0, FAIL_BACKOFF));
         assert!(cycle_due(
             None,
             fail,
+            t0,
             interval,
             t0 + FAIL_BACKOFF,
             FAIL_BACKOFF
@@ -268,6 +273,7 @@ mod tests {
         assert!(!cycle_due(
             success,
             None,
+            t0,
             interval,
             t0 + Duration::from_secs(60),
             FAIL_BACKOFF
@@ -275,6 +281,30 @@ mod tests {
         assert!(cycle_due(
             success,
             None,
+            t0,
+            interval,
+            t0 + interval,
+            FAIL_BACKOFF
+        ));
+    }
+
+    #[test]
+    fn launch_does_not_fire_before_interval() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(1800);
+        assert!(!cycle_due(None, None, t0, interval, t0, FAIL_BACKOFF));
+        assert!(!cycle_due(
+            None,
+            None,
+            t0,
+            interval,
+            t0 + Duration::from_secs(30),
+            FAIL_BACKOFF
+        ));
+        assert!(cycle_due(
+            None,
+            None,
+            t0,
             interval,
             t0 + interval,
             FAIL_BACKOFF

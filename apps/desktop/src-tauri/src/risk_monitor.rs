@@ -9,7 +9,7 @@ use rusqlite::OptionalExtension;
 use tauri::{AppHandle, Emitter};
 use tokio::time::MissedTickBehavior;
 
-use crate::app_state::{AppState, CycleGateGuard};
+use crate::app_state::{AppState, BookBusyGuard};
 use crate::calendar::TradingCalendar;
 use crate::cache::CachedPrice;
 use crate::intents;
@@ -92,8 +92,8 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
         return Ok(None);
     }
 
-    let Some(_gate) = CycleGateGuard::acquire(state.clone()) else {
-        tracing::debug!(target: "risk_monitor", "skipped — cycle gate held");
+    let Some(_gate) = BookBusyGuard::acquire(state.clone()) else {
+        tracing::debug!(target: "risk_monitor", "skipped — book busy");
         return Ok(None);
     };
 

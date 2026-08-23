@@ -123,6 +123,26 @@ export function CycleProvider({ children }: { children: ReactNode }) {
     };
   }, [onComplete]);
 
+  // Recover if we saw a stale `running` snapshot (risk/dream used to share the
+  // cycle flag) or missed `cycle:complete` after a tauri reload.
+  useEffect(() => {
+    if (!running) return;
+    let cancelled = false;
+    const tick = window.setInterval(() => {
+      void api<{ running: boolean }>('cycle_status')
+        .then((status) => {
+          if (!cancelled && !status.running) setRunning(false);
+        })
+        .catch(() => {
+          /* keep current */
+        });
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(tick);
+    };
+  }, [running]);
+
   const value = useMemo(() => ({ running }), [running]);
 
   return <CycleContext.Provider value={value}>{children}</CycleContext.Provider>;

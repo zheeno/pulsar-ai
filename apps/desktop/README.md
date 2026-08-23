@@ -24,6 +24,8 @@ npm run desktop:dev
 
 `npm run desktop:dev` runs `prepare:resources`, which bundles the agent worker and (on macOS/Windows) downloads Node.js 20 into `src-tauri/resources/node/` once per version. Set `PULSAR_SKIP_NODE_BUNDLE=1` to skip the Node download during local dev if you already have Node 20+ on your PATH.
 
+`prepare:resources` only rewrites `agent-worker.cjs` / `app.env` when contents change, so `tauri dev` does not rebuild in a loop. Vite ignores `src-tauri/**`. Auto-cycle waits a full interval after launch (it does not trade on open). If the agent prints `write EPIPE`, the desktop process exited while the worker was still answering — that is leftover from a reload, not a failed trade.
+
 ## Ship (macOS)
 
 Requires **Node.js 20+** and **Rust (cargo)** on the **build machine** only. End users do **not** need Node or Rust installed.
@@ -62,7 +64,8 @@ Startup now:
 1. Initializes the vault path only (`secrets::init`) — no Keychain.
 2. Opens SQLite and shows the `main` window.
 3. Preloads the Keychain vault on a blocking worker after the window can paint.
-4. Paints a native HTML splash in `index.html` before React mounts, so you still see “Starting Pulsar…” if JS is slow.
+4. Paints a native HTML splash (official Pulsar mark) in `index.html` before React mounts.
+5. Hides that overlay as soon as the JS bundle evaluates — it does not wait for `requestAnimationFrame` (WKWebView on Tahoe can stall rAF). If the bundle never loads, the splash updates after 8s instead of hanging forever.
 
 If you still get a totally empty window, the webview process itself never started (Gatekeeper quarantine, wrong arch, or a native abort). Check Console.app for `Pulsar AI` / `panic_cannot_unwind`, and open the app with **Right-click → Open** once.
 
