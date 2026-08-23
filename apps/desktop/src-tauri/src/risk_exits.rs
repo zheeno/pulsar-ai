@@ -58,6 +58,19 @@ pub struct ExitParams {
     pub partial_tp_fraction: f64,
 }
 
+/// NGX default is 0 (off). Busha must not inherit a zero clock — use 72h when unset.
+pub fn effective_time_stop_hours(venue: &str, stored: f64) -> f64 {
+    if venue.eq_ignore_ascii_case("busha") {
+        if stored <= 0.0 {
+            72.0
+        } else {
+            stored
+        }
+    } else {
+        stored.max(0.0)
+    }
+}
+
 impl ExitParams {
     pub fn sl_tp(stop_loss_pct: f64, take_profit_pct: Option<f64>) -> Self {
         Self {
@@ -144,8 +157,9 @@ pub fn assess_position_exit_full(
                 sell_fraction: frac,
             })
         }
-        (Some(_), Some(px))
+        (Some(pnl), Some(px))
             if params.time_stop_hours > 0.0
+                && pnl <= 0.0
                 && hours_held.map(|h| h >= params.time_stop_hours).unwrap_or(false) =>
         {
             let held = hours_held.unwrap_or(0.0);
@@ -153,8 +167,11 @@ pub fn assess_position_exit_full(
                 symbol: symbol.to_string(),
                 kind: ExitKind::TimeStop,
                 rationale: format!(
-                    "Time stop: held {held:.1}h ≥ {:.0}h (avg {:.2}, last {:.2}) — recycle capital",
-                    params.time_stop_hours, avg_cost, px
+                    "Time stop: losing/stale lot held {held:.1}h ≥ {:.0}h ({:+.1}%, avg {:.2}, last {:.2})",
+                    params.time_stop_hours,
+                    pnl * 100.0,
+                    avg_cost,
+                    px
                 ),
                 confidence: 1.0,
                 sell_fraction: 1.0,
@@ -381,8 +398,21 @@ mod tests {
     }
 
     #[test]
-    fn time_stop_recycles_in_band_lot() {
+    fn time_stop_skips_in_band_winner() {
         let lots = vec![aged("GTCO", 80.0, 50.0, Some(51.0), 30.0)];
+        let params = ExitParams {
+            stop_loss_pct: 0.08,
+            take_profit_pct: Some(0.15),
+            time_stop_hours: 24.0,
+            partial_tp_fraction: 1.0,
+        };
+        let exits = evaluate_position_exits_full(&lots, params, &HashMap::new(), false);
+        assert!(exits.is_empty());
+    }
+
+    #[test]
+    fn time_stop_recycles_losing_lot() {
+        let lots = vec![aged("GTCO", 80.0, 50.0, Some(49.0), 30.0)];
         let params = ExitParams {
             stop_loss_pct: 0.08,
             take_profit_pct: Some(0.15),
@@ -392,6 +422,9 @@ mod tests {
         let exits = evaluate_position_exits_full(&lots, params, &HashMap::new(), false);
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].kind, ExitKind::TimeStop);
+        assert_eq!(effective_time_stop_hours("sandbox", 0.0), 0.0);
+        assert_eq!(effective_time_stop_hours("busha", 0.0), 72.0);
+        assert_eq!(effective_time_stop_hours("busha", 48.0), 48.0);
         assert_eq!(sell_qty_for_exit(80.0, 1.0), 80.0);
         assert_eq!(sell_qty_for_exit_ex(0.75, 1.0, false), 0.75);
         assert_eq!(sell_qty_for_exit_ex(1.75, 1.0, true), 1.0);

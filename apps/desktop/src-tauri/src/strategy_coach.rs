@@ -64,7 +64,7 @@ pub struct StrategyParams {
 }
 
 fn default_time_stop_hours() -> f64 {
-    24.0
+    0.0
 }
 
 fn default_partial_tp_fraction() -> f64 {
@@ -304,7 +304,7 @@ pub fn read_active_strategy(conn: &Connection) -> Result<StrategyRow> {
                     min_confidence_to_trade: row.get(6)?,
                     max_daily_drawdown_pct: row.get(7)?,
                     cycle_budget_pct: row.get(9)?,
-                    time_stop_hours: row.get::<_, Option<f64>>(11)?.unwrap_or(24.0),
+                    time_stop_hours: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
                     partial_tp_fraction: row.get::<_, Option<f64>>(12)?.unwrap_or(1.0),
                 },
             })

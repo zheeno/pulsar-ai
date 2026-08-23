@@ -77,8 +77,8 @@ impl Default for AppSettings {
             llm_configured: false,
             onboarding_complete: false,
             default_starting_capital: 10_000_000.0,
-            simulated_slippage_bps: 10.0,
-            simulated_fee_pct: 0.0015,
+            simulated_slippage_bps: 40.0,
+            simulated_fee_pct: 0.005,
             auto_cycle_enabled: false,
             auto_cycle_interval_minutes: 30,
             selected_broker: "wealth".into(),
@@ -126,9 +126,9 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
                 settings.default_starting_capital = value.parse().unwrap_or(10_000_000.0)
             }
             "simulated_slippage_bps" => {
-                settings.simulated_slippage_bps = value.parse().unwrap_or(10.0)
+                settings.simulated_slippage_bps = value.parse().unwrap_or(40.0)
             }
-            "simulated_fee_pct" => settings.simulated_fee_pct = value.parse().unwrap_or(0.0015),
+            "simulated_fee_pct" => settings.simulated_fee_pct = value.parse().unwrap_or(0.005),
             "auto_cycle_enabled" => settings.auto_cycle_enabled = value == "true",
             "auto_cycle_interval_minutes" => {
                 settings.auto_cycle_interval_minutes =
@@ -348,6 +348,23 @@ pub fn validate_numeric_settings(settings: &AppSettings) -> Result<()> {
     Ok(())
 }
 
+/// Venue-accurate sandbox costs. NGX all-in is ~1% RT; Busha is much tighter.
+pub fn fee_pct_for_venue(settings: &AppSettings, venue: &str) -> f64 {
+    if venue.eq_ignore_ascii_case("busha") {
+        0.002
+    } else {
+        settings.simulated_fee_pct
+    }
+}
+
+pub fn slippage_bps_for_venue(settings: &AppSettings, venue: &str) -> f64 {
+    if venue.eq_ignore_ascii_case("busha") {
+        15.0
+    } else {
+        settings.simulated_slippage_bps
+    }
+}
+
 impl AppSettings {
     /// Shared execute gate for manual cycles, scheduled cycles, and risk-monitor exits.
     ///
@@ -519,6 +536,9 @@ mod tests {
         assert!(!s.flatten_on_drawdown_armed);
         assert!(!s.halt_new_buys);
         assert!(!s.launch_at_login);
+        assert!((s.simulated_fee_pct - 0.005).abs() < 1e-9);
+        assert!((fee_pct_for_venue(&s, "bamboo") - 0.005).abs() < 1e-9);
+        assert!((fee_pct_for_venue(&s, "busha") - 0.002).abs() < 1e-9);
     }
 
     #[test]

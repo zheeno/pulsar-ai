@@ -13,7 +13,8 @@ use crate::wealth::TradingMode;
 pub const MAX_QUOTE_DEVIATION: f64 = 0.05;
 pub const MAX_LIQUIDATION_PCT: f64 = 0.25;
 pub const MAX_SIGNAL_TOTAL: usize = 40;
-pub const MAX_SIGNAL_BUYS: usize = 15;
+/// Hard cap on new BUY ideas accepted in one cycle (selectivity, not a quota).
+pub const MAX_SIGNAL_BUYS: usize = 3;
 pub const MAX_SIGNAL_SELLS: usize = 15;
 /// Bamboo NGX market orders reject notionals below this floor.
 pub const BAMBOO_MIN_ORDER_NOTIONAL: f64 = 5_000.0;
@@ -53,14 +54,59 @@ pub fn max_buys_for_min_notional(budget: f64, min_notional: f64, cap: usize) -> 
     ((budget / min_notional).floor() as usize).min(cap)
 }
 
-/// Per-cycle BUY budget from current spendable cash.
-/// Fills already reduce the wallet, so today's buy notional is not subtracted again.
+/// Per-session BUY budget: `cycle_budget_pct` of start-of-day cash, minus today's spends.
+/// `cash` is the current wallet (already net of fills). `spent_today` reconstructs the open.
 pub fn remaining_buy_budget(
     cash: f64,
     cycle_budget_pct: f64,
     min_notional: f64,
 ) -> f64 {
-    live_buy_budget(cash, cycle_budget_pct, min_notional)
+    remaining_session_buy_budget(cash, cycle_budget_pct, min_notional, 0.0)
+}
+
+/// Session remaining = (cash + spent_today) × cycle% − spent_today. One daily pot, not a refill each cycle.
+pub fn remaining_session_buy_budget(
+    cash: f64,
+    cycle_budget_pct: f64,
+    min_notional: f64,
+    spent_today: f64,
+) -> f64 {
+    let start = (cash + spent_today.max(0.0)).max(0.0);
+    let daily = live_buy_budget(start, cycle_budget_pct, min_notional);
+    (daily - spent_today.max(0.0)).max(0.0)
+}
+
+/// Today's filled/submitted BUY count at `venue` (calendar day).
+pub fn todays_buy_count(conn: &Connection, venue: &str) -> Result<i64> {
+    if venue.eq_ignore_ascii_case("sandbox") {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sandbox_trades
+             WHERE UPPER(side) = 'BUY' AND date(executed_at) = date('now')",
+            [],
+            |row| row.get(0),
+        )?;
+        return Ok(n);
+    }
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM order_intents
+         WHERE UPPER(side) = 'BUY' AND venue = ?1
+           AND date(created_at) = date('now')
+           AND LOWER(state) IN ('submitted', 'filled', 'unknown')",
+        [venue],
+        |row| row.get(0),
+    )?;
+    Ok(n)
+}
+
+/// Sandbox BUY notional executed today (fills already in the wallet).
+pub fn todays_sandbox_buy_notional(conn: &Connection) -> Result<f64> {
+    let v: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(quantity * fill_price), 0) FROM sandbox_trades
+         WHERE UPPER(side) = 'BUY' AND date(executed_at) = date('now')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(v)
 }
 
 /// Why a new BUY cannot be funded this cycle. `None` means cash/budget may still
@@ -102,7 +148,7 @@ pub fn todays_buy_notional(conn: &Connection, venue: &str) -> Result<f64> {
 pub struct ParamSet {
     pub id: String,
     pub max_position_pct: f64,
-    /// Legacy column; daily BUY caps are no longer enforced.
+    /// Max new BUY fills per calendar day.
     pub max_daily_trades: i64,
     pub stop_loss_pct: f64,
     pub min_confidence_to_trade: f64,
@@ -360,9 +406,13 @@ pub struct FillSimulator {
 
 impl FillSimulator {
     pub fn from_settings(settings: &AppSettings) -> Self {
+        Self::for_venue(settings, "sandbox")
+    }
+
+    pub fn for_venue(settings: &AppSettings, venue: &str) -> Self {
         Self {
-            slippage_bps: settings.simulated_slippage_bps,
-            fee_pct: settings.simulated_fee_pct,
+            slippage_bps: crate::settings::slippage_bps_for_venue(settings, venue),
+            fee_pct: crate::settings::fee_pct_for_venue(settings, venue),
         }
     }
 
@@ -508,10 +558,12 @@ impl ExecutionService {
                             return Ok((std::collections::HashMap::new(), None));
                         };
                         let param_set = Self::load_param_set(conn, &strategy_id)?;
-                        let remaining = remaining_buy_budget(
+                        let spent = todays_buy_notional(conn, client.id().as_str()).unwrap_or(0.0);
+                        let remaining = remaining_session_buy_budget(
                             spendable,
                             param_set.cycle_budget_pct,
                             min_n,
+                            spent,
                         );
                         if let Some(reason) = buy_ineligible_reason(spendable, remaining, min_n) {
                             return Ok((std::collections::HashMap::new(), Some(reason)));
@@ -649,7 +701,8 @@ impl ExecutionService {
             action: action.clone(),
             confidence,
         };
-        let fee_pct = settings.simulated_fee_pct.max(0.0);
+        let venue_name = broker.map(|s| s.id().as_str()).unwrap_or("sandbox");
+        let fee_pct = crate::settings::fee_pct_for_venue(settings, venue_name);
         if settings.halt_new_buys && action == "BUY" {
             db.with_conn(|conn| {
                 conn.execute(
@@ -659,6 +712,21 @@ impl ExecutionService {
                 Ok(())
             })?;
             return Ok(false);
+        }
+        if action == "BUY" {
+            let used = db
+                .with_conn(|conn| todays_buy_count(conn, venue_name))
+                .unwrap_or(0);
+            if used >= param_set.max_daily_trades {
+                db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE signals SET risk_policy_result = 'BLOCKED_DAILY_TRADES' WHERE id = ?1 AND executed = 0",
+                        [signal_id],
+                    )?;
+                    Ok(())
+                })?;
+                return Ok(false);
+            }
         }
 
         // BUY already failed Pass A qualify — risk_policy_result was written in the planner.
@@ -1367,10 +1435,12 @@ impl ExecutionService {
                 |row| row.get(0),
             )
             .unwrap_or(0.0);
-        let remaining = remaining_buy_budget(
+        let spent = todays_sandbox_buy_notional(conn).unwrap_or(0.0);
+        let remaining = remaining_session_buy_budget(
             portfolio.1,
             param_set.cycle_budget_pct,
             0.0,
+            spent,
         );
         Self::plan_buy_targets(
             conn,
@@ -1911,7 +1981,6 @@ mod tests {
 
     #[test]
     fn leftover_cash_after_fills_can_still_fund_min_lot() {
-        // Wallet is already net of today's fills; do not treat prior BUY notional as a second cap.
         let cash = 11_043.0;
         let min_n = super::BAMBOO_MIN_ORDER_NOTIONAL;
         let remaining_full = super::remaining_buy_budget(cash, 1.0, min_n);
@@ -1921,6 +1990,17 @@ mod tests {
         let remaining_half = super::remaining_buy_budget(cash, 0.5, min_n);
         assert!(super::buy_ineligible_reason(cash, remaining_half, min_n).is_none());
         assert_eq!(super::max_buys_for_min_notional(remaining_half, min_n, 15), 1);
+    }
+
+    #[test]
+    fn session_budget_does_not_refill_after_daily_spend() {
+        let start = 100_000.0;
+        let spent = 20_000.0;
+        let cash = start - spent;
+        let remaining = super::remaining_session_buy_budget(cash, 0.20, 0.0, spent);
+        assert!(remaining.abs() < 1e-9);
+        let unused = super::remaining_session_buy_budget(start, 0.20, 0.0, 0.0);
+        assert!((unused - 20_000.0).abs() < 1e-9);
     }
 
     #[test]

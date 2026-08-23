@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { buildCoachMessages, gateToolCall, parseCoachOutput } from './coach-brain';
 import { createChatModel } from './model-factory';
 import { buildSignalPrompt } from './prompt/v1.0.0';
-import { buildPortfolioSignalPrompt } from './prompt/v2.4.0';
+import { buildPortfolioSignalPrompt } from './prompt/v2.5.0';
 
 const MAX_TOOL_ROUNDS = 3;
 /** Prompt allows 1 search + 2 upserts; hard-cap total invocations across rounds. */

@@ -54,7 +54,7 @@ export const StrategyParamSetSchema = z.object({
   id: z.string().uuid().optional(),
   name: z.string().min(1),
   max_position_pct: z.number().min(0).max(1),
-  max_daily_trades: z.number().int().positive().optional(), // deprecated: unused
+  max_daily_trades: z.number().int().positive().optional(), // max new BUY fills per calendar day
   stop_loss_pct: z.number().min(0).max(1),
   take_profit_pct: z.number().min(0).max(1).nullable().optional(),
   min_confidence_to_trade: z.number().min(0).max(1),
@@ -97,7 +97,7 @@ export const NGX_TRADING_HOURS = { open: 9, close: 16 };
 export const NGX_TIMEZONE = 'Africa/Lagos';
 
 export const PROMPT_VERSION = 'v1.0.0';
-export const PORTFOLIO_PROMPT_VERSION = 'v2.4.0';
+export const PORTFOLIO_PROMPT_VERSION = 'v2.5.0';
 export const STRATEGY_COACH_PROMPT_VERSION = 'v4.0.1';
 
 export * from './types';

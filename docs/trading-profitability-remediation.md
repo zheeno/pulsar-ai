@@ -123,22 +123,43 @@ Cap **new buys per cycle at 0–3**. Allow zero. Size **down** when N is small �
 
 ---
 
-## Implementation map (for a follow-up PR)
+## Implementation (this PR)
 
-| Priority | Change | Primary files |
-|---|---|---|
-| P0 | Empty array legal; kill quota / `Math.max(1,…)` / “never empty” / momentum-buy line | `packages/agent/src/prompt/v2.4.0.ts` |
-| P0 | `MIN_BUY_TARGET = 0`; delete pass-B backfill-to-min | `apps/desktop/src-tauri/src/signals.rs` |
-| P0 | Lot age = current open, not first BUY | `signals.rs` (`sandbox_lots`, `attach_live_opened_at`) |
-| P0 | NGX time-stop default 0 or losers-only; Busha unchanged / longer | `db/mod.rs` default, `risk_exits.rs`, `strategy_coach.rs` |
-| P0 | Stop `|pct|` ranking as the LLM working set; liquidity fail-closed | `signals.rs` (`shape_universe_for_llm`, `keep_unheld_for_llm`) |
-| P0 | Session/day cash or name cap | `execution.rs` (`max_daily_trades` is already on the row and unused) |
-| P0 | Persist `take_profit_pct` in seed + NULL migration; Settings must write what it shows | `seed.rs`, `Settings.tsx`, `strategy_coach.rs` |
-| P0 | Per-venue sandbox fee/slip | `settings.rs` |
-| P1 | Split NGX vs Busha prompts and param sets | `llm.ts`, `signals.rs`, `strategy_param_sets` |
-| P1 | Add rsi/sma50/sma200/mom/volx to TSV (no frozen bands) | `signals.rs`, `indicators.rs` |
-| P1 | Call `ingest_indices` on the cycle path if a regime switch is added later | `ingest.rs`, `signals.rs` `run_cycle` |
-| P2 | Wilder RSI; journal win = net PnL; do not close-loop the journal | `indicators.rs`, `outcomes.rs` |
+Shipped as prompt `v2.5.0` plus Rust/TS gates. **Not** an 80% win-rate claim.
+
+| Signed item | What landed |
+|---|---|
+| Empty array legal; no buy quota | `packages/agent/src/prompt/v2.5.0.ts`; `MIN_BUY_TARGET=0`; `maxBuySignals` is a ceiling (0–3) |
+| No pass-B backfill-to-quota | `plan_buy_accept_indices` honors sector cap only |
+| Lot age = current open | `current_lot_opened_at` walks BUY/SELL and resets on flatten |
+| NGX time-stop off / losers-only | Seed + migrate factory `24` → `0`; `pnl <= 0` required. Busha stored `0` → effective **72h** |
+| Persist take-profit | Seed `0.10`; migrate NULL → `0.10` |
+| Stop `\|pct\|` ranking | Universe shaped by volume / sector round-robin |
+| Liquidity + indicators fail-closed | NGX: volume>0 and SMA50+RSI. Busha: volume often 0 — RSI required, SMA50 optional |
+| Session cash + daily trades | `remaining_session_buy_budget` is one daily pot; `max_daily_trades` blocks extra BUYs |
+| Venue fees | NGX sandbox default 0.50% / 40 bps; Busha 0.20% / 15 bps |
+| Journal | Hit rate uses `pnl > 0` |
+| Split desk wording + TSV indicators | NGX vs Busha prompt; TSV columns `rsi/sma50/sma200/mom/volx` |
+| ASI week_change | `ingest_indices` on the cycle path |
+| Wilder RSI | `indicators.rs` smoothed RSI |
+
+---
+
+## File map
+
+| Change | Primary files |
+|---|---|
+| Empty array legal; kill quota / “never empty” / momentum-buy line | `packages/agent/src/prompt/v2.5.0.ts` |
+| `MIN_BUY_TARGET = 0`; no pass-B backfill-to-min | `apps/desktop/src-tauri/src/signals.rs` |
+| Lot age = current open, not first BUY | `signals.rs` (`current_lot_opened_at`) |
+| NGX time-stop default 0 / losers-only; Busha 72h fallback | `db/mod.rs`, `risk_exits.rs`, `strategy_coach.rs` |
+| Stop `|pct|` ranking; liquidity fail-closed | `signals.rs` (`shape_universe_for_llm`, `row_is_tradable_candidate`) |
+| Session/day cash + `max_daily_trades` | `execution.rs` |
+| Persist `take_profit_pct` | `seed.rs`, `db/mod.rs`, `Settings.tsx` |
+| Per-venue sandbox fee/slip | `settings.rs` |
+| NGX vs Busha prompt desk + TSV indicators | `llm.ts`, `signals.rs` |
+| `ingest_indices` on the cycle path | `ingest.rs`, `signals.rs` `run_cycle` |
+| Wilder RSI; journal win = net PnL | `indicators.rs`, `outcomes.rs` |
 
 ---
 
@@ -158,6 +179,6 @@ No historical LLM backtest as a substitute for that gate.
 
 ## What we will say to the user
 
-We removed (or will remove) structurally losing behavior: forced buys, one-day-mover menus, and 24-hour recycle of in-band lots. We will measure the book like a book — expectancy, profit factor, drawdown, and a honest trade count — not like a win-rate ad.
+We removed structurally losing behavior: forced buys, one-day-mover menus, and 24-hour recycle of in-band lots. Measure the book like a book — expectancy, profit factor, drawdown, and an honest trade count — not like a win-rate ad.
 
 We will not promise an 80% success rate.

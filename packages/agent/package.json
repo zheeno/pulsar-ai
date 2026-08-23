@@ -11,7 +11,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/worker.js",
-    "test": "tsc && node --test dist/coach-brain.test.js"
+    "test": "tsc && node --test dist/coach-brain.test.js dist/prompt/v2.5.0.test.js"
   },
   "dependencies": {
     "@langchain/anthropic": "^0.3.30",
