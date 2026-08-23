@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { applyCoachHardBreaks, formatCoachSummary } from '@ngx/shared';
 import {
   allowedTools,
   attachesBook,
@@ -151,7 +152,7 @@ test('classifier remains a hint, not a tool gate', () => {
   assert.match(buildCoachSystemPrompt({ conversation: { message: 'hi' } }), /Prompt version:/);
 });
 
-test('v4.1.0 prompt covers desk tools, lede, and no minConfidence knob', () => {
+test('v4.1.1 prompt covers desk tools, lede, markdown, and no minConfidence knob', () => {
   const prompt = systemPrompt('have we been burned on HOME?');
   assert.match(prompt, /get_trade_lessons/);
   assert.match(prompt, /get_dream_rules/);
@@ -161,9 +162,52 @@ test('v4.1.0 prompt covers desk tools, lede, and no minConfidence knob', () => {
   assert.match(prompt, /Do not raise minConfidence/);
   assert.match(prompt, /empty signals array is valid/i);
   assert.match(prompt, /chase_reversal/);
-  assert.match(prompt, /v4\.1\.0/);
+  assert.match(prompt, /GitHub-flavored markdown/);
+  assert.match(prompt, /Never echo this JSON/);
+  assert.match(prompt, /₦1,234\.56/);
+  assert.match(prompt, /v4\.1\.1/);
   assert.ok(allowedTools('research').includes('get_trade_lessons'));
   assert.ok(allowedTools('account').includes('get_last_cycle'));
+});
+
+test('formatCoachSummary and hard breaks keep tape scannable', () => {
+  assert.equal(
+    formatCoachSummary(
+      '{"needMoreContext":false,"summary":"**GTCO** last ₦46.20","patch":{}}',
+    ),
+    '**GTCO** last ₦46.20',
+  );
+  const stacked = applyCoachHardBreaks('**GTCO** last ₦46.20\nas-of today · **stale**');
+  assert.match(stacked, /₦46\.20  \n/);
+  const list = applyCoachHardBreaks('- **GTCO** ₦46.20\n- **MTNN** ₦225.00');
+  assert.doesNotMatch(list, /₦46\.20  \n/);
+});
+
+test('parseCoachOutput never shows a leaked JSON envelope or literal \\\\n', () => {
+  const leaked = parseCoachOutput(
+    '{"needMoreContext":false,"clarifyingQuestions":[],"summary":"**GTCO** last ₦46.20 as-of today.","patch":{},"rationale":{},"warnings":[]}',
+  );
+  assert.equal(leaked.summary, '**GTCO** last ₦46.20 as-of today.');
+  assert.doesNotMatch(leaked.summary, /needMoreContext/);
+
+  const broken = parseCoachOutput(`{
+  "needMoreContext": false,
+  "summary": "**GTCO** last ₦46.20
+as-of 2026-08-23 · **stale**",
+  "patch": {}
+}`);
+  assert.match(broken.summary, /\*\*GTCO\*\*/);
+  assert.match(broken.summary, /stale/);
+  assert.doesNotMatch(broken.summary, /needMoreContext/);
+
+  const escaped = parseCoachOutput('**GTCO** last ₦46.20\\nas-of today · **stale**');
+  assert.match(escaped.summary, /\n/);
+  assert.doesNotMatch(escaped.summary, /\\n/);
+
+  const fencedJson = parseCoachOutput(
+    '```json\n{"summary":"- **GTCO** ₦46.20\\n- **MTNN** ₦225.00","patch":{}}\n```',
+  );
+  assert.match(fencedJson.summary, /\*\*MTNN\*\*/);
 });
 
 test('parseCoachOutput accepts JSON and plain conversational replies', () => {

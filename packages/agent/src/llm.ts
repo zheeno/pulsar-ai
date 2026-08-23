@@ -218,7 +218,7 @@ async function invokeCoachMessages(
   const layout = buildCoachMessages(context);
   const prompt = layout.map((m) => `${m.role}: ${m.content}`).join('\n\n');
   const forceHint =
-    'Do not call tools. Return the JSON copilot object (summary/patch) now. Empty patch unless this turn is a strategy change. Do not invent prices.';
+    'Do not call tools. Return the JSON copilot object now. summary is GitHub-flavored markdown the user reads — no JSON, no fences, no tool dumps. Empty patch unless this turn is a strategy change. Do not invent prices.';
 
   const gated: ToolCaller | undefined = callTool
     ? async (name, args) => gateToolCall('other', name, args, callTool)

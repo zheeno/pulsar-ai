@@ -2,6 +2,8 @@ import {
   CURATED_SYMBOLS,
   LlmStrategyCoachOutputSchema,
   STRATEGY_COACH_PROMPT_VERSION,
+  formatCoachNote,
+  formatCoachSummary,
   type LlmStrategyCoachOutput,
 } from '@ngx/shared';
 
@@ -160,13 +162,26 @@ const COACH_AGENT_TOOLS = [
 
 const IRREVERSIBLE_TOOLS = new Set(['execute_trade', 'apply_strategy_patch']);
 
+function finalizeCoachOutput(parsed: LlmStrategyCoachOutput): LlmStrategyCoachOutput {
+  return LlmStrategyCoachOutputSchema.parse({
+    ...parsed,
+    summary: formatCoachSummary(parsed.summary, PERSONA_GREETING),
+    clarifyingQuestions: (parsed.clarifyingQuestions ?? [])
+      .map((q) => formatCoachNote(q))
+      .filter(Boolean),
+    warnings: (parsed.warnings ?? []).map((w) => formatCoachNote(w)).filter(Boolean),
+  });
+}
+
 export function parseCoachOutput(raw: string): LlmStrategyCoachOutput {
   const trimmed = raw.trim();
   if (!trimmed) {
-    return LlmStrategyCoachOutputSchema.parse({
-      summary: PERSONA_GREETING,
-      patch: {},
-    });
+    return finalizeCoachOutput(
+      LlmStrategyCoachOutputSchema.parse({
+        summary: PERSONA_GREETING,
+        patch: {},
+      }),
+    );
   }
 
   const candidates: string[] = [trimmed];
@@ -177,21 +192,34 @@ export function parseCoachOutput(raw: string): LlmStrategyCoachOutput {
     const jsonMatch = candidate.match(/\{[\s\S]*\}/);
     if (!jsonMatch) continue;
     try {
-      return LlmStrategyCoachOutputSchema.parse(JSON.parse(jsonMatch[0]));
+      return finalizeCoachOutput(LlmStrategyCoachOutputSchema.parse(JSON.parse(jsonMatch[0])));
     } catch {
-      // try next candidate
+      const rescued = formatCoachSummary(candidate, '');
+      if (rescued && rescued !== candidate.trim()) {
+        return finalizeCoachOutput(
+          LlmStrategyCoachOutputSchema.parse({
+            needMoreContext: false,
+            clarifyingQuestions: [],
+            summary: rescued,
+            patch: {},
+            rationale: {},
+            warnings: [],
+          }),
+        );
+      }
     }
   }
 
-  // Model replied in plain language — wrap as the chat bubble (conversation-first).
-  return LlmStrategyCoachOutputSchema.parse({
-    needMoreContext: false,
-    clarifyingQuestions: [],
-    summary: trimmed,
-    patch: {},
-    rationale: {},
-    warnings: [],
-  });
+  return finalizeCoachOutput(
+    LlmStrategyCoachOutputSchema.parse({
+      needMoreContext: false,
+      clarifyingQuestions: [],
+      summary: formatCoachSummary(trimmed, PERSONA_GREETING),
+      patch: {},
+      rationale: {},
+      warnings: [],
+    }),
+  );
 }
 
 export function classifyCoachIntent(message: string): CoachIntentClass {
@@ -328,11 +356,17 @@ Investment advice:
 
 Return format (mandatory — the app parses your reply):
 - Respond with ONE JSON object only. No markdown fences, no text before or after the JSON.
-- Put everything the user reads in "summary". That can be natural conversational prose.
+- Put everything the user reads in "summary". The app renders that field as GitHub-flavored markdown.
+- Never echo this JSON, never dump tool JSON, never wrap summary in \`\`\` fences.
+- Short turns (hi / thanks / who are you): one or two sentences. No heading.
+- Research, tape, news, lessons, account: bold one-line lede, then a tight list or table — not a wall of numbers.
+- Money: ₦1,234.56 (never raw 1234.5). Percents: +1.2% / −0.4%. Always cite as-of; if stale=true write **stale**.
+- Tickers as **GTCO** / **BTC**. Two or more names → markdown list or table (Symbol | Last | Change | As-of).
+- Headlines: Source — title, then the lede. Not a buy signal.
 {
   "needMoreContext": false,
   "clarifyingQuestions": [],
-  "summary": "<chat bubble — natural language>",
+  "summary": "<chat bubble — GitHub-flavored markdown>",
   "patch": {},
   "rationale": {},
   "warnings": []

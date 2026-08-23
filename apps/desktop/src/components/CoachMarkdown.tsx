@@ -1,3 +1,4 @@
+import { applyCoachHardBreaks, formatCoachSummary } from '@ngx/shared';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Components } from 'react-markdown';
@@ -21,13 +22,13 @@ type CoachMarkdownProps = {
 };
 
 export function CoachMarkdown({ content, className }: CoachMarkdownProps) {
-  const trimmed = content.trim();
-  if (!trimmed) return null;
+  const cleaned = formatCoachSummary(content);
+  if (!cleaned) return null;
 
   return (
     <div className={className ? `coach-md ${className}` : 'coach-md'}>
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-        {trimmed}
+        {applyCoachHardBreaks(cleaned)}
       </ReactMarkdown>
     </div>
   );

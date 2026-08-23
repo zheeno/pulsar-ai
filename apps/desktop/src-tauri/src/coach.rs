@@ -1294,6 +1294,126 @@ pub fn redact_args(args: &Value) -> Value {
     out
 }
 
+/// User-visible Coach text. Never persist a leaked JSON envelope.
+pub fn format_coach_summary(raw: &str, fallback: &str) -> String {
+    let mut text = tidy_coach_text(raw);
+    if text.is_empty() {
+        return fallback.to_string();
+    }
+    for _ in 0..3 {
+        let unfenced = unwrap_coach_fence(&text);
+        if let Some(extracted) = extract_envelope_summary(&unfenced) {
+            text = tidy_coach_text(&extracted);
+            continue;
+        }
+        text = tidy_coach_text(&unfenced);
+        break;
+    }
+    if !text.contains('\n') && text.contains("\\n") {
+        text = tidy_coach_text(&text.replace("\\n", "\n").replace("\\t", "  "));
+    }
+    if looks_like_coach_envelope(&text) {
+        text = extract_envelope_summary(&text)
+            .map(|s| tidy_coach_text(&s))
+            .unwrap_or_default();
+    }
+    if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text
+    }
+}
+
+fn tidy_coach_text(raw: &str) -> String {
+    let s = raw.replace('\u{feff}', "").replace("\r\n", "\n");
+    let mut out = String::with_capacity(s.len());
+    let mut blank = 0usize;
+    for line in s.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.is_empty() {
+            blank += 1;
+            if blank <= 1 {
+                out.push('\n');
+            }
+        } else {
+            blank = 0;
+            out.push_str(trimmed_end);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
+}
+
+fn unwrap_coach_fence(text: &str) -> String {
+    let t = text.trim();
+    if !t.starts_with("```") {
+        return t.to_string();
+    }
+    let mut lines: Vec<&str> = t.lines().collect();
+    if lines.len() < 2 || !lines[0].starts_with("```") {
+        return t.to_string();
+    }
+    if lines.last().is_some_and(|l| l.trim() == "```") {
+        lines.pop();
+    }
+    lines.remove(0);
+    lines.join("\n").trim().to_string()
+}
+
+fn looks_like_coach_envelope(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with('{')
+        && (t.contains("needMoreContext") || t.contains("clarifyingQuestions") || t.contains("\"patch\""))
+}
+
+fn extract_envelope_summary(text: &str) -> Option<String> {
+    if !text.contains("\"summary\"") && !looks_like_coach_envelope(text) {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+        if let Some(s) = v.get("summary").and_then(|x| x.as_str()).map(str::trim) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    let key = "\"summary\"";
+    let idx = text.find(key)?;
+    let after = &text[idx + key.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let bytes = rest.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'"' | b'\\' | b'/' => out.push(bytes[i + 1] as char),
+                _ => out.push(bytes[i + 1] as char),
+            }
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            break;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    let s = out.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 pub fn summarize_tool_result(name: &str, result: &Value) -> String {
     if result.get("unavailable").and_then(|v| v.as_bool()) == Some(true) {
         return "unavailable".into();
@@ -1670,6 +1790,26 @@ mod tests {
         let again = confirm_and_execute(&db, &settings, &pid).unwrap_err();
         assert!(again.to_string().contains("not awaiting confirm"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn format_coach_summary_strips_envelope_and_literal_newlines() {
+        let clean = format_coach_summary(
+            r#"{"needMoreContext":false,"summary":"**GTCO** last ₦46.20 as-of today.","patch":{}}"#,
+            "fallback",
+        );
+        assert_eq!(clean, "**GTCO** last ₦46.20 as-of today.");
+        let broken = format_coach_summary(
+            "{\n  \"summary\": \"**GTCO** last ₦46.20\nas-of today · **stale**\",\n  \"patch\": {}\n}",
+            "fallback",
+        );
+        assert!(broken.contains("**GTCO**"));
+        assert!(broken.contains("stale"));
+        assert!(!broken.contains("needMoreContext"));
+        let escaped = format_coach_summary("**GTCO** last ₦46.20\\nas-of today", "");
+        assert!(escaped.contains('\n'));
+        assert!(!escaped.contains("\\n"));
+        assert_eq!(format_coach_summary("   ", "Hey."), "Hey.");
     }
 
     #[test]

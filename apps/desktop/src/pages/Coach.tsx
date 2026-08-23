@@ -43,6 +43,7 @@ type TradeCard = {
   preview?: {
     price?: number;
     asOf?: string;
+    stale?: boolean;
     estimatedCost?: number;
     warnings?: string[];
     minOrderNotional?: number;
@@ -584,8 +585,9 @@ export default function CoachPage() {
                         ? ` · est. ${formatNaira(turn.trade.preview.estimatedCost)}`
                         : ''}
                       {turn.trade.preview?.price != null
-                        ? ` · px ${turn.trade.preview.price} as-of ${turn.trade.preview.asOf || '—'}`
+                        ? ` · ${formatNaira(turn.trade.preview.price)} as-of ${turn.trade.preview.asOf || '—'}`
                         : ''}
+                      {turn.trade.preview?.stale ? ' · stale' : ''}
                     </p>
                     {turn.trade.preview?.warnings?.length ? (
                       <ul className="coach-warnings">
