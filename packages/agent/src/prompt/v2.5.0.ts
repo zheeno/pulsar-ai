@@ -45,6 +45,8 @@ export function buildPortfolioSignalPrompt(context: Record<string, unknown>): st
     estimatedFeePct: context.estimatedFeePct ?? 0,
     symbolMemory: context.symbolMemory ?? {},
     retrievedMemories: context.retrievedMemories ?? [],
+    tradeLessons: context.tradeLessons ?? [],
+    dreamRules: context.dreamRules ?? [],
     news: context.news ?? { status: 'absent', headlines: [] },
   };
 
@@ -81,6 +83,8 @@ ${buyRules}
 - Return at most ${maxSellSignals} SELL ideas
 - Skip a BUY when RSI is cited as overbought (>70) if known
 - Do not contradict retrievedMemories or recent symbolMemory rationale without new evidence
+- tradeLessons are closed lots (net of fees). Use them as pattern evidence, not a ticker blacklist. One loss does not ban a symbol. If the same pattern has repeatCount >= 3, treat it as a standing caution for NEW buys. Do not raise minConfidence from this list. LESSON rows in retrievedMemories are the same closes in prose — prefer tradeLessons numbers
+- dreamRules are overnight consolidations of those closed-lot patterns (n>=3). Standing cautions for NEW buys only. Not a ticker blacklist. Do not raise minConfidence. Do not treat a dream rule as a sell-now order
 - tradingVenue is sandbox|wealth|bamboo|busha
 - Stop loss / take profit thresholds are in strategy; do not re-fire those rule exits
 - No external company knowledge beyond this prompt

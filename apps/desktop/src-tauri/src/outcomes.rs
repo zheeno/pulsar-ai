@@ -68,9 +68,22 @@ pub fn record_executed_fill(
                 confidence,
                 venue,
             )?;
-            let horizon_pct = horizon * 100.0;
-            let text = format!(
-                "Closed {quantity:.0} {symbol} @ {fill_price:.2} vs cost {cost:.2} ({horizon_pct:+.1}%) pnl ₦{pnl:.2} venue={venue}"
+            let hold_hours = hours_since_last_buy(conn, symbol);
+            let exit_model = signal_model(conn, signal_id).unwrap_or_default();
+            let entry = last_executed_buy(conn, symbol);
+            let pattern = classify_close(horizon, hold_hours, &exit_model);
+            let text = close_lesson_text(
+                symbol,
+                venue,
+                quantity,
+                fill_price,
+                cost,
+                horizon,
+                pnl,
+                hold_hours,
+                pattern,
+                &exit_model,
+                entry.as_deref(),
             );
             let _ = memory::insert_memory(
                 conn,
@@ -81,18 +94,243 @@ pub fn record_executed_fill(
                 None,
             );
         }
-    } else {
-        let text = format!("Filled BUY {quantity:.0} {symbol} @ {fill_price:.2} venue={venue}");
-        let _ = memory::insert_memory(
-            conn,
-            "symbol_lesson",
-            Some(symbol),
-            &text,
-            "trade_outcome",
-            None,
-        );
     }
     Ok(())
+}
+
+/// Pattern on a closed lot. One loss is not a blacklist — the label is for retrieval.
+pub fn classify_close(horizon: f64, hold_hours: Option<f64>, exit_model: &str) -> &'static str {
+    let model = exit_model.to_ascii_lowercase();
+    if model.contains("stop-loss") {
+        return "stop_loss";
+    }
+    if model.contains("time-stop") {
+        return "time_stop";
+    }
+    if model.contains("take-profit") {
+        return "take_profit";
+    }
+    let quick = hold_hours.map(|h| h < 2.0).unwrap_or(false);
+    if horizon > 0.0 {
+        return "winner";
+    }
+    if quick && horizon <= -0.04 {
+        return "chase_reversal";
+    }
+    if horizon < 0.0 {
+        "loser"
+    } else {
+        "flat"
+    }
+}
+
+pub(crate) fn close_caution(pattern: &str) -> &'static str {
+    match pattern {
+        "chase_reversal" => {
+            "Do not buy a name already green on the day / mid-RSI just above SMA, then dump on the first dip. One-day % is not an edge."
+        }
+        "stop_loss" => {
+            "Hard stop fired. Do not re-enter the same setup on this name until the thesis is new."
+        }
+        "time_stop" => "Time-stop recycled a stale/losing lot. Do not immediately redeploy into a similar name.",
+        "take_profit" => "Winner was realized at the stored target. Repeat the setup, not the ticker.",
+        "winner" => "Closed green. Prefer letting winners work over scalp-flips.",
+        _ => "Recorded close. One result is not a standing rule and is not a symbol ban.",
+    }
+}
+
+pub fn close_lesson_text(
+    symbol: &str,
+    venue: &str,
+    quantity: f64,
+    fill_price: f64,
+    cost: f64,
+    horizon: f64,
+    pnl: f64,
+    hold_hours: Option<f64>,
+    pattern: &str,
+    exit_model: &str,
+    entry_rationale: Option<&str>,
+) -> String {
+    let result = if horizon > 0.0 { "win" } else { "loss" };
+    let hold = hold_hours
+        .map(|h| format!("{h:.1}h"))
+        .unwrap_or_else(|| "unknown".into());
+    let entry = entry_rationale
+        .map(|s| truncate_lesson(s, 180))
+        .unwrap_or_default();
+    format!(
+        "LESSON close {sym} venue={venue} result={result} pattern={pattern} pnl={:+.1}% ₦{pnl:.2} hold={hold} exit={exit} qty={quantity:.4} px={fill_price:.4} cost={cost:.4}. {caution} entry: {entry}",
+        horizon * 100.0,
+        sym = symbol.to_uppercase(),
+        exit = if exit_model.is_empty() { "unknown" } else { exit_model },
+        caution = close_caution(pattern),
+        entry = if entry.is_empty() { "n/a" } else { entry.as_str() },
+    )
+}
+
+/// Last closed lots for the cycle prompt. Numbers, not a confidence-floor knob.
+pub fn desk_lessons(
+    conn: &Connection,
+    venue: Option<&str>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let limit = limit.clamp(1, 30) as i64;
+    let sql = if venue.is_some() {
+        "SELECT symbol, horizon_return_pct, pnl, confidence, venue, created_at, signal_id
+         FROM signal_outcomes WHERE event = 'close' AND venue = ?1
+         ORDER BY created_at DESC LIMIT ?2"
+    } else {
+        "SELECT symbol, horizon_return_pct, pnl, confidence, venue, created_at, signal_id
+         FROM signal_outcomes WHERE event = 'close'
+         ORDER BY created_at DESC LIMIT ?1"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = if let Some(v) = venue {
+        stmt.query(rusqlite::params![v, limit])?
+    } else {
+        stmt.query(rusqlite::params![limit])?
+    };
+    let mut raw = Vec::new();
+    while let Some(row) = rows.next()? {
+        let symbol: String = row.get(0)?;
+        let horizon: Option<f64> = row.get(1)?;
+        let pnl: Option<f64> = row.get(2)?;
+        let confidence: Option<f64> = row.get(3)?;
+        let v: Option<String> = row.get(4)?;
+        let created: Option<String> = row.get(5)?;
+        let sid: String = row.get(6)?;
+        let exit_model = signal_model(conn, &sid).unwrap_or_default();
+        let hold = created
+            .as_deref()
+            .and_then(|ts| hold_hours_as_of(conn, &symbol, ts))
+            .or_else(|| hours_since_last_buy(conn, &symbol));
+        let h = horizon.unwrap_or(0.0);
+        let pattern = classify_close(h, hold, &exit_model);
+        raw.push(serde_json::json!({
+            "symbol": symbol,
+            "pattern": pattern,
+            "result": if h > 0.0 { "win" } else { "loss" },
+            "horizonPct": h * 100.0,
+            "pnl": pnl,
+            "holdHours": hold,
+            "confidence": confidence,
+            "venue": v,
+            "exitModel": exit_model,
+            "caution": close_caution(pattern),
+            "closedAt": created,
+        }));
+    }
+    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for item in &raw {
+        if let Some(p) = item.get("pattern").and_then(|v| v.as_str()) {
+            *counts.entry(p.to_string()).or_insert(0) += 1;
+        }
+    }
+    for item in &mut raw {
+        if let Some(obj) = item.as_object_mut() {
+            let p = obj.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            obj.insert("repeatCount".into(), serde_json::json!(counts.get(p).copied().unwrap_or(0)));
+        }
+    }
+    Ok(raw)
+}
+
+pub fn memory_search_query(held: &str, recently_sold: &[String]) -> String {
+    let sold = recently_sold.join(" ");
+    format!(
+        "LESSON close DREAM rule result=loss pattern=chase_reversal stop_loss winner short hold green tape RSI SMA holdings {held} sold {sold}"
+    )
+}
+
+fn parse_ts(raw: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f"))
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw).map(|d| d.naive_utc()))
+        .ok()
+}
+
+fn collect_buy_stamps(conn: &Connection, symbol: &str) -> Vec<String> {
+    let mut stamps = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT executed_at FROM sandbox_trades
+         WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY'",
+    ) {
+        if let Ok(rows) = stmt.query_map([symbol], |row| row.get::<_, String>(0)) {
+            stamps.extend(rows.filter_map(|r| r.ok()));
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT created_at FROM broker_orders
+         WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY'
+           AND LOWER(status) IN ('executed', 'filled')",
+    ) {
+        if let Ok(rows) = stmt.query_map([symbol], |row| row.get::<_, String>(0)) {
+            stamps.extend(rows.filter_map(|r| r.ok()));
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT created_at FROM signal_outcomes
+         WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY' AND event = 'fill'",
+    ) {
+        if let Ok(rows) = stmt.query_map([symbol], |row| row.get::<_, String>(0)) {
+            stamps.extend(rows.filter_map(|r| r.ok()));
+        }
+    }
+    stamps
+}
+
+fn hours_since_last_buy(conn: &Connection, symbol: &str) -> Option<f64> {
+    hold_hours_as_of(conn, symbol, &chrono::Utc::now().to_rfc3339())
+}
+
+/// Hold time of the lot that was open at `as_of` (last BUY at or before that stamp).
+pub(crate) fn hold_hours_as_of(conn: &Connection, symbol: &str, as_of: &str) -> Option<f64> {
+    let as_of_dt = parse_ts(as_of)?;
+    let latest = collect_buy_stamps(conn, symbol)
+        .into_iter()
+        .filter_map(|s| parse_ts(&s))
+        .filter(|t| *t <= as_of_dt)
+        .max()?;
+    let secs = (as_of_dt - latest).num_seconds() as f64;
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs / 3600.0)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn signal_model(conn: &Connection, signal_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT COALESCE(model_name, '') FROM signals WHERE id = ?1",
+        [signal_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+fn last_executed_buy(conn: &Connection, symbol: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT rationale FROM signals
+         WHERE UPPER(symbol) = UPPER(?1) AND action = 'BUY' AND executed = 1
+         ORDER BY generated_at DESC LIMIT 1",
+        [symbol],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+fn truncate_lesson(s: &str, max: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| *c == ' ' || !c.is_control())
+        .collect();
+    let mut chars = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if chars.chars().count() > max {
+        chars = chars.chars().take(max.saturating_sub(1)).collect();
+        chars.push('…');
+    }
+    chars
 }
 
 fn insert_outcome(
@@ -259,5 +497,92 @@ mod tests {
         assert_eq!(j.len(), 1);
         assert_eq!(j[0]["bucket"], "0.70–0.85");
         assert_eq!(j[0]["n"], 1);
+    }
+
+    #[test]
+    fn buy_fill_does_not_write_a_lesson() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed)
+             VALUES ('b1', 'HOME', 'BUY', 0.58, 'above sma', '{}', 'llm', 'v2.5.0', 'APPROVED', 1)",
+            [],
+        )
+        .unwrap();
+        record_executed_fill(&conn, "b1", "HOME", "BUY", 1.0, 9.52, 0.0, "busha", None).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_memories WHERE source = 'trade_outcome'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn home_style_quick_loss_is_chase_reversal() {
+        assert_eq!(
+            classify_close(-0.126, Some(0.43), "openai:gpt-5.6-luna"),
+            "chase_reversal"
+        );
+        let text = close_lesson_text(
+            "HOME",
+            "busha",
+            1.0,
+            8.32,
+            9.52,
+            -0.126,
+            -1.2,
+            Some(0.43),
+            "chase_reversal",
+            "openai:gpt-5.6-luna",
+            Some("Price above SMA50, RSI 62.9, daily +3.61%"),
+        );
+        assert!(text.contains("pattern=chase_reversal"));
+        assert!(text.contains("result=loss"));
+        assert!(text.contains("One-day % is not an edge"));
+        assert!(text.contains("RSI 62.9"));
+    }
+
+    #[test]
+    fn historical_hold_uses_close_time_not_now() {
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE sandbox_trades (
+                id TEXT PRIMARY KEY, symbol TEXT, side TEXT, executed_at TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sandbox_trades (id, symbol, side, executed_at)
+             VALUES ('b1', 'HOME', 'BUY', '2026-08-01T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let hold = hold_hours_as_of(&conn, "HOME", "2026-08-01T10:26:00Z").unwrap();
+        assert!((hold - 0.4333).abs() < 0.05);
+        assert_eq!(
+            classify_close(-0.126, Some(hold), "openai:gpt-5.6-luna"),
+            "chase_reversal"
+        );
+    }
+
+    #[test]
+    fn one_loss_is_not_classified_as_a_ban() {
+        assert_eq!(classify_close(-0.02, Some(20.0), "llm"), "loser");
+        let text = close_lesson_text(
+            "ATOM",
+            "busha",
+            1.0,
+            10.0,
+            10.2,
+            -0.02,
+            -0.2,
+            Some(20.0),
+            "loser",
+            "llm",
+            None,
+        );
+        assert!(text.contains("not a symbol ban"));
     }
 }

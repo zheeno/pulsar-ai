@@ -89,6 +89,8 @@ export interface AppSettings {
   simulatedFeePct: number;
   autoCycleEnabled: boolean;
   autoCycleIntervalMinutes: number;
+  dreamEnabled?: boolean;
+  dreamIntervalHours?: number;
   selectedBroker?: string;
   wealthEmail?: string | null;
   wealthConnected?: boolean;

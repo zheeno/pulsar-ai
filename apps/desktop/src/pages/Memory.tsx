@@ -75,7 +75,13 @@ export default function MemoryPage() {
       <header className="page-header">
         <div>
           <h1>Memory</h1>
-          <p>Local agent lessons (cap 1000). Retrieved every signal cycle.</p>
+          <p>
+            On-device lessons (cap 1000). Closed lots write a pattern note automatically — one loss
+            is not a blacklist. When overnight desk review is on, repeated patterns compress into
+            standing DREAM rules (still not a ticker ban, and they never raise minConfidence).
+            Retrieved every cycle. Uses your existing LLM key for embeddings (OpenAI / OpenRouter);
+            no external vector database.
+          </p>
         </div>
         <form onSubmit={onSearch} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <input

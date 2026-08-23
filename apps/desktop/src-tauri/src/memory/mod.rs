@@ -142,10 +142,10 @@ pub fn insert_memory(
     } else {
         "freeform"
     };
-    let source = if source == "trade_outcome" {
-        "trade_outcome"
-    } else {
-        "agent_upsert"
+    let source = match source {
+        "trade_outcome" => "trade_outcome",
+        "dream_consolidate" => "dream_consolidate",
+        _ => "agent_upsert",
     };
     let text = text.trim();
     if text.is_empty() {
@@ -171,7 +171,9 @@ pub fn evict_over_cap(conn: &Connection) -> Result<()> {
     if extra > 0 {
         conn.execute(
             "DELETE FROM agent_memories WHERE rowid IN (
-                SELECT rowid FROM agent_memories ORDER BY created_at ASC, rowid ASC LIMIT ?1
+                SELECT rowid FROM agent_memories
+                WHERE source NOT IN ('dream_consolidate', 'trade_outcome')
+                ORDER BY created_at ASC, rowid ASC LIMIT ?1
              )",
             [extra],
         )?;
