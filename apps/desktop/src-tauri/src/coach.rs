@@ -211,9 +211,17 @@ fn arg_raw(args: &Value, key: &str) -> Option<String> {
 fn parse_quote_ts(raw: &str) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d"))
-        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw).map(|d| d.naive_utc()))
         .ok()
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        })
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .ok()
+                .map(|d| d.naive_utc())
+        })
 }
 
 /// NGX daily bars can be yesterday and still current. Crypto marks go stale faster.
@@ -1835,6 +1843,13 @@ mod tests {
             .to_string();
         assert!(quote_freshness(&three_hours, true).0);
         assert!(!quote_freshness(&three_hours, false).0);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today_ngx = quote_freshness(&today, false);
+        assert!(!today_ngx.0, "today's NGX date-only bar must not be stale");
+        assert!(today_ngx.1.is_some());
+        let old_date = quote_freshness("2020-01-01", false);
+        assert!(old_date.0);
+        assert!(old_date.1.unwrap() > 72.0);
     }
 
     #[test]
@@ -1872,12 +1887,12 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO busha_pairs (symbol, pair_id, buy_price, sell_price, synced_at)
-                 VALUES ('BTC', 'btc-ngn', 150000000, 149000000, '2026-08-23T09:00:00Z')",
+                 VALUES ('BTC', 'btc-ngn', 150000000, 149000000, '2026-08-20T09:00:00Z')",
                 [],
             )?;
             conn.execute(
                 "INSERT INTO busha_ohlc_meta (symbol, period, snapshot_price, change_pct, fetched_at)
-                 VALUES ('BTC', '1d', 150000000, 2.5, '2026-08-23T09:00:00Z')",
+                 VALUES ('BTC', '1d', 150000000, 2.5, '2026-08-20T09:00:00Z')",
                 [],
             )?;
             Ok(())
