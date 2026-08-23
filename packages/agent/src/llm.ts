@@ -128,7 +128,7 @@ function coachTools(callTool: ToolCaller, allowed?: string[]): any[] {
     ),
     t(
       'get_news',
-      'Headlines for a symbol or the market. May be unavailable — never fabricate.',
+      'Crypto: CoinDesk/Decrypt/The Block RSS title+lede. Pass symbol=BTC or query=bitcoin. NGX news is unavailable. Never fabricate.',
       z.object({ symbol: z.string().optional(), query: z.string().optional() }),
     ),
     t(

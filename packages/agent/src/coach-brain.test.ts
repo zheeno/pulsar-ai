@@ -38,6 +38,8 @@ test('D1–D2 prompt treats greetings and identity as conversation, not tape', (
   const canned = cannedSocialReply('greeting', 'hello');
   assert.doesNotMatch(canned, /₦|cash|holdings|gtco/i);
   assert.match(PERSONA_META, /NGX/);
+  assert.match(PERSONA_META, /Busha crypto/);
+  assert.match(PERSONA_META, /CoinDesk/);
 });
 
 test('D3–D5 policy: soft ack, off-topic, critique never dump the book', () => {
@@ -64,6 +66,15 @@ test('D6–D7 research and investment caution stay in the prompt', () => {
   assert.match(prompt, /Investment advice/);
   assert.match(prompt, /green names/);
   assert.match(prompt, /not an edge/);
+});
+
+test('Coach treats BTC news as a wired RSS tool, not an NGX-only refuse', () => {
+  const prompt = systemPrompt('get BTC news');
+  assert.match(prompt, /Call get_news/);
+  assert.match(prompt, /BTC \/ crypto news is on-topic/);
+  assert.match(prompt, /Do not say you are NGX-only/);
+  assert.match(prompt, /CoinDesk \/ Decrypt \/ The Block/);
+  assert.doesNotMatch(prompt, /don't have a wired BTC news feed/i);
 });
 
 test('D8–D9 strategy and trade: confirm in UI, irreversible refused', async () => {
