@@ -28,8 +28,12 @@ test('crypto prompt treats RSS headlines as context, not a buy signal', () => {
   const prompt = buildPortfolioSignalPrompt({
     universeSize: 4,
     executionConstraints: { assetClass: 'crypto', maxBuySignals: 2 },
-    news: { status: 'ok', headlines: [{ source: 'CoinDesk', title: 'Bitcoin ETF inflows' }] },
+    news: {
+      status: 'ok',
+      headlines: [{ source: 'CoinDesk', title: 'Bitcoin ETF inflows', summary: 'Weekly inflows rose.' }],
+    },
   });
+  assert.match(prompt, /title plus a short lede/);
   assert.match(prompt, /Do not BUY because a headline is bullish/);
   assert.match(prompt, /Headline-only sells are not allowed/);
 });

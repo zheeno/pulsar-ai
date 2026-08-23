@@ -1,7 +1,7 @@
 //! Crypto desk headlines from first-party RSS (no API key).
 //!
 //! Fail-open: a dead feed must not block a cycle or invent copy.
-//! Headlines are titles only — already in the tape; not an entry signal.
+//! Each item is title + RSS lede (not a scraped article). Already in the tape; not an entry signal.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 const CACHE_TTL: Duration = Duration::from_secs(12 * 60);
 const MAX_HEADLINES: usize = 12;
 const MAX_SYMBOL_HITS: usize = 8;
+const SUMMARY_MAX_CHARS: usize = 280;
 const USER_AGENT: &str = "PulsarAI/1.0 (+https://github.com/zheeno/pulsar-ai; rss)";
 
 const FEEDS: &[(&str, &str)] = &[
@@ -82,6 +83,7 @@ const ALIASES: &[(&str, &str)] = &[
 pub struct Headline {
     pub source: String,
     pub title: String,
+    pub summary: String,
     pub url: String,
     pub published_at: Option<String>,
     pub symbols: Vec<String>,
@@ -326,10 +328,17 @@ pub fn parse_rss_items(source: &str, xml: &str) -> Vec<Headline> {
         let published_at = tag_text(block, "pubDate")
             .and_then(|raw| parse_pubdate(&raw))
             .map(|dt| dt.to_rfc3339());
-        let symbols = symbols_in_title(&title);
+        let summary = clip_summary(&tag_text(block, "description").unwrap_or_default());
+        let mut symbols = symbols_in_title(&title);
+        for extra in symbols_in_title(&summary) {
+            if !symbols.contains(&extra) {
+                symbols.push(extra);
+            }
+        }
         out.push(Headline {
             source: source.to_string(),
             title,
+            summary,
             url,
             published_at,
             symbols,
@@ -413,10 +422,25 @@ fn clean_text(raw: &str) -> String {
     {
         s = inner.to_string();
     }
-    decode_entities(&s)
+    let no_tags = html_tag_re().replace_all(&s, " ").into_owned();
+    decode_entities(&no_tags)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn clip_summary(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= SUMMARY_MAX_CHARS {
+        return s.to_string();
+    }
+    let clipped: String = s.chars().take(SUMMARY_MAX_CHARS.saturating_sub(1)).collect();
+    format!("{clipped}…")
+}
+
+fn html_tag_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?s)<[^>]+>").expect("html tag regex"))
 }
 
 fn decode_entities(s: &str) -> String {
@@ -446,6 +470,7 @@ mod tests {
       <item>
         <title><![CDATA[Bitcoin and ether ETFs draw $2.6 billion]]></title>
         <link>https://www.theblock.co/news/btc-etf</link>
+        <description><![CDATA[Combined ETF weekly volume more than tripled to $29 billion as <b>bitcoin</b> and ether prices rallied.]]></description>
         <pubDate>Sat, 22 Aug 2026 19:31:35 +0000</pubDate>
       </item>
       <item>
@@ -470,6 +495,8 @@ mod tests {
         assert!(items[0].symbols.contains(&"ETH".into()));
         assert!(items.iter().any(|h| h.symbols.contains(&"SOL".into())));
         assert!(!items.iter().any(|h| h.title.contains("Microsoft")));
+        assert!(items[0].summary.contains("tripled"));
+        assert!(!items[0].summary.contains("<b>"));
     }
 
     #[test]
