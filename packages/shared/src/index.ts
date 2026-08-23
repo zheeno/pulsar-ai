@@ -98,7 +98,8 @@ export const NGX_TIMEZONE = 'Africa/Lagos';
 
 export const PROMPT_VERSION = 'v1.0.0';
 export const PORTFOLIO_PROMPT_VERSION = 'v2.5.3';
-export const STRATEGY_COACH_PROMPT_VERSION = 'v4.0.1';
+export const STRATEGY_COACH_PROMPT_VERSION = 'v4.1.1';
 
 export * from './types';
 export * from './desktop';
+export * from './coach-format';

@@ -462,12 +462,15 @@ pub fn proposal_from_llm(
                 .collect()
         })
         .unwrap_or_default();
-    let summary = output
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let summary = crate::coach::format_coach_summary(
+        output.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+        "",
+    );
+    let summary = if summary.is_empty() {
+        crate::coach::format_coach_summary(&output.to_string(), "")
+    } else {
+        summary
+    };
     if summary.is_empty() {
         return Err("Coach response was missing a summary".into());
     }
@@ -760,7 +763,13 @@ fn persist_coach_assistant(
     state
         .db
         .with_conn(|conn| {
-            crate::coach::append_message(conn, session_id, "assistant", summary, Some(payload))
+            crate::coach::append_message(
+                conn,
+                session_id,
+                "assistant",
+                &crate::coach::format_coach_summary(summary, summary),
+                Some(payload),
+            )
         })
         .map_err(|e| e.to_string())?;
     Ok(())

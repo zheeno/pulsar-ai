@@ -93,18 +93,22 @@ function coachTools(callTool: ToolCaller, allowed?: string[]): any[] {
     } as any);
 
   const all = [
-    t('get_account_snapshot', 'Cash, equity, venue, live/sandbox, Bamboo floor.', z.object({})),
+    t(
+      'get_account_snapshot',
+      'Cash, equity, venue, live/sandbox, asset class. Lead replies with the lede field (venue + mode + as-of).',
+      z.object({}),
+    ),
     t('get_holdings', 'Open lots with avg cost, last, unrealized PnL.', z.object({})),
     t('get_recent_trades', 'Recent fills.', z.object({ limit: z.number().int().optional() })),
     t('get_strategy_params', 'Current Settings sliders.', z.object({})),
     t(
       'list_universe_quotes',
-      'Cached quotes for active NGX names: price, percent change, volume, as-of.',
+      'Cached quotes for the active desk: NGX instruments or Busha pairs. Each row has asOf and stale. Not a buy list.',
       z.object({ limit: z.number().int().optional() }),
     ),
     t(
       'get_symbol_quote',
-      'One symbol live/cached quote.',
+      'One cached quote with asOf, stale, and indicators when history exists. Never invent a price.',
       z.object({ symbol: z.string().min(1) }),
     ),
     t(
@@ -119,7 +123,7 @@ function coachTools(callTool: ToolCaller, allowed?: string[]): any[] {
     ),
     t(
       'search_memory',
-      'Search on-device memories.',
+      'Search on-device LESSON / DREAM memories. Not a blacklist.',
       z.object({
         query: z.string().min(1),
         symbol: z.string().optional(),
@@ -128,7 +132,7 @@ function coachTools(callTool: ToolCaller, allowed?: string[]): any[] {
     ),
     t(
       'get_news',
-      'Headlines for a symbol or the market. May be unavailable — never fabricate.',
+      'Crypto: CoinDesk/Decrypt/The Block RSS title+lede. Pass symbol=BTC or query=bitcoin. NGX news is unavailable. Never fabricate.',
       z.object({ symbol: z.string().optional(), query: z.string().optional() }),
     ),
     t(
@@ -142,6 +146,26 @@ function coachTools(callTool: ToolCaller, allowed?: string[]): any[] {
       z.object({ symbol: z.string().min(1) }),
     ),
     t('get_cycle_status', 'Scheduler / live / halt-buys flags.', z.object({})),
+    t(
+      'get_trade_lessons',
+      'Last closed lots as patterns with repeatCount. Not a ticker ban. Do not raise minConfidence.',
+      z.object({ limit: z.number().int().optional() }),
+    ),
+    t(
+      'get_dream_rules',
+      'Overnight standing cautions (adverse patterns, n>=3). New buys only. Not a ban or sell-now.',
+      z.object({}),
+    ),
+    t(
+      'get_last_cycle',
+      'Most recent cycle audit (signals, executed, blocked histogram). Empty cycle is valid.',
+      z.object({}),
+    ),
+    t(
+      'get_confidence_journal',
+      'Closed-lot hit rate by confidence bucket. Display only — do not raise minConfidence.',
+      z.object({}),
+    ),
     t(
       'propose_strategy_patch',
       'Preview a slider patch. Does not save.',
@@ -194,7 +218,7 @@ async function invokeCoachMessages(
   const layout = buildCoachMessages(context);
   const prompt = layout.map((m) => `${m.role}: ${m.content}`).join('\n\n');
   const forceHint =
-    'Do not call tools. Return the JSON copilot object (summary/patch) now. Empty patch unless this turn is a strategy change. Do not invent prices.';
+    'Do not call tools. Return the JSON copilot object now. summary is GitHub-flavored markdown the user reads — no JSON, no fences, no tool dumps. Empty patch unless this turn is a strategy change. Do not invent prices.';
 
   const gated: ToolCaller | undefined = callTool
     ? async (name, args) => gateToolCall('other', name, args, callTool)

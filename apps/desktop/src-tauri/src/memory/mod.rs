@@ -91,29 +91,60 @@ pub fn delete_memory(conn: &Connection, id: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+fn keyword_tokens(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in query.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
+        let t = part.trim();
+        if t.len() >= 2 {
+            out.push(t.to_string());
+        }
+        if out.len() == 8 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        let q = query.trim();
+        if !q.is_empty() {
+            out.push(q.to_string());
+        }
+    }
+    out
+}
+
 pub fn keyword_search(
     conn: &Connection,
     query: &str,
     symbol: Option<&str>,
     k: usize,
 ) -> Result<Vec<MemoryRecord>> {
-    let like = format!("%{}%", query.trim());
-    let limit = k.clamp(1, 40) as i64;
-    if let Some(sym) = symbol.filter(|s| !s.is_empty()) {
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, symbol, text, source, created_at FROM agent_memories
-             WHERE symbol = ?1 AND (text LIKE ?2 OR kind LIKE ?2)
-             ORDER BY created_at DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![sym.to_uppercase(), like, limit], map_row)?;
-        return Ok(rows.filter_map(|r| r.ok()).collect());
+    let tokens = keyword_tokens(query);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT id, kind, symbol, text, source, created_at FROM agent_memories
-         WHERE text LIKE ?1 OR kind LIKE ?1 OR IFNULL(symbol,'') LIKE ?1
-         ORDER BY created_at DESC LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![like, limit], map_row)?;
+    let likes: Vec<String> = tokens.iter().map(|t| format!("%{t}%")).collect();
+    let limit = k.clamp(1, 40);
+    let mut sql = String::from(
+        "SELECT id, kind, symbol, text, source, created_at FROM agent_memories WHERE ",
+    );
+    let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(sym) = symbol.filter(|s| !s.is_empty()) {
+        sql.push_str("UPPER(symbol) = UPPER(?) AND ");
+        binds.push(rusqlite::types::Value::Text(sym.to_string()));
+    }
+    let token_sql: Vec<&str> = likes
+        .iter()
+        .map(|_| "(text LIKE ? OR kind LIKE ? OR IFNULL(symbol,'') LIKE ?)")
+        .collect();
+    sql.push_str(&token_sql.join(" AND "));
+    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+    for like in &likes {
+        binds.push(rusqlite::types::Value::Text(like.clone()));
+        binds.push(rusqlite::types::Value::Text(like.clone()));
+        binds.push(rusqlite::types::Value::Text(like.clone()));
+    }
+    binds.push(rusqlite::types::Value::Integer(limit as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), map_row)?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
@@ -496,6 +527,25 @@ mod tests {
         .unwrap();
         assert_eq!(v["error"], "embeddings unavailable");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keyword_search_matches_lesson_tokens() {
+        let conn = setup();
+        insert_memory(
+            &conn,
+            "symbol_lesson",
+            Some("HOME"),
+            "LESSON close HOME venue=busha result=loss pattern=chase_reversal pnl=-12.6%",
+            "trade_outcome",
+            None,
+        )
+        .unwrap();
+        let hits = keyword_search(&conn, "LESSON chase_reversal", None, 8).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol.as_deref(), Some("HOME"));
+        let by_sym = keyword_search(&conn, "chase", Some("HOME"), 8).unwrap();
+        assert_eq!(by_sym.len(), 1);
     }
 
     #[test]

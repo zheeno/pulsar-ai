@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { applyCoachHardBreaks, formatCoachSummary } from '@ngx/shared';
 import {
   allowedTools,
   attachesBook,
@@ -38,6 +39,8 @@ test('D1–D2 prompt treats greetings and identity as conversation, not tape', (
   const canned = cannedSocialReply('greeting', 'hello');
   assert.doesNotMatch(canned, /₦|cash|holdings|gtco/i);
   assert.match(PERSONA_META, /NGX/);
+  assert.match(PERSONA_META, /Busha crypto/);
+  assert.match(PERSONA_META, /CoinDesk/);
 });
 
 test('D3–D5 policy: soft ack, off-topic, critique never dump the book', () => {
@@ -64,6 +67,15 @@ test('D6–D7 research and investment caution stay in the prompt', () => {
   assert.match(prompt, /Investment advice/);
   assert.match(prompt, /green names/);
   assert.match(prompt, /not an edge/);
+});
+
+test('Coach treats BTC news as a wired RSS tool, not an NGX-only refuse', () => {
+  const prompt = systemPrompt('get BTC news');
+  assert.match(prompt, /Call get_news/);
+  assert.match(prompt, /BTC \/ crypto news is on-topic/);
+  assert.match(prompt, /Do not say you are NGX-only/);
+  assert.match(prompt, /CoinDesk \/ Decrypt \/ The Block/);
+  assert.doesNotMatch(prompt, /don't have a wired BTC news feed/i);
 });
 
 test('D8–D9 strategy and trade: confirm in UI, irreversible refused', async () => {
@@ -138,6 +150,64 @@ test('classifier remains a hint, not a tool gate', () => {
   assert.equal(classifyCoachIntent('sell half my MTNN'), 'trade');
   assert.ok(allowedTools(classifyCoachIntent('tell me about yourself')).length > 0);
   assert.match(buildCoachSystemPrompt({ conversation: { message: 'hi' } }), /Prompt version:/);
+});
+
+test('v4.1.1 prompt covers desk tools, lede, markdown, and no minConfidence knob', () => {
+  const prompt = systemPrompt('have we been burned on HOME?');
+  assert.match(prompt, /get_trade_lessons/);
+  assert.match(prompt, /get_dream_rules/);
+  assert.match(prompt, /get_last_cycle/);
+  assert.match(prompt, /get_confidence_journal/);
+  assert.match(prompt, /lede/);
+  assert.match(prompt, /Do not raise minConfidence/);
+  assert.match(prompt, /empty signals array is valid/i);
+  assert.match(prompt, /chase_reversal/);
+  assert.match(prompt, /GitHub-flavored markdown/);
+  assert.match(prompt, /Never echo this JSON/);
+  assert.match(prompt, /₦1,234\.56/);
+  assert.match(prompt, /v4\.1\.1/);
+  assert.ok(allowedTools('research').includes('get_trade_lessons'));
+  assert.ok(allowedTools('account').includes('get_last_cycle'));
+});
+
+test('formatCoachSummary and hard breaks keep tape scannable', () => {
+  assert.equal(
+    formatCoachSummary(
+      '{"needMoreContext":false,"summary":"**GTCO** last ₦46.20","patch":{}}',
+    ),
+    '**GTCO** last ₦46.20',
+  );
+  const stacked = applyCoachHardBreaks('**GTCO** last ₦46.20\nas-of today · **stale**');
+  assert.match(stacked, /₦46\.20  \n/);
+  const list = applyCoachHardBreaks('- **GTCO** ₦46.20\n- **MTNN** ₦225.00');
+  assert.doesNotMatch(list, /₦46\.20  \n/);
+});
+
+test('parseCoachOutput never shows a leaked JSON envelope or literal \\\\n', () => {
+  const leaked = parseCoachOutput(
+    '{"needMoreContext":false,"clarifyingQuestions":[],"summary":"**GTCO** last ₦46.20 as-of today.","patch":{},"rationale":{},"warnings":[]}',
+  );
+  assert.equal(leaked.summary, '**GTCO** last ₦46.20 as-of today.');
+  assert.doesNotMatch(leaked.summary, /needMoreContext/);
+
+  const broken = parseCoachOutput(`{
+  "needMoreContext": false,
+  "summary": "**GTCO** last ₦46.20
+as-of 2026-08-23 · **stale**",
+  "patch": {}
+}`);
+  assert.match(broken.summary, /\*\*GTCO\*\*/);
+  assert.match(broken.summary, /stale/);
+  assert.doesNotMatch(broken.summary, /needMoreContext/);
+
+  const escaped = parseCoachOutput('**GTCO** last ₦46.20\\nas-of today · **stale**');
+  assert.match(escaped.summary, /\n/);
+  assert.doesNotMatch(escaped.summary, /\\n/);
+
+  const fencedJson = parseCoachOutput(
+    '```json\n{"summary":"- **GTCO** ₦46.20\\n- **MTNN** ₦225.00","patch":{}}\n```',
+  );
+  assert.match(fencedJson.summary, /\*\*MTNN\*\*/);
 });
 
 test('parseCoachOutput accepts JSON and plain conversational replies', () => {

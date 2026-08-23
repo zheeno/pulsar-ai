@@ -201,6 +201,52 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn arg_raw(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_quote_ts(raw: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f"))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        })
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .ok()
+                .map(|d| d.naive_utc())
+        })
+}
+
+/// NGX daily bars can be yesterday and still current. Crypto marks go stale faster.
+pub(crate) fn quote_freshness(as_of: &str, crypto: bool) -> (bool, Option<f64>) {
+    let Some(ts) = parse_quote_ts(as_of) else {
+        return (true, None);
+    };
+    let secs = (chrono::Utc::now().naive_utc() - ts).num_seconds() as f64;
+    if !secs.is_finite() || secs < 0.0 {
+        return (true, None);
+    }
+    let hours = secs / 3600.0;
+    let stale = if crypto { hours > 2.0 } else { hours > 72.0 };
+    (stale, Some(hours))
+}
+
+fn attach_freshness(obj: &mut Value, as_of: &str, crypto: bool) {
+    let (stale, age) = quote_freshness(as_of, crypto);
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("asOf".into(), json!(as_of));
+        map.insert("stale".into(), json!(stale));
+        map.insert("ageHours".into(), json!(age));
+    }
+}
+
 fn arg_i64(args: &Value, key: &str, default: i64) -> i64 {
     args.get(key)
         .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|n| n as i64)))
@@ -284,14 +330,27 @@ fn dispatch(
                 })),
             }
         }
-        "search_memory" => Ok(json!({
-            "ok": false,
-            "error": "use memory_search via host",
-        })),
+        "search_memory" | "memory_search" => {
+            let Some(query) = arg_raw(args, "query") else {
+                return Ok(json!({ "ok": false, "error": "query is required" }));
+            };
+            let symbol = args
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let k = arg_i64(args, "k", 8).clamp(1, 40) as usize;
+            let hits = crate::memory::keyword_search(conn, &query, symbol, k)?;
+            Ok(json!({ "ok": true, "hits": hits, "source": "keyword" }))
+        }
         "get_news" => {
-            if crate::broker::crypto_mode() {
-                let symbol = arg_str(args, "symbol");
-                let query = arg_str(args, "query");
+            let symbol = arg_str(args, "symbol");
+            let query = arg_str(args, "query");
+            if crate::news::wants_crypto_news(
+                symbol.as_deref(),
+                query.as_deref(),
+                crate::broker::crypto_mode(),
+            ) {
                 Ok(crate::runtime_util::block_on_local(
                     crate::news::coach_crypto_news(symbol.as_deref(), query.as_deref()),
                 ))
@@ -299,7 +358,7 @@ fn dispatch(
                 Ok(json!({
                     "ok": false,
                     "unavailable": true,
-                    "error": "NGX news is not wired in this build. No headlines were invented.",
+                    "error": "NGX news is not wired in this build. Crypto headlines (BTC and other coins) use CoinDesk / Decrypt / The Block RSS — pass symbol or query. No headlines were invented.",
                 }))
             }
         }
@@ -316,6 +375,37 @@ fn dispatch(
             "liveTradingEnabled": settings.live_trading_enabled,
             "haltNewBuys": settings.halt_new_buys,
             "intervalMinutes": settings.auto_cycle_interval_minutes,
+        })),
+        "get_trade_lessons" => {
+            let limit = arg_i64(args, "limit", 12).clamp(1, 30) as usize;
+            let venue = if crate::broker::crypto_mode() {
+                Some("busha")
+            } else {
+                None
+            };
+            Ok(json!({
+                "ok": true,
+                "lessons": crate::outcomes::desk_lessons(conn, venue, limit).unwrap_or_default(),
+                "note": "Pattern evidence only. One loss is not a blacklist. Do not raise minConfidence.",
+            }))
+        }
+        "get_dream_rules" => Ok(json!({
+            "ok": true,
+            "dreamRules": crate::dream::desk_dream_rules(conn).unwrap_or_default(),
+            "note": "Standing cautions for NEW buys. Not a ticker ban, not a minConfidence knob, not a sell-now order.",
+        })),
+        "get_last_cycle" => {
+            let rows = crate::signals::list_recent_cycle_audits(conn, 1)?;
+            Ok(json!({
+                "ok": true,
+                "cycle": rows.first().cloned().unwrap_or(json!(null)),
+                "note": "An empty signals array is valid. Do not treat a quiet cycle as a failure.",
+            }))
+        }
+        "get_confidence_journal" => Ok(json!({
+            "ok": true,
+            "journal": crate::outcomes::confidence_journal(conn).unwrap_or_default(),
+            "note": "Display only. Do not raise minConfidence from these buckets.",
         })),
         "propose_strategy_patch" => Ok(propose_strategy_patch(conn, args)?),
         "apply_strategy_patch" => Ok(json!({
@@ -354,6 +444,105 @@ fn last_price(conn: &Connection, symbol: &str) -> Option<(f64, String, Option<f6
     .ok()
 }
 
+/// Busha pair mark when `price_history` has no row (crypto desk / BTC).
+fn busha_mark(conn: &Connection, symbol: &str) -> Option<(f64, String, Option<f64>)> {
+    conn.query_row(
+        "SELECT COALESCE(NULLIF(m.snapshot_price, 0), NULLIF(bp.buy_price, 0), bp.sell_price),
+                m.change_pct,
+                COALESCE(m.fetched_at, bp.synced_at)
+         FROM busha_pairs bp
+         LEFT JOIN busha_ohlc_meta m ON m.symbol = bp.symbol AND m.period = '1d'
+         WHERE UPPER(bp.symbol) = UPPER(?1)",
+        [symbol],
+        |row| {
+            Ok((
+                row.get::<_, Option<f64>>(0)?,
+                row.get::<_, Option<f64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )
+    .ok()
+    .and_then(|(px, chg, as_of)| {
+        let px = px.filter(|p| *p > 0.0)?;
+        Some((px, as_of.unwrap_or_default(), chg))
+    })
+}
+
+fn latest_mark(
+    conn: &Connection,
+    symbol: &str,
+) -> Option<(f64, String, Option<f64>, Option<i64>, bool)> {
+    let crypto = crate::broker::crypto_mode() || crate::busha::is_crypto_symbol(conn, symbol);
+    if let Some((price, date, chg, vol)) = last_price(conn, symbol) {
+        return Some((price, date, chg, vol, crypto));
+    }
+    busha_mark(conn, symbol).map(|(price, date, chg)| (price, date, chg, None, true))
+}
+
+fn desk_venue(settings: &AppSettings) -> String {
+    if crate::broker::crypto_mode() {
+        "busha".into()
+    } else {
+        settings.selected_broker.clone()
+    }
+}
+
+fn spendable_cash(conn: &Connection, settings: &AppSettings) -> f64 {
+    cached_live_book(conn, settings)
+        .map(|b| b.brokerage_balance)
+        .unwrap_or_else(|| sandbox_cash(conn))
+}
+
+fn same_symbol_chase(conn: &Connection, symbol: &str) -> Result<bool> {
+    let venue = if crate::broker::crypto_mode() {
+        Some("busha")
+    } else {
+        None
+    };
+    let lessons = crate::outcomes::desk_lessons(conn, venue, 12).unwrap_or_default();
+    Ok(lessons.iter().any(|row| {
+        row.get("symbol").and_then(|v| v.as_str()) == Some(symbol)
+            && row.get("pattern").and_then(|v| v.as_str()) == Some("chase_reversal")
+    }))
+}
+
+fn standing_chase_warnings(conn: &Connection) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let dreams = crate::dream::desk_dream_rules(conn).unwrap_or_default();
+    if dreams.iter().any(|row| {
+        row.get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("chase_reversal")
+    }) {
+        warnings.push(
+            "Standing caution: a dream rule mentions chase_reversal. That is a pattern warning, not a ticker blacklist."
+                .into(),
+        );
+    }
+    let venue = if crate::broker::crypto_mode() {
+        Some("busha")
+    } else {
+        None
+    };
+    let lessons = crate::outcomes::desk_lessons(conn, venue, 12).unwrap_or_default();
+    if lessons.iter().any(|row| {
+        row.get("pattern").and_then(|v| v.as_str()) == Some("chase_reversal")
+            && row
+                .get("repeatCount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                >= 3
+    }) {
+        warnings.push(
+            "Standing caution: chase_reversal has repeated at least three times on the desk. Still proposing because this name is not the prior loser."
+                .into(),
+        );
+    }
+    warnings
+}
+
 fn cached_live_book(
     conn: &Connection,
     settings: &AppSettings,
@@ -381,7 +570,6 @@ fn get_account_snapshot(conn: &Connection, settings: &AppSettings) -> Result<Val
         .as_ref()
         .map(|r| r.params.cycle_budget_pct)
         .unwrap_or(0.20);
-    let remaining = remaining_buy_budget(cash, cycle_pct, min_n);
     let live_book = cached_live_book(conn, settings);
     let (mode, live_cash, equity) = if let Some(book) = live_book {
         let mv = book.market_value();
@@ -397,8 +585,17 @@ fn get_account_snapshot(conn: &Connection, settings: &AppSettings) -> Result<Val
     } else {
         ("sandbox", None, None)
     };
+    let spendable = live_cash.unwrap_or(cash);
+    let remaining = remaining_buy_budget(spendable, cycle_pct, min_n);
+    let asset = crate::broker::asset_class().as_str();
+    let sess = crate::broker::crypto_session().as_str();
+    let as_of = chrono::Utc::now().to_rfc3339();
+    let lede = format!(
+        "Venue {broker}, {mode}, {asset}, cryptoSession={sess}, as-of {as_of}"
+    );
     Ok(json!({
         "ok": true,
+        "lede": lede,
         "tradingMode": mode,
         "venue": broker,
         "liveTradingEnabled": settings.live_trading_enabled,
@@ -406,13 +603,15 @@ fn get_account_snapshot(conn: &Connection, settings: &AppSettings) -> Result<Val
         "flattenOnDrawdownArmed": settings.flatten_on_drawdown_armed,
         "sandboxCash": cash,
         "liveCash": live_cash,
+        "spendableCash": spendable,
         "equity": equity,
         "spendableBudget": remaining,
         "bambooMinNotional": BAMBOO_MIN_ORDER_NOTIONAL,
         "minOrderNotional": min_n,
-        "assetClass": crate::broker::asset_class().as_str(),
-        "cryptoSession": crate::broker::crypto_session().as_str(),
-        "asOf": chrono::Utc::now().to_rfc3339(),
+        "estimatedFeePct": crate::settings::fee_pct_for_venue(settings, &broker),
+        "assetClass": asset,
+        "cryptoSession": sess,
+        "asOf": as_of,
     }))
 }
 
@@ -479,19 +678,28 @@ fn get_holdings(conn: &Connection, settings: &AppSettings) -> Result<Value> {
 }
 
 fn list_universe_quotes(conn: &Connection, limit: i64) -> Result<Value> {
+    let crypto = crate::broker::crypto_mode();
+    if crypto {
+        return list_crypto_universe(conn, limit);
+    }
+    list_ngx_universe(conn, limit)
+}
+
+pub(crate) fn list_ngx_universe(conn: &Connection, limit: i64) -> Result<Value> {
     let limit = limit.clamp(5, 80);
     let mut stmt = conn.prepare(
         "SELECT i.symbol, i.name, i.sector, p.price, p.change_percent, p.volume, p.trade_date
          FROM instruments i
          JOIN price_history p ON p.symbol = i.symbol
          WHERE i.is_active = 1
+           AND IFNULL(i.sector, '') != 'CRYPTO'
            AND p.trade_date = (
              SELECT MAX(trade_date) FROM price_history ph WHERE ph.symbol = i.symbol
            )
          ORDER BY ABS(COALESCE(p.change_percent, 0)) DESC
          LIMIT ?1",
     )?;
-    let rows: Vec<Value> = stmt
+    let mut rows: Vec<Value> = stmt
         .query_map([limit], |row| {
             Ok(json!({
                 "symbol": row.get::<_, String>(0)?,
@@ -501,17 +709,86 @@ fn list_universe_quotes(conn: &Connection, limit: i64) -> Result<Value> {
                 "changePercent": row.get::<_, Option<f64>>(4)?,
                 "volume": row.get::<_, Option<i64>>(5)?,
                 "asOf": row.get::<_, String>(6)?,
+                "source": "price_history",
             }))
         })?
         .filter_map(|r| r.ok())
         .collect();
+    for row in &mut rows {
+        let as_of = row
+            .get("asOf")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        attach_freshness(row, &as_of, false);
+        row.as_object_mut()
+            .map(|m| m.insert("rankNote".into(), json!("abs 1-day % is not an edge")));
+    }
     if rows.is_empty() {
         return Ok(json!({
             "ok": false,
             "error": "No universe quotes in the local store. Ingest Pulse data or run a cycle first.",
         }));
     }
-    Ok(json!({ "ok": true, "quotes": rows, "count": rows.len() }))
+    Ok(json!({
+        "ok": true,
+        "desk": "ngx",
+        "quotes": rows,
+        "count": rows.len(),
+        "rankNote": "Sorted by |1-day %|; that is not an edge.",
+    }))
+}
+
+pub(crate) fn list_crypto_universe(conn: &Connection, limit: i64) -> Result<Value> {
+    let limit = limit.clamp(5, 80);
+    let mut stmt = conn.prepare(
+        "SELECT bp.symbol,
+                COALESCE(NULLIF(m.snapshot_price, 0), NULLIF(bp.buy_price, 0), bp.sell_price),
+                m.change_pct,
+                COALESCE(m.fetched_at, bp.synced_at)
+         FROM busha_pairs bp
+         LEFT JOIN busha_ohlc_meta m ON m.symbol = bp.symbol AND m.period = '1d'
+         ORDER BY ABS(COALESCE(m.change_pct, 0)) DESC, bp.symbol ASC
+         LIMIT ?1",
+    )?;
+    let mut rows: Vec<Value> = stmt
+        .query_map([limit], |row| {
+            Ok(json!({
+                "symbol": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(0)?,
+                "sector": "CRYPTO",
+                "price": row.get::<_, Option<f64>>(1)?,
+                "changePercent": row.get::<_, Option<f64>>(2)?,
+                "volume": null,
+                "asOf": row.get::<_, Option<String>>(3)?,
+                "source": "busha",
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    for row in &mut rows {
+        let as_of = row
+            .get("asOf")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        attach_freshness(row, &as_of, true);
+        row.as_object_mut()
+            .map(|m| m.insert("rankNote".into(), json!("abs 1-day % is not an edge")));
+    }
+    if rows.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "error": "No Busha pairs in the local store. Connect Busha or run a crypto cycle first.",
+        }));
+    }
+    Ok(json!({
+        "ok": true,
+        "desk": "busha",
+        "quotes": rows,
+        "count": rows.len(),
+        "rankNote": "Sorted by |1-day %|; that is not an edge.",
+    }))
 }
 
 fn get_symbol_quote(conn: &Connection, symbol: &str) -> Result<Value> {
@@ -523,16 +800,23 @@ fn get_symbol_quote(conn: &Connection, symbol: &str) -> Result<Value> {
     if !crate::broker::is_valid_trade_symbol(venue, symbol) {
         return Ok(json!({ "ok": false, "error": format!("invalid ticker {symbol}") }));
     }
-    match last_price(conn, symbol) {
-        Some((price, date, chg, vol)) => Ok(json!({
-            "ok": true,
-            "symbol": symbol,
-            "price": price,
-            "changePercent": chg,
-            "volume": vol,
-            "asOf": date,
-            "source": "price_history",
-        })),
+    let indicators = IndicatorService::compute(conn, symbol)
+        .ok()
+        .flatten();
+    match latest_mark(conn, symbol) {
+        Some((price, date, chg, vol, crypto)) => {
+            let mut out = json!({
+                "ok": true,
+                "symbol": symbol,
+                "price": price,
+                "changePercent": chg,
+                "volume": vol,
+                "source": if crypto { "busha_or_history" } else { "price_history" },
+                "indicators": indicators,
+            });
+            attach_freshness(&mut out, &date, crypto);
+            Ok(out)
+        }
         None => Ok(json!({
             "ok": false,
             "error": format!("No cached quote for {symbol}"),
@@ -707,17 +991,30 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
         .or_else(active_session_id)
         .unwrap_or_default();
 
-    let quote = last_price(conn, &symbol);
-    let Some((price, as_of, _, _)) = quote else {
+    if side == "BUY" && same_symbol_chase(conn, &symbol)? {
+        return Ok(json!({
+            "ok": false,
+            "error": format!(
+                "Refusing a BUY preview on {symbol}: this name has a chase_reversal close in the last 12 lots. That is a same-name caution, not a sector blacklist. A different symbol can still be previewed."
+            ),
+            "pattern": "chase_reversal",
+            "scope": "same_symbol_only",
+            "placed": false,
+        }));
+    }
+
+    let quote = latest_mark(conn, &symbol);
+    let Some((price, as_of, _, _, crypto)) = quote else {
         return Ok(json!({
             "ok": false,
             "error": format!("No cached quote for {symbol}; cannot preview a trade"),
         }));
     };
+    let (stale, age_hours) = quote_freshness(&as_of, crypto);
     let est_qty = qty.unwrap_or_else(|| {
         notional
             .map(|n| {
-                if crate::broker::crypto_mode() {
+                if crate::broker::crypto_mode() || crypto {
                     n / price
                 } else {
                     (n / price).floor()
@@ -726,12 +1023,11 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
             .unwrap_or(0.0)
     });
     let est_notional = notional.unwrap_or(est_qty * price);
-    let min_n = crate::execution::min_order_notional_for_venue(if crate::broker::crypto_mode() {
-        "busha"
-    } else {
-        &settings.selected_broker
-    });
-    let cash = sandbox_cash(conn);
+    let venue = desk_venue(settings);
+    let min_n = crate::execution::min_order_notional_for_venue(&venue);
+    let fee_pct = crate::settings::fee_pct_for_venue(settings, &venue);
+    let estimated_fee = est_notional * fee_pct;
+    let cash = spendable_cash(conn, settings);
     let mut warnings = Vec::new();
     if side == "BUY" && est_notional + 1e-9 < min_n && min_n > 0.0 {
         warnings.push(format!(
@@ -747,6 +1043,17 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
     if !settings.live_trading_enabled {
         warnings.push("Live trading is off — sandbox fill only if the book is sandbox".into());
     }
+    if stale {
+        warnings.push(format!(
+            "Quote as-of {as_of} is stale (ageHours={}). Do not treat this mark as live.",
+            age_hours
+                .map(|h| format!("{h:.1}"))
+                .unwrap_or_else(|| "unknown".into())
+        ));
+    }
+    if side == "BUY" {
+        warnings.extend(standing_chase_warnings(conn));
+    }
 
     let preview = json!({
         "symbol": symbol,
@@ -755,7 +1062,13 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
         "notional": est_notional,
         "price": price,
         "asOf": as_of,
-        "estimatedCost": est_notional,
+        "stale": stale,
+        "ageHours": age_hours,
+        "venue": venue,
+        "estimatedFeePct": fee_pct,
+        "estimatedFee": estimated_fee,
+        "estimatedCost": est_notional + estimated_fee,
+        "spendableCash": cash,
         "minOrderNotional": min_n,
         "warnings": warnings,
         "liveTradingEnabled": settings.live_trading_enabled,
@@ -786,6 +1099,11 @@ fn propose_trade(conn: &Connection, settings: &AppSettings, args: &Value) -> Res
         "preview": preview,
         "rationale": rationale,
         "placed": false,
+        "spendableCash": cash,
+        "venue": venue,
+        "estimatedFeePct": fee_pct,
+        "warning": warnings.join(" "),
+        "warnings": warnings,
     }))
 }
 
@@ -976,6 +1294,126 @@ pub fn redact_args(args: &Value) -> Value {
     out
 }
 
+/// User-visible Coach text. Never persist a leaked JSON envelope.
+pub fn format_coach_summary(raw: &str, fallback: &str) -> String {
+    let mut text = tidy_coach_text(raw);
+    if text.is_empty() {
+        return fallback.to_string();
+    }
+    for _ in 0..3 {
+        let unfenced = unwrap_coach_fence(&text);
+        if let Some(extracted) = extract_envelope_summary(&unfenced) {
+            text = tidy_coach_text(&extracted);
+            continue;
+        }
+        text = tidy_coach_text(&unfenced);
+        break;
+    }
+    if !text.contains('\n') && text.contains("\\n") {
+        text = tidy_coach_text(&text.replace("\\n", "\n").replace("\\t", "  "));
+    }
+    if looks_like_coach_envelope(&text) {
+        text = extract_envelope_summary(&text)
+            .map(|s| tidy_coach_text(&s))
+            .unwrap_or_default();
+    }
+    if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text
+    }
+}
+
+fn tidy_coach_text(raw: &str) -> String {
+    let s = raw.replace('\u{feff}', "").replace("\r\n", "\n");
+    let mut out = String::with_capacity(s.len());
+    let mut blank = 0usize;
+    for line in s.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.is_empty() {
+            blank += 1;
+            if blank <= 1 {
+                out.push('\n');
+            }
+        } else {
+            blank = 0;
+            out.push_str(trimmed_end);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
+}
+
+fn unwrap_coach_fence(text: &str) -> String {
+    let t = text.trim();
+    if !t.starts_with("```") {
+        return t.to_string();
+    }
+    let mut lines: Vec<&str> = t.lines().collect();
+    if lines.len() < 2 || !lines[0].starts_with("```") {
+        return t.to_string();
+    }
+    if lines.last().is_some_and(|l| l.trim() == "```") {
+        lines.pop();
+    }
+    lines.remove(0);
+    lines.join("\n").trim().to_string()
+}
+
+fn looks_like_coach_envelope(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with('{')
+        && (t.contains("needMoreContext") || t.contains("clarifyingQuestions") || t.contains("\"patch\""))
+}
+
+fn extract_envelope_summary(text: &str) -> Option<String> {
+    if !text.contains("\"summary\"") && !looks_like_coach_envelope(text) {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+        if let Some(s) = v.get("summary").and_then(|x| x.as_str()).map(str::trim) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    let key = "\"summary\"";
+    let idx = text.find(key)?;
+    let after = &text[idx + key.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let bytes = rest.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'"' | b'\\' | b'/' => out.push(bytes[i + 1] as char),
+                _ => out.push(bytes[i + 1] as char),
+            }
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            break;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    let s = out.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 pub fn summarize_tool_result(name: &str, result: &Value) -> String {
     if result.get("unavailable").and_then(|v| v.as_bool()) == Some(true) {
         return "unavailable".into();
@@ -1077,6 +1515,8 @@ mod tests {
         assert_eq!(v["ok"], false);
         assert_eq!(v["unavailable"], true);
         assert!(!v["error"].as_str().unwrap().is_empty());
+        assert!(crate::news::wants_crypto_news(Some("BTC"), None, false));
+        assert!(!crate::news::wants_crypto_news(Some("GTCO"), None, false));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1353,6 +1793,26 @@ mod tests {
     }
 
     #[test]
+    fn format_coach_summary_strips_envelope_and_literal_newlines() {
+        let clean = format_coach_summary(
+            r#"{"needMoreContext":false,"summary":"**GTCO** last ₦46.20 as-of today.","patch":{}}"#,
+            "fallback",
+        );
+        assert_eq!(clean, "**GTCO** last ₦46.20 as-of today.");
+        let broken = format_coach_summary(
+            "{\n  \"summary\": \"**GTCO** last ₦46.20\nas-of today · **stale**\",\n  \"patch\": {}\n}",
+            "fallback",
+        );
+        assert!(broken.contains("**GTCO**"));
+        assert!(broken.contains("stale"));
+        assert!(!broken.contains("needMoreContext"));
+        let escaped = format_coach_summary("**GTCO** last ₦46.20\\nas-of today", "");
+        assert!(escaped.contains('\n'));
+        assert!(!escaped.contains("\\n"));
+        assert_eq!(format_coach_summary("   ", "Hey."), "Hey.");
+    }
+
+    #[test]
     fn secrets_never_land_in_tool_args_log() {
         let redacted = redact_args(&json!({ "symbol": "GTCO", "apiKey": "sk-live", "token": "abc" }));
         assert_eq!(redacted["symbol"], "GTCO");
@@ -1407,6 +1867,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn seed_listed(conn: &Connection, symbol: &str, price: f64, as_of: &str) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO instruments (symbol, name) VALUES (?1, ?1)",
+            [symbol],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO price_history (symbol, trade_date, price, change_percent, volume)
+             VALUES (?1, ?2, ?3, 1.0, 1000)",
+            rusqlite::params![symbol, as_of, price],
+        )?;
+        Ok(())
+    }
+
+    fn seed_sandbox(conn: &Connection, cash: f64) -> anyhow::Result<String> {
+        let param_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO strategy_param_sets (id, name, is_active) VALUES (?1, 'default', 1)",
+            rusqlite::params![param_id],
+        )?;
+        let pid = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO sandbox_portfolios (id, name, starting_capital, cash_balance, strategy_param_set_id)
+             VALUES (?1, 'default-sandbox', ?2, ?2, ?3)",
+            rusqlite::params![pid, cash, param_id],
+        )?;
+        Ok(pid)
+    }
+
+    fn seed_chase_close(
+        conn: &Connection,
+        id: &str,
+        symbol: &str,
+        closed_at: &str,
+        bought_at: &str,
+        portfolio_id: &str,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO signals (id, symbol, action, confidence, rationale, technical_snapshot, model_name, prompt_version, risk_policy_result, executed)
+             VALUES (?1, ?2, 'SELL', 0.6, 'close', '{}', 'openai:gpt-5.6-luna', 'v2.5.2', 'APPROVED', 1)",
+            rusqlite::params![id, symbol],
+        )?;
+        conn.execute(
+            "INSERT INTO signal_outcomes (
+                id, signal_id, symbol, side, event, quantity, fill_price, fee,
+                pnl, horizon_return_pct, confidence, venue, created_at
+             ) VALUES (?1, ?1, ?2, 'SELL', 'close', 1, 8.32, 0, -1.2, -0.126, 0.6, 'wealth', ?3)",
+            rusqlite::params![id, symbol, closed_at],
+        )?;
+        conn.execute(
+            "INSERT INTO sandbox_trades (
+                id, portfolio_id, symbol, side, quantity, fill_price, resulting_cash_balance, executed_at
+             ) VALUES (?1, ?2, ?3, 'BUY', 1, 9.52, 1000, ?4)",
+            rusqlite::params![format!("b-{id}"), portfolio_id, symbol, bought_at],
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn research_intent_still_allows_quote() {
         let (dir, db) = setup();
@@ -1444,6 +1961,354 @@ mod tests {
             }),
         );
         assert_eq!(trade["ok"], false);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quote_freshness_labels_unparseable_and_old() {
+        assert_eq!(quote_freshness("not-a-date", false), (true, None));
+        assert_eq!(quote_freshness("", true), (true, None));
+        let old = quote_freshness("2020-01-01 00:00:00", false);
+        assert!(old.0);
+        assert!(old.1.unwrap() > 72.0);
+        let recent = (chrono::Utc::now() - chrono::Duration::minutes(20))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let fresh_ngx = quote_freshness(&recent, false);
+        assert!(!fresh_ngx.0);
+        let stale_crypto = quote_freshness(&recent, true);
+        assert!(!stale_crypto.0);
+        let three_hours = (chrono::Utc::now() - chrono::Duration::hours(3))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(quote_freshness(&three_hours, true).0);
+        assert!(!quote_freshness(&three_hours, false).0);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today_ngx = quote_freshness(&today, false);
+        assert!(!today_ngx.0, "today's NGX date-only bar must not be stale");
+        assert!(today_ngx.1.is_some());
+        let old_date = quote_freshness("2020-01-01", false);
+        assert!(old_date.0);
+        assert!(old_date.1.unwrap() > 72.0);
+    }
+
+    #[test]
+    fn ngx_universe_excludes_crypto_and_marks_stale() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            seed_listed(conn, "GTCO", 50.0, "2026-08-18")?;
+            conn.execute(
+                "INSERT OR IGNORE INTO instruments (symbol, name, sector) VALUES ('BTC', 'Bitcoin', 'CRYPTO')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO price_history (symbol, trade_date, price, change_percent, volume)
+                 VALUES ('BTC', '2026-08-18', 100.0, 9.0, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let v = handle_tool(&db, &AppSettings::default(), "list_universe_quotes", &json!({}));
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["desk"], "ngx");
+        let quotes = v["quotes"].as_array().unwrap();
+        assert!(quotes.iter().all(|q| q["symbol"] != "BTC"));
+        assert_eq!(quotes[0]["symbol"], "GTCO");
+        assert!(quotes[0].get("asOf").is_some());
+        assert_eq!(quotes[0]["stale"], true);
+        assert!(quotes[0].get("ageHours").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn crypto_universe_reads_busha_pairs() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO busha_pairs (symbol, pair_id, buy_price, sell_price, synced_at)
+                 VALUES ('BTC', 'btc-ngn', 150000000, 149000000, '2026-08-20T09:00:00Z')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO busha_ohlc_meta (symbol, period, snapshot_price, change_pct, fetched_at)
+                 VALUES ('BTC', '1d', 150000000, 2.5, '2026-08-20T09:00:00Z')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let v = db
+            .with_conn(|conn| list_crypto_universe(conn, 10))
+            .unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["desk"], "busha");
+        assert_eq!(v["quotes"][0]["symbol"], "BTC");
+        assert_eq!(v["quotes"][0]["price"], 150000000.0);
+        assert_eq!(v["quotes"][0]["stale"], true);
+        assert!(v["quotes"][0].get("asOf").is_some());
+        let quote = handle_tool(
+            &db,
+            &AppSettings::default(),
+            "get_symbol_quote",
+            &json!({ "symbol": "BTC" }),
+        );
+        assert_eq!(quote["ok"], true);
+        assert_eq!(quote["price"], 150000000.0);
+        assert_eq!(quote["stale"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_memory_returns_lesson_hits() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            crate::memory::insert_memory(
+                conn,
+                "symbol_lesson",
+                Some("HOME"),
+                "LESSON close HOME venue=busha result=loss pattern=chase_reversal pnl=-12.6%",
+                "trade_outcome",
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let v = handle_tool(
+            &db,
+            &AppSettings::default(),
+            "search_memory",
+            &json!({ "query": "LESSON chase_reversal" }),
+        );
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["source"], "keyword");
+        let hits = v["hits"].as_array().unwrap();
+        assert!(!hits.is_empty());
+        let text = hits[0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("LESSON"));
+        assert!(text.contains("HOME"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn account_snapshot_lede_uses_live_cash_when_book_exists() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            seed_sandbox(conn, 99_999.0)?;
+            conn.execute(
+                "INSERT INTO wealth_account (id, brokerage_balance, stock_value, profit, synced_at)
+                 VALUES (1, 1234.0, 0, 0, datetime('now'))",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let v = handle_tool(
+            &db,
+            &AppSettings::default(),
+            "get_account_snapshot",
+            &json!({}),
+        );
+        assert_eq!(v["ok"], true);
+        let lede = v["lede"].as_str().unwrap();
+        assert!(lede.contains("Venue wealth"));
+        assert!(lede.contains("as-of"));
+        assert_eq!(v["sandboxCash"], 99_999.0);
+        assert_eq!(v["liveCash"], 1234.0);
+        assert_eq!(v["spendableCash"], 1234.0);
+        assert!(v.get("estimatedFeePct").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desk_read_tools_do_not_write_blotter_or_strategy() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            seed_listed(conn, "GTCO", 50.0, "2026-08-23")?;
+            seed_sandbox(conn, 10_000.0)?;
+            conn.execute(
+                "INSERT INTO cycle_audits (id, cycle_id, summary, expires_at, detail, blocked_histogram, cash, executed_ids)
+                 VALUES ('a1', 'c1', 'signals=0 executed=0 venue=sandbox universe=4', datetime('now','+90 days'), '{\"signals\":[]}', '{}', 10000, '[]')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let before = db
+            .with_conn(|conn| {
+                let trades: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM sandbox_trades", [], |r| r.get(0))?;
+                let params: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM strategy_param_sets",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let proposals: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM coach_trade_proposals",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let mem: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM agent_memories", [], |r| r.get(0))?;
+                Ok::<_, anyhow::Error>((trades, params, proposals, mem))
+            })
+            .unwrap();
+        let settings = AppSettings::default();
+        for name in [
+            "get_trade_lessons",
+            "get_dream_rules",
+            "get_last_cycle",
+            "get_confidence_journal",
+        ] {
+            let v = handle_tool(&db, &settings, name, &json!({}));
+            assert_eq!(v["ok"], true, "{name} {v}");
+            assert!(
+                v["note"].as_str().unwrap_or("").contains("not")
+                    || v["note"].as_str().unwrap_or("").contains("Do not")
+                    || v["note"].as_str().unwrap_or("").contains("valid"),
+                "{name} note missing guardrail: {v}"
+            );
+        }
+        assert!(handle_tool(&db, &settings, "get_last_cycle", &json!({}))["cycle"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("signals=0"));
+        let after = db
+            .with_conn(|conn| {
+                let trades: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM sandbox_trades", [], |r| r.get(0))?;
+                let params: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM strategy_param_sets",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let proposals: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM coach_trade_proposals",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let mem: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM agent_memories", [], |r| r.get(0))?;
+                Ok::<_, anyhow::Error>((trades, params, proposals, mem))
+            })
+            .unwrap();
+        assert_eq!(before, after);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn propose_buy_refuses_same_symbol_chase_but_allows_other_names() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            seed_listed(conn, "HOME", 8.32, "2026-08-23")?;
+            seed_listed(conn, "GTCO", 50.0, "2026-08-23")?;
+            let pid = seed_sandbox(conn, 50_000.0)?;
+            for i in 0..3 {
+                seed_chase_close(
+                    conn,
+                    &format!("c{i}"),
+                    "HOME",
+                    &format!("2026-08-01T10:{i:02}:00Z"),
+                    &format!("2026-08-01T09:{i:02}:00Z"),
+                    &pid,
+                )?;
+            }
+            crate::memory::insert_memory(
+                conn,
+                "freeform",
+                None,
+                "DREAM rule pattern=chase_reversal n=5 lookback=20. Standing caution for NEW buys.",
+                "dream_consolidate",
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let session = db.with_conn(create_session).unwrap();
+        let sid = session["id"].as_str().unwrap();
+        let settings = AppSettings::default();
+        let refused = handle_tool(
+            &db,
+            &settings,
+            "propose_trade",
+            &json!({
+                "sessionId": sid,
+                "symbol": "HOME",
+                "side": "BUY",
+                "notional": 5000,
+                "rationale": "re-enter HOME"
+            }),
+        );
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["pattern"], "chase_reversal");
+        assert_eq!(refused["scope"], "same_symbol_only");
+        assert!(refused["error"].as_str().unwrap().contains("HOME"));
+        let proposals: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM coach_trade_proposals",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        assert_eq!(proposals, 0);
+
+        let allowed = handle_tool(
+            &db,
+            &settings,
+            "propose_trade",
+            &json!({
+                "sessionId": sid,
+                "symbol": "GTCO",
+                "side": "BUY",
+                "notional": 5000,
+                "rationale": "different name"
+            }),
+        );
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(allowed["placed"], false);
+        assert_eq!(allowed["preview"]["estimatedFeePct"], 0.005);
+        assert!(allowed["preview"].get("venue").is_some());
+        let warn = allowed["warning"].as_str().unwrap_or("");
+        assert!(warn.contains("dream rule") || warn.contains("Standing caution"));
+        assert!(warn.contains("three times") || warn.contains("repeat"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn propose_trade_spendable_prefers_live_book() {
+        let (dir, db) = setup();
+        db.with_conn(|conn| {
+            seed_listed(conn, "GTCO", 50.0, "2026-08-23")?;
+            seed_sandbox(conn, 99_999.0)?;
+            conn.execute(
+                "INSERT INTO wealth_account (id, brokerage_balance, stock_value, profit, synced_at)
+                 VALUES (1, 400.0, 0, 0, datetime('now'))",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let session = db.with_conn(create_session).unwrap();
+        let sid = session["id"].as_str().unwrap();
+        let v = handle_tool(
+            &db,
+            &AppSettings::default(),
+            "propose_trade",
+            &json!({
+                "sessionId": sid,
+                "symbol": "GTCO",
+                "side": "BUY",
+                "notional": 5000,
+                "rationale": "size vs live cash"
+            }),
+        );
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["spendableCash"], 400.0);
+        let warn = v["warning"].as_str().unwrap_or("");
+        assert!(warn.contains("insufficient"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

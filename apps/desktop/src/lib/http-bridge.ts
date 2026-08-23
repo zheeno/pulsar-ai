@@ -822,7 +822,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       if (isMeta) {
         toolTrace = [];
         summary =
-          "I'm Coach, Pulsar's NGX desk copilot. I can check the tape, a name's history, news when it's wired, help you tighten risk sliders, and propose trades. I won't silently place live orders, and I won't invent prices or headlines. What do you want to look at?";
+          "I'm Coach, Pulsar's desk copilot for **NGX** equities and **Busha** crypto. I can check the tape, a name's history, crypto headlines from CoinDesk / Decrypt / The Block RSS, help you tighten risk sliders, and propose trades. NGX news is not wired — I won't invent it. I won't silently place live orders or invent prices. What do you want to look at?";
       } else if (isGreeting) {
         toolTrace = [];
         summary = lower.includes('thank')
@@ -830,18 +830,40 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
           : 'Hey. Tape, a ticker, news, risk sliders, or a trade idea — your call.';
       } else if (isAdvisory || lower.includes('news')) {
         const news = lower.includes('news');
+        const cryptoNews = /\b(btc|bitcoin|eth|crypto)\b/.test(lower);
         toolTrace = news
-          ? [{ name: 'get_news', ok: false, summary: 'unavailable' }]
+          ? [{ name: 'get_news', ok: true, summary: cryptoNews ? 'rss' : 'unavailable' }]
           : [{ name: 'get_symbol_quote', ok: true, summary: 'GTCO @ 46.2' }];
         summary = news
-          ? 'NGX news is not wired in this mock. No headlines were invented.'
-          : 'GTCO last ₦46.20 as-of mock tape. Advice only — not an order.';
+          ? cryptoNews
+            ? '**BTC** (mock RSS) — not a buy signal.\n\n- **CoinDesk** — Bitcoin ETF inflows rose this week. Title+lede only.'
+            : 'NGX news is not wired in this mock. Ask for **BTC** / crypto for CoinDesk / Decrypt / The Block RSS. No headlines were invented.'
+          : '**GTCO** last ₦46.20 as-of mock tape. Advice only — not an order.';
       } else if (lower.includes('moving') || lower.includes('quote')) {
         toolTrace = [{ name: 'list_universe_quotes', ok: true, summary: '2 quotes' }];
-        summary = 'GTCO ₦46.20 (+1.2% as-of mock). MTNN ₦225.00. Figures are mock store data.';
+        summary =
+          'Tape (mock — not an edge).\n\n| Symbol | Last | Change | As-of |\n| --- | --- | --- | --- |\n| **GTCO** | ₦46.20 | +1.2% | mock |\n| **MTNN** | ₦225.00 | — | mock |';
       } else if (lower.includes('history') || lower.includes('doing')) {
         toolTrace = [{ name: 'get_price_history', ok: true, summary: 'GTCO' }];
         summary = 'GTCO recent closes come from the mock book, not a live Pulse call.';
+      } else if (/\blesson|burned|dream rule|closed lot/.test(lower)) {
+        toolTrace = [
+          { name: 'get_trade_lessons', ok: true, summary: 'ok' },
+          { name: 'get_dream_rules', ok: true, summary: 'ok' },
+        ];
+        summary =
+          'Closed lots are pattern evidence only — not a ticker blacklist and not a minConfidence knob. A chase_reversal close is a same-name caution.';
+      } else if (/\bcash\b|\baccount\b|\bholdings\b|\bequity\b/.test(lower)) {
+        toolTrace = [{ name: 'get_account_snapshot', ok: true, summary: 'ok' }];
+        summary =
+          'Venue wealth, sandbox, stocks, cryptoSession=disconnected, as-of mock. Spendable uses live cash when a live book exists.';
+      } else if (/last cycle|what did you do/.test(lower)) {
+        toolTrace = [{ name: 'get_last_cycle', ok: true, summary: 'ok' }];
+        summary = 'Last cycle (mock): empty signals array is valid. That is not a failure.';
+      } else if (/\bhome\b/.test(lower) && /\bbuy\b/.test(lower)) {
+        toolTrace = [{ name: 'propose_trade', ok: false, summary: 'chase_reversal same-name refuse' }];
+        summary =
+          'Refusing a BUY preview on HOME: chase_reversal close in the last 12 lots. Same-name caution, not a sector blacklist.';
       } else if (/\bbuy\b|\bsell\b/.test(lower)) {
         toolTrace = [{ name: 'propose_trade', ok: true, summary: 'proposal (not placed)' }];
         trade = {
