@@ -5,7 +5,6 @@ import AuthBridgeSessionAlerts from './components/AuthBridgeSessionAlerts';
 import ErrorBoundary from './components/ErrorBoundary';
 import SplashScreen from './components/SplashScreen';
 import { api, isTauri, type AppSettings } from './lib/api';
-import { hideNativeSplash } from './lib/native-splash';
 import { SessionContext } from './lib/session';
 import { ToastProvider } from './lib/toast';
 import { CycleProvider } from './lib/cycle';
@@ -150,10 +149,6 @@ function AppRoutes() {
 
 export default function App() {
   const browserMode = typeof window !== 'undefined' && !isTauri();
-
-  useEffect(() => {
-    hideNativeSplash();
-  }, []);
 
   return (
     <HashRouter>

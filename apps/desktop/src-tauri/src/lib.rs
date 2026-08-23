@@ -255,11 +255,13 @@ pub fn run() {
             let state = AppState::new(db, worker_path, node_bin);
             app.manage(state.clone());
             app.manage(crate::auth_bridge::AuthBridge::new());
-            crate::auth_bridge::start_expiry_watcher(app.handle().clone());
 
-            scheduler::start_scheduler(app.handle().clone(), state.clone());
-            dream::start_dream_scheduler(app.handle().clone(), state.clone());
-            risk_monitor::start_risk_monitor(app.handle().clone(), state);
+            // Paint before any Keychain or scheduler work. Background ticks may
+            // still read auth-bridge Keychain, but only after setup() returns.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
 
             // Keychain after the window can paint. get_secret() still lazy-loads.
             tauri::async_runtime::spawn(async move {
@@ -275,10 +277,10 @@ pub fn run() {
                 }
             });
 
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            crate::auth_bridge::start_expiry_watcher(app.handle().clone());
+            scheduler::start_scheduler(app.handle().clone(), state.clone());
+            dream::start_dream_scheduler(app.handle().clone(), state.clone());
+            risk_monitor::start_risk_monitor(app.handle().clone(), state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
