@@ -440,6 +440,20 @@ impl SignalGenerationService {
         if let Some(obj) = context.as_object_mut() {
             obj.insert("retrievedMemories".into(), json!(retrieved));
         }
+        let mut news_warning: Option<String> = None;
+        if venue.eq_ignore_ascii_case("busha") {
+            let mut focus: Vec<String> = held_symbols.iter().cloned().collect();
+            focus.sort();
+            let bundle = crate::news::fetch_crypto_desk(&focus).await;
+            if let Some(obj) = context.as_object_mut() {
+                obj.insert("news".into(), crate::news::headlines_json(&bundle));
+            }
+            if bundle.unavailable {
+                news_warning = Some(
+                    "crypto news RSS unavailable — cycle continues without headlines.".into(),
+                );
+            }
+        }
         let _ = memory::backfill_missing_embeddings(db, settings, &api_key).await;
 
         let result = agent.portfolio_signals(settings, context, db).await?;
@@ -455,6 +469,9 @@ impl SignalGenerationService {
         let model_name = result.get("modelName").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
         let mut gen_warnings: Vec<String> = Vec::new();
+        if let Some(w) = news_warning {
+            gen_warnings.push(w);
+        }
         if let Some(reason) = capacity.capital_reason {
             tracing::info!(target: "signals", reason, "capital-constrained");
             gen_warnings.push(format!("capital-constrained: {reason}"));
