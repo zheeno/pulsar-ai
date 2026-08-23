@@ -16,7 +16,7 @@ use tokio::time::MissedTickBehavior;
 use crate::app_state::{AppState, CycleGateGuard};
 use crate::calendar::TradingCalendar;
 use crate::memory;
-use crate::outcomes::{classify_close, close_caution, hold_hours_as_of, signal_model};
+use crate::outcomes::{classify_close, hold_hours_as_of, signal_model};
 use crate::settings::{get_settings, set_setting};
 
 pub const MIN_CLOSES: usize = 12;
@@ -110,10 +110,37 @@ pub fn set_last_dream_at(conn: &Connection, at: DateTime<Utc>) -> Result<()> {
     set_setting(conn, DREAM_LAST_AT_KEY, &at.to_rfc3339())
 }
 
+/// Only loss-side patterns become standing rules. Winners/TPs are not a buy-more loop.
+fn is_dreamable_pattern(pattern: &str) -> bool {
+    matches!(
+        pattern,
+        "chase_reversal" | "stop_loss" | "time_stop" | "loser"
+    )
+}
+
+/// Pattern-only copy. No “this name” / “similar name” that the model can join to tradeLessons.
+fn dream_caution(pattern: &str) -> &'static str {
+    match pattern {
+        "chase_reversal" => {
+            "Do not buy a name already green on the day / mid-RSI just above SMA, then dump on the first dip. One-day % is not an edge."
+        }
+        "stop_loss" => {
+            "Hard stops have repeated. Do not re-enter the same setup until the thesis is new."
+        }
+        "time_stop" => {
+            "Time-stops have recycled stale or losing lots. Do not immediately redeploy into a similar setup."
+        }
+        "loser" => {
+            "Repeated closed losses of the same pattern. One result is not a standing rule and is not a symbol ban."
+        }
+        _ => "Standing caution for NEW buys. This is not a ticker ban.",
+    }
+}
+
 fn dream_rule_text(pattern: &str, n: usize, lookback: usize) -> String {
     format!(
         "DREAM rule pattern={pattern} n={n} lookback={lookback}. Standing caution for NEW buys: {caution} This is not a ticker blacklist. Do not raise minConfidence. Do not treat this as a sell-now order.",
-        caution = close_caution(pattern),
+        caution = dream_caution(pattern),
     )
 }
 
@@ -198,7 +225,7 @@ pub fn consolidate(conn: &Connection) -> Result<DreamReport> {
     let lookback = closes.len();
     let qualified: BTreeSet<String> = counts
         .iter()
-        .filter(|(_, n)| **n >= MIN_PATTERN_N)
+        .filter(|(p, n)| **n >= MIN_PATTERN_N && is_dreamable_pattern(p))
         .map(|(p, _)| p.clone())
         .collect();
 
@@ -267,7 +294,7 @@ pub fn desk_dream_rules(conn: &Connection) -> Result<Vec<serde_json::Value>> {
         out.push(serde_json::json!({
             "pattern": pattern,
             "n": n,
-            "caution": close_caution(&pattern),
+            "caution": dream_caution(&pattern),
             "text": text,
             "reviewedAt": created,
         }));
@@ -522,6 +549,8 @@ mod tests {
         assert!(texts[0].contains("n=3"));
         assert!(texts[0].contains("not a ticker blacklist"));
         assert!(texts[0].contains("Do not raise minConfidence"));
+        assert!(!texts[0].to_ascii_lowercase().contains("this name"));
+        assert!(!texts[0].to_ascii_lowercase().contains("similar name"));
         assert!(!texts[0].contains("HOME"));
         assert!(!texts[0].contains("ATOM"));
         let after_lessons: i64 = conn
@@ -532,6 +561,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(before_lessons, after_lessons);
+    }
+
+    #[test]
+    fn three_take_profits_do_not_write_a_buy_more_rule() {
+        let conn = setup();
+        for i in 0..3 {
+            insert_close(
+                &conn,
+                &format!("tp{i}"),
+                "WIN",
+                0.10,
+                &format!("2026-08-01T12:{i:02}:00Z"),
+                &format!("2026-07-31T12:{i:02}:00Z"),
+                "rules:take-profit",
+            );
+        }
+        for i in 0..9 {
+            insert_close(
+                &conn,
+                &format!("w{i}"),
+                &format!("W{i}"),
+                0.04,
+                &format!("2026-08-02T12:{i:02}:00Z"),
+                &format!("2026-08-01T12:{i:02}:00Z"),
+                "llm",
+            );
+        }
+        let report = consolidate(&conn).unwrap();
+        assert!(report.skipped.is_none());
+        assert_eq!(report.wrote, 0);
+        assert!(dream_texts(&conn).is_empty());
+    }
+
+    #[test]
+    fn consolidate_does_not_evict_lesson_rows_at_cap() {
+        let conn = setup();
+        seed_chase_book(&conn, 3, 12);
+        for i in 0..memory::MEMORY_CAP {
+            conn.execute(
+                "INSERT INTO agent_memories (id, kind, symbol, text, source, created_at, updated_at)
+                 VALUES (?1, 'symbol_lesson', 'X', ?2, 'trade_outcome', datetime('now'), datetime('now'))",
+                rusqlite::params![format!("m{i}"), format!("LESSON close pad {i}")],
+            )
+            .unwrap();
+        }
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_memories WHERE source = 'trade_outcome'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let report = consolidate(&conn).unwrap();
+        assert_eq!(report.wrote, 1);
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_memories WHERE source = 'trade_outcome'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after, memory::MEMORY_CAP as i64);
     }
 
     #[test]

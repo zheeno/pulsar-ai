@@ -172,7 +172,7 @@ pub fn evict_over_cap(conn: &Connection) -> Result<()> {
         conn.execute(
             "DELETE FROM agent_memories WHERE rowid IN (
                 SELECT rowid FROM agent_memories
-                WHERE source != 'dream_consolidate'
+                WHERE source NOT IN ('dream_consolidate', 'trade_outcome')
                 ORDER BY created_at ASC, rowid ASC LIMIT ?1
              )",
             [extra],
