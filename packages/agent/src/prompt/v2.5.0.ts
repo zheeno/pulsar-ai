@@ -45,6 +45,7 @@ export function buildPortfolioSignalPrompt(context: Record<string, unknown>): st
     estimatedFeePct: context.estimatedFeePct ?? 0,
     symbolMemory: context.symbolMemory ?? {},
     retrievedMemories: context.retrievedMemories ?? [],
+    news: context.news ?? { status: 'absent', headlines: [] },
   };
 
   const buyRules = buysDisabled
@@ -58,7 +59,9 @@ ${minOrderNotional > 0 ? `- Broker minimum is ₦${minOrderNotional} per order. 
 - At most ${maxBuysPerSector} BUYs per UNIVERSE sec code
 - Prefer names that do not further concentrate heldSectorCounts=${JSON.stringify(heldSectorCounts)} or recent symbolMemory when data supports it
 - Higher confidence receives a larger share of the cycle cash budget at execution; you do not choose quantities
-- Do not buy a name solely because it is today's largest gainer. One-day % is not an edge. Prefer liquid names with a stated thesis from the table (trend, RSI, volume), not a green tape print`;
+- Do not buy a name solely because it is today's largest gainer. One-day % is not an edge. Prefer liquid names with a stated thesis from the table (trend, RSI, volume), not a green tape print
+${isCrypto ? `- news.headlines are CoinDesk / Decrypt / The Block RSS items: title plus a short lede, not the full article. Delayed, incomplete, already in the tape. Do not BUY because a headline is bullish. Do not invent missing body text. If news.status is unavailable/empty/absent, proceed without news
+- A headline may support a discretionary SELL of a held name only with a matching adverse price move. Headline-only sells are not allowed` : ''}`;
 
   return `You are a ${desk} portfolio trading analyst. Scan HELD names first, then the FULL universe table (${universeSize} names).
 
