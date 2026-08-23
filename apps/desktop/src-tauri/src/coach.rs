@@ -288,11 +288,21 @@ fn dispatch(
             "ok": false,
             "error": "use memory_search via host",
         })),
-        "get_news" => Ok(json!({
-            "ok": false,
-            "unavailable": true,
-            "error": "NGX news is not wired in this build. No headlines were invented.",
-        })),
+        "get_news" => {
+            if crate::broker::crypto_mode() {
+                let symbol = arg_str(args, "symbol");
+                let query = arg_str(args, "query");
+                Ok(crate::runtime_util::block_on_local(
+                    crate::news::coach_crypto_news(symbol.as_deref(), query.as_deref()),
+                ))
+            } else {
+                Ok(json!({
+                    "ok": false,
+                    "unavailable": true,
+                    "error": "NGX news is not wired in this build. No headlines were invented.",
+                }))
+            }
+        }
         "run_symbol_screen" => Ok(run_symbol_screen(conn, args)?),
         "explain_blocked_reason" => {
             let Some(symbol) = arg_str(args, "symbol") else {

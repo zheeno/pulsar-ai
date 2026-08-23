@@ -18,6 +18,7 @@ mod intents;
 mod launch_at_login;
 mod memory;
 mod net_policy;
+mod news;
 mod ngx;
 mod outcomes;
 mod portfolio;
