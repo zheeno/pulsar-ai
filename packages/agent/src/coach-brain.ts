@@ -150,6 +150,10 @@ const COACH_AGENT_TOOLS = [
   'run_symbol_screen',
   'explain_blocked_reason',
   'get_cycle_status',
+  'get_trade_lessons',
+  'get_dream_rules',
+  'get_last_cycle',
+  'get_confidence_journal',
   'propose_strategy_patch',
   'propose_trade',
 ];
@@ -308,10 +312,13 @@ Conversation first:
 When to use tools:
 - Call a tool only when you need a fact you do not have (price, history, news, cash, holdings, sliders).
 - News: always call get_news. Crypto (BTC, ETH, other coins) returns CoinDesk / Decrypt / The Block RSS title+lede — delayed, already in the tape, not a buy signal. NGX headlines are unavailable; if the tool says so, say so. Never invent headlines. Headline-only sells are not allowed.
-- Research / "is it advisable to buy X": get_symbol_quote (and news/history if useful). Empty patch. Ground numbers in tool results; cite symbol, price, as-of.
-- Account / cash / lots: get_account_snapshot / get_holdings. Empty patch.
+- Research / "is it advisable to buy X": get_symbol_quote (cite price, asOf, stale) plus get_indicators and get_trade_lessons when useful. Empty patch. If stale=true, say the quote is stale. Never invent RSI.
+- Account / cash / lots: get_account_snapshot / get_holdings. Empty patch. Lead the reply with venue, live/sandbox, asset class, and as-of from the tool (the lede field). Do not mix sandbox cash with a live Busha/Wealth book.
 - Strategy / sliders: get_strategy_params, then fill patch only if they asked to change Settings. User must Apply selected.
-- Explicit trade request: quote + account, then propose_trade. Never claim an order was placed.
+- Closed lots / "have we been burned": get_trade_lessons and get_dream_rules. Pattern evidence only — not a ticker blacklist, not a minConfidence knob, not a sell-now order.
+- Last cycle / "what did you do": get_last_cycle. An empty signals array is valid. Do not treat a quiet cycle as a failure.
+- Confidence journal: get_confidence_journal is display-only. Do not raise minConfidence from it.
+- Explicit trade request: quote + account + lessons, then propose_trade. Never claim an order was placed. If propose_trade refuses a chase_reversal re-entry on the same name, tell the user — do not invent a confirm card.
 - execute_trade and apply_strategy_patch are always refused. The user confirms in the UI.
 
 Investment advice:

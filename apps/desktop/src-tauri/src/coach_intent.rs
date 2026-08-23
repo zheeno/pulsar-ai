@@ -46,7 +46,7 @@ impl CoachIntent {
     }
 }
 
-pub const PERSONA_META: &str = "I'm Coach, Pulsar's NGX desk copilot. I can check the tape, a name's history, news when it's wired, help you tighten risk sliders, and propose trades. I won't silently place live orders, and I won't invent prices or headlines. What do you want to look at?";
+pub const PERSONA_META: &str = "I'm Coach, Pulsar's desk copilot for NGX equities and Busha crypto. I can check the tape, a name's history, crypto headlines from CoinDesk / Decrypt / The Block RSS, help you tighten risk sliders, and propose trades. NGX news is not wired — I won't invent it. I won't silently place live orders or invent prices. What do you want to look at?";
 pub const PERSONA_GREETING: &str = "Hey. Tape, a ticker, news, risk sliders, or a trade idea — your call.";
 pub const PERSONA_THANKS: &str = "Anytime. Ping me if you want the tape, a name, or a trade idea.";
 pub const PERSONA_BYE: &str = "See you. I'll be here when you want the next look.";
@@ -84,6 +84,10 @@ pub const COACH_AGENT_TOOLS: &[&str] = &[
     "run_symbol_screen",
     "explain_blocked_reason",
     "get_cycle_status",
+    "get_trade_lessons",
+    "get_dream_rules",
+    "get_last_cycle",
+    "get_confidence_journal",
     "propose_strategy_patch",
     "propose_trade",
 ];
@@ -492,6 +496,23 @@ mod tests {
             classify_coach_intent("buy 100 GTCO"),
             CoachIntentClass::Trade
         );
+    }
+
+    #[test]
+    fn persona_names_busha_and_coindesk_not_unwired_news() {
+        let reply = canned_social_reply(
+            &extract_coach_intent("who are you", &[]),
+            "who are you",
+        );
+        assert!(reply.contains("Busha"));
+        assert!(reply.contains("CoinDesk"));
+        assert!(reply.contains("NGX"));
+        assert!(!reply.to_lowercase().contains("news when it's wired"));
+        assert!(!reply.to_lowercase().contains("news when it is wired"));
+        assert!(COACH_AGENT_TOOLS.contains(&"get_trade_lessons"));
+        assert!(COACH_AGENT_TOOLS.contains(&"get_dream_rules"));
+        assert!(COACH_AGENT_TOOLS.contains(&"get_last_cycle"));
+        assert!(COACH_AGENT_TOOLS.contains(&"get_confidence_journal"));
     }
 
     #[test]

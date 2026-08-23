@@ -151,6 +151,21 @@ test('classifier remains a hint, not a tool gate', () => {
   assert.match(buildCoachSystemPrompt({ conversation: { message: 'hi' } }), /Prompt version:/);
 });
 
+test('v4.1.0 prompt covers desk tools, lede, and no minConfidence knob', () => {
+  const prompt = systemPrompt('have we been burned on HOME?');
+  assert.match(prompt, /get_trade_lessons/);
+  assert.match(prompt, /get_dream_rules/);
+  assert.match(prompt, /get_last_cycle/);
+  assert.match(prompt, /get_confidence_journal/);
+  assert.match(prompt, /lede/);
+  assert.match(prompt, /Do not raise minConfidence/);
+  assert.match(prompt, /empty signals array is valid/i);
+  assert.match(prompt, /chase_reversal/);
+  assert.match(prompt, /v4\.1\.0/);
+  assert.ok(allowedTools('research').includes('get_trade_lessons'));
+  assert.ok(allowedTools('account').includes('get_last_cycle'));
+});
+
 test('parseCoachOutput accepts JSON and plain conversational replies', () => {
   const json = parseCoachOutput(
     '{"summary":"Hey there.","patch":{},"needMoreContext":false,"clarifyingQuestions":[],"rationale":{},"warnings":[]}',

@@ -845,6 +845,24 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       } else if (lower.includes('history') || lower.includes('doing')) {
         toolTrace = [{ name: 'get_price_history', ok: true, summary: 'GTCO' }];
         summary = 'GTCO recent closes come from the mock book, not a live Pulse call.';
+      } else if (/\blesson|burned|dream rule|closed lot/.test(lower)) {
+        toolTrace = [
+          { name: 'get_trade_lessons', ok: true, summary: 'ok' },
+          { name: 'get_dream_rules', ok: true, summary: 'ok' },
+        ];
+        summary =
+          'Closed lots are pattern evidence only — not a ticker blacklist and not a minConfidence knob. A chase_reversal close is a same-name caution.';
+      } else if (/\bcash\b|\baccount\b|\bholdings\b|\bequity\b/.test(lower)) {
+        toolTrace = [{ name: 'get_account_snapshot', ok: true, summary: 'ok' }];
+        summary =
+          'Venue wealth, sandbox, stocks, cryptoSession=disconnected, as-of mock. Spendable uses live cash when a live book exists.';
+      } else if (/last cycle|what did you do/.test(lower)) {
+        toolTrace = [{ name: 'get_last_cycle', ok: true, summary: 'ok' }];
+        summary = 'Last cycle (mock): empty signals array is valid. That is not a failure.';
+      } else if (/\bhome\b/.test(lower) && /\bbuy\b/.test(lower)) {
+        toolTrace = [{ name: 'propose_trade', ok: false, summary: 'chase_reversal same-name refuse' }];
+        summary =
+          'Refusing a BUY preview on HOME: chase_reversal close in the last 12 lots. Same-name caution, not a sector blacklist.';
       } else if (/\bbuy\b|\bsell\b/.test(lower)) {
         toolTrace = [{ name: 'propose_trade', ok: true, summary: 'proposal (not placed)' }];
         trade = {
