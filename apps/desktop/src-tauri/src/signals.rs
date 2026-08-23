@@ -9,7 +9,7 @@ use crate::memory;
 use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
-const PORTFOLIO_PROMPT_VERSION: &str = "v2.5.0";
+const PORTFOLIO_PROMPT_VERSION: &str = "v2.5.2";
 const PROMPT_VERSION: &str = "v1.0.0";
 /// Hard ceiling on LLM BUY+SELL ideas per cycle (further capped by trade capacity).
 const LLM_SIGNAL_CAP: usize = 40;
@@ -360,6 +360,7 @@ impl SignalGenerationService {
             "marketContext": market_context,
             "maxActions": capacity.max_actions as i64,
             "symbolMemory": symbol_memory,
+            "tradeLessons": crate::outcomes::desk_lessons(conn, Some(&venue), 12).unwrap_or_default(),
             "cashBalance": cash,
             "brokerageBalance": if venue != "sandbox" { Some(cash) } else { None::<f64> },
             "tradingVenue": venue,
@@ -429,7 +430,9 @@ impl SignalGenerationService {
             .get("universeTsv")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let mem_query = format!("holdings {held_q}");
+        let mut sold_for_mem: Vec<String> = recently_sold.iter().cloned().collect();
+        sold_for_mem.sort();
+        let mem_query = crate::outcomes::memory_search_query(&held_q, &sold_for_mem);
         let retrieved = memory::search_memories(db, settings, &api_key, &mem_query, None, Some(8))
             .await
             .unwrap_or_default();
