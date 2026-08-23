@@ -155,7 +155,7 @@ function draftFromStrategy(s: StrategyRecord): StrategyDraft {
     maxDailyDrawdownPct: toPct(s.max_daily_drawdown_pct, 1, 100),
     stopLossPct: toPct(s.stop_loss_pct, 1, 25),
     takeProfitPct: toPct(s.take_profit_pct ?? 0.1, 2, 40),
-    timeStopHours: clamp(Math.round(s.time_stop_hours ?? 24), 0, 168),
+    timeStopHours: clamp(Math.round(s.time_stop_hours ?? 0), 0, 168),
     partialTpPct: clamp(Math.round((s.partial_tp_fraction ?? 1) * 100), 10, 100),
   };
 }
@@ -1222,7 +1222,7 @@ export default function SettingsPage() {
           <ParamSlider
             id={timeStopId}
             label="Time-stop"
-            hint="If a holding is still in-band (neither SL nor TP) after this many hours, sell the lot to recycle cash under the broker minimum. 0 hours turns time-stop off. Does not flatten on drawdown."
+            hint="Sell a losing or flat lot after this many hours. In-band winners are left for take-profit. 0 hours turns the NGX clock off; Busha still uses a 72h fallback when this is 0. Does not flatten on drawdown."
             value={strategyDraft.timeStopHours}
             min={0}
             max={168}

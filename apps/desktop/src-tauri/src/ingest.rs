@@ -65,12 +65,12 @@ impl IngestionService {
     }
 
     pub async fn ingest_indices(
-        conn: &Connection,
+        db: &Database,
         client: &NgxPulseClient,
         calendar: &TradingCalendar,
         force: bool,
     ) -> Result<()> {
-        if !force && !calendar.is_trading_day(None) {
+        if !force && crate::runtime_util::enforce_market_hours() && !calendar.is_trading_day(None) {
             return Ok(());
         }
         let indices = match client.get_indices().await {
@@ -78,23 +78,30 @@ impl IngestionService {
             Err(_) => return Ok(()),
         };
         let trade_date = calendar.today_wat();
-        for idx in indices {
-            conn.execute(
-                "INSERT INTO index_history (index_code, trade_date, value, points, week_change, month_change, year_change)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(index_code, trade_date) DO UPDATE SET value = excluded.value",
-                rusqlite::params![
-                    idx.code,
-                    trade_date,
-                    idx.value,
-                    idx.points,
-                    idx.week_change,
-                    idx.month_change,
-                    idx.year_change
-                ],
-            )?;
-        }
-        Ok(())
+        db.with_conn(|conn| {
+            for idx in &indices {
+                conn.execute(
+                    "INSERT INTO index_history (index_code, trade_date, value, points, week_change, month_change, year_change)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(index_code, trade_date) DO UPDATE SET
+                        value = excluded.value,
+                        points = excluded.points,
+                        week_change = excluded.week_change,
+                        month_change = excluded.month_change,
+                        year_change = excluded.year_change",
+                    rusqlite::params![
+                        idx.code,
+                        trade_date,
+                        idx.value,
+                        idx.points,
+                        idx.week_change,
+                        idx.month_change,
+                        idx.year_change
+                    ],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub async fn backfill_symbols(

@@ -144,7 +144,7 @@ pub fn confidence_journal(conn: &Connection) -> Result<Vec<serde_json::Value>> {
               ELSE '0.85–1.00'
             END AS bucket,
             COUNT(*) AS n,
-            AVG(CASE WHEN COALESCE(horizon_return_pct, 0) > 0 THEN 1.0 ELSE 0.0 END) AS hit_rate,
+            AVG(CASE WHEN COALESCE(pnl, 0) > 0 THEN 1.0 ELSE 0.0 END) AS hit_rate,
             AVG(pnl) AS avg_pnl,
             AVG(horizon_return_pct) AS avg_return
          FROM signal_outcomes

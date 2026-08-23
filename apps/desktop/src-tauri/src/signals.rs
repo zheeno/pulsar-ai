@@ -9,13 +9,13 @@ use crate::memory;
 use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
-const PORTFOLIO_PROMPT_VERSION: &str = "v2.4.0";
+const PORTFOLIO_PROMPT_VERSION: &str = "v2.5.0";
 const PROMPT_VERSION: &str = "v1.0.0";
 /// Hard ceiling on LLM BUY+SELL ideas per cycle (further capped by trade capacity).
 const LLM_SIGNAL_CAP: usize = 40;
-/// Soft target for BUY count when capacity allows (prompt + post-LLM backfill).
-const MIN_BUY_TARGET: usize = 8;
-/// Max accepted BUYs per sector code in pass A (pass B may relax to fill min target).
+/// No buy quota. Empty cycles are valid.
+const MIN_BUY_TARGET: usize = 0;
+/// Max accepted BUYs per sector code. Surplus names in the same sector are dropped.
 const MAX_BUYS_PER_SECTOR: usize = 3;
 /// Block BUY re-entry after an executed SELL within this window.
 const BUY_REENTRY_COOLDOWN_HOURS: i64 = 6;
@@ -95,7 +95,7 @@ impl SignalGenerationService {
         live_holdings: Option<&[HeldLot]>,
     ) -> Result<PortfolioGeneration> {
         let live_holdings_owned = live_holdings.map(|h| h.to_vec());
-        let settings_fee = settings.simulated_fee_pct;
+        let settings_fee = crate::settings::fee_pct_for_venue(settings, trading_venue);
         let venue = trading_venue.to_string();
         let pid = portfolio_id.map(|s| s.to_string());
         let prep = db.with_conn(|conn| -> Result<Option<_>> {
@@ -129,9 +129,16 @@ impl SignalGenerationService {
             venue.eq_ignore_ascii_case("busha"),
         )?;
         universe_rows.retain(|row| {
+            let held = held_symbols.contains(&row.symbol.to_uppercase());
             keep_unheld_for_llm(
-                held_symbols.contains(&row.symbol.to_uppercase()),
-                IndicatorService::is_overbought(conn, &row.symbol).unwrap_or(false),
+                held,
+                row_is_tradable_candidate(
+                    conn,
+                    &row.symbol,
+                    held,
+                    row.volume,
+                    venue.eq_ignore_ascii_case("busha"),
+                ),
             )
         });
         if universe_rows.is_empty() {
@@ -164,7 +171,7 @@ impl SignalGenerationService {
             (cash - pending).max(0.0)
         };
 
-        let universe_tsv = Self::encode_universe_tsv(&universe_rows);
+        let universe_tsv = Self::encode_universe_tsv(conn, &universe_rows);
         let universe_size = universe_rows.len();
         let valid_symbols: std::collections::HashSet<String> = universe_rows
             .iter()
@@ -198,7 +205,10 @@ impl SignalGenerationService {
                 crate::risk_exits::ExitParams {
                     stop_loss_pct: param_set.stop_loss_pct,
                     take_profit_pct: param_set.take_profit_pct,
-                    time_stop_hours: param_set.time_stop_hours,
+                    time_stop_hours: crate::risk_exits::effective_time_stop_hours(
+                        &venue,
+                        param_set.time_stop_hours,
+                    ),
                     partial_tp_fraction: param_set.partial_tp_fraction,
                 },
                 lot.hours_held(),
@@ -230,6 +240,7 @@ impl SignalGenerationService {
                     &exit.rationale,
                     exit.confidence,
                     exit.sell_fraction,
+                    &venue,
                 )? {
                     signal_ids.push(id);
                 }
@@ -280,10 +291,17 @@ impl SignalGenerationService {
         let risk_params = param_set.to_param_set();
 
         let min_n = crate::execution::min_order_notional_for_venue(&venue);
-        let remaining_budget = crate::execution::remaining_buy_budget(
+        let spent_today = if venue == "sandbox" {
+            crate::execution::todays_sandbox_buy_notional(conn).unwrap_or(0.0)
+        } else {
+            crate::execution::todays_buy_notional(conn, &venue).unwrap_or(0.0)
+        };
+        let buys_today = crate::execution::todays_buy_count(conn, &venue).unwrap_or(0);
+        let remaining_budget = crate::execution::remaining_session_buy_budget(
             spendable,
             param_set.cycle_budget_pct,
             min_n,
+            spent_today,
         );
         let capacity = compute_trade_capacity(
             &param_set,
@@ -300,9 +318,9 @@ impl SignalGenerationService {
             remaining_budget,
             settings.halt_new_buys,
             crate::broker::whole_shares_for_venue(&venue),
+            buys_today,
         );
 
-        let min_buy_signals = MIN_BUY_TARGET.min(capacity.max_buy_signals);
         let mut recently_sold_list: Vec<String> = recently_sold.iter().cloned().collect();
         recently_sold_list.sort();
         let context = json!({
@@ -332,7 +350,7 @@ impl SignalGenerationService {
                 "assetClass": if venue.eq_ignore_ascii_case("busha") { "crypto" } else { "stocks" },
             },
             "diversification": {
-                "minBuySignals": min_buy_signals,
+                "minBuySignals": 0,
                 "maxBuysPerSector": MAX_BUYS_PER_SECTOR,
                 "heldSectorCounts": held_sector_counts,
                 "buyReentryCooldownHours": BUY_REENTRY_COOLDOWN_HOURS,
@@ -356,7 +374,6 @@ impl SignalGenerationService {
             universe_size,
             capacity,
             symbol_sectors,
-            min_buy_signals,
             recently_sold,
             queued_buy_symbols,
         )))
@@ -370,7 +387,6 @@ impl SignalGenerationService {
             universe_size,
             capacity,
             symbol_sectors,
-            min_buy_signals,
             recently_sold,
             queued_buy_symbols,
         )) = prep
@@ -413,8 +429,7 @@ impl SignalGenerationService {
             .get("universeTsv")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let movers: String = tsv.lines().take(20).collect::<Vec<_>>().join(" ");
-        let mem_query = format!("holdings {held_q} {movers}");
+        let mem_query = format!("holdings {held_q}");
         let retrieved = memory::search_memories(db, settings, &api_key, &mem_query, None, Some(8))
             .await
             .unwrap_or_default();
@@ -551,7 +566,6 @@ impl SignalGenerationService {
             let (accept_idx, dropped_sector) = plan_buy_accept_indices(
                 &candidate_keys,
                 buy_cap,
-                min_buy_signals,
                 MAX_BUYS_PER_SECTOR,
             );
             for i in accept_idx {
@@ -748,6 +762,7 @@ impl SignalGenerationService {
         rationale: &str,
         confidence: f64,
         sell_fraction: f64,
+        venue: &str,
     ) -> Result<Option<String>> {
         let pick = json!({
             "action": "SELL",
@@ -763,7 +778,7 @@ impl SignalGenerationService {
             model_name,
             PORTFOLIO_PROMPT_VERSION,
             false,
-            if crate::broker::crypto_mode() { "busha" } else { "sandbox" },
+            venue,
         )?;
         if let Some(ref sid) = id {
             let snap = json!({ "sellFraction": sell_fraction.clamp(0.1, 1.0) });
@@ -790,7 +805,7 @@ impl SignalGenerationService {
                 position_size_pct: row.get(6)?,
                 cycle_budget_pct: row.get(7)?,
                 max_daily_drawdown_pct: row.get(8)?,
-                time_stop_hours: row.get::<_, Option<f64>>(9)?.unwrap_or(24.0),
+                time_stop_hours: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                 partial_tp_fraction: row.get::<_, Option<f64>>(10)?.unwrap_or(1.0),
             })
         };
@@ -870,20 +885,33 @@ impl SignalGenerationService {
         Ok(shape_universe_for_llm(out, held_symbols, recent_symbols))
     }
 
-    fn encode_universe_tsv(rows: &[UniverseRow]) -> String {
-        let mut out = String::from("SYM\tpx\tpct\tvol\tsec\n");
+    fn encode_universe_tsv(conn: &Connection, rows: &[UniverseRow]) -> String {
+        let mut out = String::from("SYM\tpx\tpct\tvol\tsec\trsi\tsma50\tsma200\tmom\tvolx\n");
         for row in rows {
             let px = row.price.unwrap_or(0.0);
             let pct = row.change_percent.unwrap_or(0.0);
             let vol = row.volume.unwrap_or(0);
             let sec = sector_code(row.sector.as_deref());
+            let tech = IndicatorService::compute(conn, &row.symbol)
+                .ok()
+                .flatten();
+            let rsi = tech.as_ref().and_then(|t| t.rsi14);
+            let sma50 = tech.as_ref().and_then(|t| t.sma50);
+            let sma200 = tech.as_ref().and_then(|t| t.sma200);
+            let mom = tech.as_ref().and_then(|t| t.momentum);
+            let volx = tech.as_ref().and_then(|t| t.volume_anomaly);
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 row.symbol,
                 compact_num(px),
                 compact_num(pct),
                 compact_vol(vol),
-                sec
+                sec,
+                opt_num(rsi),
+                opt_num(sma50),
+                opt_num(sma200),
+                opt_num(mom),
+                opt_num(volx),
             ));
         }
         out
@@ -901,9 +929,7 @@ impl SignalGenerationService {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT p.symbol, p.quantity, p.avg_cost,
-                    (SELECT MIN(t.executed_at) FROM sandbox_trades t
-                      WHERE t.portfolio_id = p.portfolio_id AND t.symbol = p.symbol AND t.side = 'BUY')
+            "SELECT p.symbol, p.quantity, p.avg_cost
              FROM sandbox_positions p WHERE p.portfolio_id = ?1 AND p.quantity > 0",
         )?;
         let rows = stmt.query_map([&pid], |row| {
@@ -912,10 +938,14 @@ impl SignalGenerationService {
                 quantity: row.get(1)?,
                 avg_cost: row.get(2)?,
                 last_price: None,
-                opened_at: row.get(3)?,
+                opened_at: None,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut lots: Vec<HeldLot> = rows.filter_map(|r| r.ok()).collect();
+        for lot in &mut lots {
+            lot.opened_at = current_lot_opened_at_sandbox(conn, &pid, &lot.symbol);
+        }
+        Ok(lots)
     }
 
     pub(crate) fn attach_live_opened_at(conn: &Connection, lots: &mut [HeldLot]) {
@@ -923,16 +953,7 @@ impl SignalGenerationService {
             if lot.opened_at.is_some() {
                 continue;
             }
-            lot.opened_at = conn
-                .query_row(
-                    "SELECT MIN(created_at) FROM broker_orders
-                     WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY'
-                       AND LOWER(status) IN ('executed', 'filled')",
-                    [&lot.symbol],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .ok()
-                .flatten();
+            lot.opened_at = current_lot_opened_at_broker(conn, &lot.symbol);
         }
     }
 
@@ -1206,6 +1227,7 @@ fn compute_trade_capacity(
     remaining_budget: f64,
     halt_new_buys: bool,
     whole_shares: bool,
+    buys_today: i64,
 ) -> TradeCapacity {
     let drawdown_ok = daily_drawdown < param_set.max_daily_drawdown_pct;
     let capital_reason =
@@ -1234,14 +1256,22 @@ fn compute_trade_capacity(
             }
         })
     };
-    let buy_allowed =
-        drawdown_ok && can_afford && cash > 0.0 && capital_reason.is_none() && !halt_new_buys;
+    let daily_trades_ok = buys_today < param_set.max_daily_trades;
+    let buy_allowed = drawdown_ok
+        && can_afford
+        && cash > 0.0
+        && capital_reason.is_none()
+        && !halt_new_buys
+        && daily_trades_ok;
     let sell_allowed = held_symbols.iter().any(|s| !seen.contains(s));
-    let max_buy_signals = if buy_allowed {
+    let daily_left = (param_set.max_daily_trades - buys_today.max(0)).max(0) as usize;
+    let max_buy_signals = if buy_allowed && daily_left > 0 {
         crate::execution::max_buys_for_min_notional(
             cycle_budget,
             min_order_notional,
-            crate::execution::MAX_SIGNAL_BUYS.min(LLM_SIGNAL_CAP),
+            crate::execution::MAX_SIGNAL_BUYS
+                .min(LLM_SIGNAL_CAP)
+                .min(daily_left),
         )
     } else {
         0
@@ -1264,6 +1294,8 @@ fn compute_trade_capacity(
         let mut reasons = Vec::new();
         if !drawdown_ok {
             reasons.push("daily drawdown limit");
+        } else if !daily_trades_ok {
+            reasons.push("daily buy count limit");
         } else if let Some(reason) = capital_reason {
             reasons.push(reason);
             } else if !can_afford {
@@ -1301,8 +1333,43 @@ fn compute_trade_capacity(
     }
 }
 
-fn keep_unheld_for_llm(held: bool, overbought: bool) -> bool {
-    held || !overbought
+fn keep_unheld_for_llm(held: bool, tradable: bool) -> bool {
+    held || tradable
+}
+
+/// NGX: last print volume must be positive. Busha `price_history.volume` is often 0/NULL.
+fn unheld_passes_liquidity(volume: Option<i64>, crypto: bool) -> bool {
+    crypto || volume.unwrap_or(0) > 0
+}
+
+/// NGX candidates need SMA50+RSI. Crypto SMA50 is often missing — RSI is enough.
+fn unheld_passes_indicators(sma50: Option<f64>, rsi14: Option<f64>, crypto: bool) -> bool {
+    match rsi14 {
+        None => false,
+        Some(r) if r > 70.0 => false,
+        Some(_) => crypto || sma50.is_some(),
+    }
+}
+
+/// Unheld BUY candidates must be liquid and have computable indicators. Missing data is fail-closed.
+fn row_is_tradable_candidate(
+    conn: &Connection,
+    symbol: &str,
+    held: bool,
+    volume: Option<i64>,
+    crypto: bool,
+) -> bool {
+    if held {
+        return true;
+    }
+    if !unheld_passes_liquidity(volume, crypto) {
+        return false;
+    }
+    let snap = IndicatorService::compute(conn, symbol).ok().flatten();
+    let Some(t) = snap else {
+        return false;
+    };
+    unheld_passes_indicators(t.sma50, t.rsi14, crypto)
 }
 
 pub fn list_recent_cycle_audits(conn: &Connection, limit: i64) -> Result<Vec<Value>> {
@@ -1427,6 +1494,78 @@ fn compact_num(n: f64) -> String {
     .to_string()
 }
 
+fn opt_num(n: Option<f64>) -> String {
+    n.map(compact_num).unwrap_or_else(|| "-".into())
+}
+
+fn current_lot_opened_at_sandbox(
+    conn: &Connection,
+    portfolio_id: &str,
+    symbol: &str,
+) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT side, quantity, executed_at FROM sandbox_trades
+             WHERE portfolio_id = ?1 AND UPPER(symbol) = UPPER(?2)
+             ORDER BY executed_at ASC, rowid ASC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![portfolio_id, symbol], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ok()?;
+    let trades: Vec<(String, f64, String)> = rows.filter_map(|r| r.ok()).collect();
+    current_lot_opened_at(&trades)
+}
+
+fn current_lot_opened_at_broker(conn: &Connection, symbol: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT side, quantity, created_at FROM broker_orders
+             WHERE UPPER(symbol) = UPPER(?1)
+               AND LOWER(status) IN ('executed', 'filled')
+             ORDER BY created_at ASC, rowid ASC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([symbol], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ok()?;
+    let trades: Vec<(String, f64, String)> = rows.filter_map(|r| r.ok()).collect();
+    current_lot_opened_at(&trades)
+}
+
+/// Age of the *current* open lot: first BUY after inventory last returned to zero.
+fn current_lot_opened_at(trades: &[(String, f64, String)]) -> Option<String> {
+    let mut qty = 0.0_f64;
+    let mut opened: Option<String> = None;
+    for (side, trade_qty, ts) in trades {
+        if side.eq_ignore_ascii_case("BUY") {
+            if qty <= 1e-12 {
+                opened = Some(ts.clone());
+            }
+            qty += *trade_qty;
+        } else if side.eq_ignore_ascii_case("SELL") {
+            qty -= *trade_qty;
+            if qty <= 1e-12 {
+                qty = 0.0;
+                opened = None;
+            }
+        }
+    }
+    opened
+}
+
 fn compact_vol(v: i64) -> String {
     if v >= 1_000_000 {
         format!("{:.1}e6", v as f64 / 1_000_000.0)
@@ -1437,15 +1576,14 @@ fn compact_vol(v: i64) -> String {
     }
 }
 
-/// Two-pass BUY index selection: sector cap first, then backfill to `min_buys`.
+/// Accept BUYs in order, honoring the per-sector cap. No backfill-to-quota.
 fn plan_buy_accept_indices(
     candidates: &[(String, String)],
     buy_cap: usize,
-    min_buys: usize,
     max_per_sector: usize,
 ) -> (Vec<usize>, usize) {
     let mut accepted: Vec<usize> = Vec::new();
-    let mut deferred: Vec<usize> = Vec::new();
+    let mut dropped_sector = 0usize;
     let mut sector_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
@@ -1455,20 +1593,9 @@ fn plan_buy_accept_indices(
         }
         let count = sector_counts.get(sec).copied().unwrap_or(0);
         if count >= max_per_sector {
-            deferred.push(i);
-            continue;
-        }
-        *sector_counts.entry(sec.clone()).or_insert(0) += 1;
-        accepted.push(i);
-    }
-
-    let mut dropped_sector = 0usize;
-    for i in deferred {
-        if accepted.len() >= buy_cap || accepted.len() >= min_buys {
             dropped_sector += 1;
             continue;
         }
-        let sec = &candidates[i].1;
         *sector_counts.entry(sec.clone()).or_insert(0) += 1;
         accepted.push(i);
     }
@@ -1490,14 +1617,11 @@ fn held_sector_counts_json(
     json!(counts)
 }
 
-fn mover_rank_key(row: &UniverseRow) -> (f64, i64) {
-    (
-        row.change_percent.unwrap_or(0.0).abs(),
-        row.volume.unwrap_or(0),
-    )
+fn liquidity_rank_key(row: &UniverseRow) -> i64 {
+    row.volume.unwrap_or(0)
 }
 
-/// Held first, then sector round-robin of movers (recent tickers soft-downranked within sector).
+/// Held first, then sector round-robin by liquidity (volume). Not ranked by |1-day %|.
 fn shape_universe_for_llm(
     rows: Vec<UniverseRow>,
     held_symbols: &std::collections::HashSet<String>,
@@ -1512,13 +1636,7 @@ fn shape_universe_for_llm(
             rest.push(row);
         }
     }
-    held_rows.sort_by(|a, b| {
-        let (ac, av) = mover_rank_key(a);
-        let (bc, bv) = mover_rank_key(b);
-        bc.partial_cmp(&ac)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| bv.cmp(&av))
-    });
+    held_rows.sort_by(|a, b| liquidity_rank_key(b).cmp(&liquidity_rank_key(a)));
 
     let mut by_sector: std::collections::BTreeMap<String, Vec<UniverseRow>> =
         std::collections::BTreeMap::new();
@@ -1530,14 +1648,9 @@ fn shape_universe_for_llm(
         queue.sort_by(|a, b| {
             let ar = recent_symbols.contains(&a.symbol.to_uppercase());
             let br = recent_symbols.contains(&b.symbol.to_uppercase());
-            // Non-recent first (false < true), then |pct| desc, volume desc.
-            ar.cmp(&br).then_with(|| {
-                let (ac, av) = mover_rank_key(a);
-                let (bc, bv) = mover_rank_key(b);
-                bc.partial_cmp(&ac)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| bv.cmp(&av))
-            })
+            // Non-recent first (false < true), then volume desc. Never |1-day %|.
+            ar.cmp(&br)
+                .then_with(|| liquidity_rank_key(b).cmp(&liquidity_rank_key(a)))
         });
     }
 
@@ -1639,6 +1752,9 @@ pub async fn run_cycle(
     if !crypto {
         if let Err(e) = crate::ingest::IngestionService::ingest_market(db, client, calendar, true).await {
             warnings.push(format!("Pulse market ingest failed: {e}"));
+        }
+        if let Err(e) = crate::ingest::IngestionService::ingest_indices(db, client, calendar, true).await {
+            warnings.push(format!("Pulse indices ingest failed: {e}"));
         }
     }
     let trading_mode = if let Some(session) = broker {
@@ -1812,7 +1928,7 @@ pub async fn run_cycle(
         }
     }
 
-    if !crypto && generated.universe_size > 0 && generated.universe_size <= 20 {
+        if !crypto && generated.universe_size > 0 && generated.universe_size <= 20 {
         warnings.push(format!(
             "Universe is only {} names (seed size). Pulse ingest may be incomplete.",
             generated.universe_size
@@ -1925,6 +2041,12 @@ mod tests {
     }
 
     #[test]
+    fn buy_quota_is_disabled() {
+        assert_eq!(MIN_BUY_TARGET, 0);
+        assert_eq!(crate::execution::MAX_SIGNAL_BUYS, 3);
+    }
+
+    #[test]
     fn llm_sell_kept_when_held() {
         assert!(llm_sell_is_held("GTCO", &held(&["GTCO", "DANGCEM"])));
     }
@@ -1991,12 +2113,12 @@ mod tests {
         ];
         let shaped = shape_universe_for_llm(rows, &held, &recent);
         assert_eq!(shaped[0].symbol, "HOLD1");
-        let top_movers: Vec<&str> = shaped.iter().skip(1).take(3).map(|r| r.symbol.as_str()).collect();
+        let top_liq: Vec<&str> = shaped.iter().skip(1).take(3).map(|r| r.symbol.as_str()).collect();
         // Round-robin across FIN, ICT, CG (BTreeMap key order: CG, FIN, ICT)
-        assert!(top_movers.contains(&"FIN_A"));
-        assert!(top_movers.contains(&"ICT_A"));
-        assert!(top_movers.contains(&"CG_A"));
-        assert!(!top_movers.contains(&"FIN_B"));
+        assert!(top_liq.contains(&"FIN_A"));
+        assert!(top_liq.contains(&"ICT_A"));
+        assert!(top_liq.contains(&"CG_A"));
+        assert!(!top_liq.contains(&"FIN_B"));
     }
 
     #[test]
@@ -2037,7 +2159,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_buy_accept_respects_sector_cap_then_backfills() {
+    fn plan_buy_accept_respects_sector_cap_without_backfill() {
         let candidates = vec![
             ("A1".into(), "FIN".into()),
             ("A2".into(), "FIN".into()),
@@ -2045,14 +2167,13 @@ mod tests {
             ("A4".into(), "FIN".into()),
             ("B1".into(), "ICT".into()),
         ];
-        let (idx, dropped) = plan_buy_accept_indices(&candidates, 5, 4, 2);
-        // Pass A: A1,A2,B1; Pass B: A3 to reach min 4; A4 dropped
-        assert_eq!(idx, vec![0, 1, 4, 2]);
-        assert_eq!(dropped, 1);
+        let (idx, dropped) = plan_buy_accept_indices(&candidates, 5, 2);
+        assert_eq!(idx, vec![0, 1, 4]);
+        assert_eq!(dropped, 2);
     }
 
     #[test]
-    fn plan_buy_accept_no_backfill_when_min_already_met() {
+    fn plan_buy_accept_drops_sector_overflow() {
         let candidates = vec![
             ("A1".into(), "FIN".into()),
             ("A2".into(), "FIN".into()),
@@ -2060,9 +2181,9 @@ mod tests {
             ("B1".into(), "ICT".into()),
             ("C1".into(), "CG".into()),
         ];
-        let (idx, dropped) = plan_buy_accept_indices(&candidates, 8, 3, 2);
+        let (idx, dropped) = plan_buy_accept_indices(&candidates, 8, 2);
         assert_eq!(idx, vec![0, 1, 3, 4]);
-        assert_eq!(dropped, 1); // A3 deferred and not needed
+        assert_eq!(dropped, 1);
     }
 
     #[test]
@@ -2120,6 +2241,7 @@ mod tests {
             remaining_for(0.0, 0.0),
             false,
             true,
+            0,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -2154,6 +2276,7 @@ mod tests {
             remaining_for(1_000_000.0, 0.0),
             false,
             true,
+            0,
         );
         assert!(!cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -2190,6 +2313,7 @@ mod tests {
             remaining_for(1_000_000.0, 0.0),
             false,
             true,
+            0,
         );
         assert!(!cap.skip_llm);
         assert!(cap.buy_allowed);
@@ -2227,6 +2351,7 @@ mod tests {
             remaining_for(200.0, 0.0),
             false,
             true,
+            0,
         );
         assert!(cap.skip_llm);
         assert!(!cap.buy_allowed);
@@ -2263,6 +2388,7 @@ mod tests {
             remaining_for(16_750.0, crate::execution::BAMBOO_MIN_ORDER_NOTIONAL),
             false,
             true,
+            0,
         );
         assert!(cap.buy_allowed);
         assert_eq!(cap.max_buy_signals, 1);
@@ -2298,6 +2424,7 @@ mod tests {
             remaining_for(cash, min_n),
             false,
             true,
+            0,
         );
         assert!(!cap.buy_allowed);
         assert!(cap.buys_disabled);
@@ -2334,6 +2461,7 @@ mod tests {
             remaining,
             false,
             true,
+            0,
         );
         assert!(cap.buy_allowed);
         assert!(!cap.buys_disabled);
@@ -2370,6 +2498,7 @@ mod tests {
             remaining_for(cash, min_n),
             false,
             true,
+            0,
         );
         assert!(!cap.skip_llm);
         assert!(cap.buys_disabled);
@@ -2412,10 +2541,80 @@ mod tests {
     }
 
     #[test]
-    fn pre_llm_filter_keeps_held_overbought_drops_unheld() {
-        assert!(!keep_unheld_for_llm(false, true));
-        assert!(keep_unheld_for_llm(true, true));
-        assert!(keep_unheld_for_llm(false, false));
+    fn pre_llm_filter_keeps_held_even_if_untradable() {
+        assert!(!keep_unheld_for_llm(false, false));
+        assert!(keep_unheld_for_llm(true, false));
+        assert!(keep_unheld_for_llm(false, true));
+    }
+
+    #[test]
+    fn ngx_unheld_needs_volume_and_sma50_rsi() {
+        assert!(!unheld_passes_liquidity(Some(0), false));
+        assert!(!unheld_passes_liquidity(None, false));
+        assert!(unheld_passes_liquidity(Some(1), false));
+        assert!(!unheld_passes_indicators(None, Some(50.0), false));
+        assert!(!unheld_passes_indicators(Some(10.0), None, false));
+        assert!(!unheld_passes_indicators(Some(10.0), Some(71.0), false));
+        assert!(unheld_passes_indicators(Some(10.0), Some(55.0), false));
+    }
+
+    #[test]
+    fn busha_unheld_allows_missing_volume_and_sma50() {
+        assert!(unheld_passes_liquidity(Some(0), true));
+        assert!(unheld_passes_liquidity(None, true));
+        assert!(unheld_passes_indicators(None, Some(50.0), true));
+        assert!(!unheld_passes_indicators(None, None, true));
+        assert!(!unheld_passes_indicators(None, Some(80.0), true));
+    }
+
+    #[test]
+    fn current_lot_age_uses_reopen_not_first_buy() {
+        let trades = vec![
+            ("BUY".into(), 10.0, "2026-01-01 09:00:00".into()),
+            ("SELL".into(), 10.0, "2026-01-02 10:00:00".into()),
+            ("BUY".into(), 5.0, "2026-01-03 11:00:00".into()),
+        ];
+        assert_eq!(
+            current_lot_opened_at(&trades).as_deref(),
+            Some("2026-01-03 11:00:00")
+        );
+    }
+
+    #[test]
+    fn capacity_blocks_buys_when_daily_trade_limit_hit() {
+        let row = sample_param_row();
+        let risk = row.to_param_set();
+        let universe = vec![UniverseRow {
+            symbol: "GTCO".into(),
+            sector: None,
+            price: Some(50.0),
+            change_percent: Some(1.0),
+            volume: Some(1000),
+        }];
+        let cap = compute_trade_capacity(
+            &row,
+            &risk,
+            1_000_000.0,
+            1_000_000.0,
+            0.0,
+            0.0015,
+            &universe,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            0.0,
+            remaining_for(1_000_000.0, 0.0),
+            false,
+            true,
+            row.max_daily_trades,
+        );
+        assert!(!cap.buy_allowed);
+        assert_eq!(cap.max_buy_signals, 0);
+        assert!(cap
+            .skip_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("daily buy count"));
     }
 
     #[test]
@@ -2445,6 +2644,7 @@ mod tests {
             remaining_for(1_000_000.0, 0.0),
             true,
             true,
+            0,
         );
         assert!(!cap.buy_allowed);
         assert!(cap.sell_allowed);

@@ -122,7 +122,7 @@ function defaultStore(): MockStore {
       max_daily_drawdown_pct: 0.03,
       position_size_pct: 0.05,
       cycle_budget_pct: 0.2,
-      time_stop_hours: 24,
+      time_stop_hours: 0,
       partial_tp_fraction: 1,
       is_active: true,
     },
@@ -741,7 +741,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         min_confidence_to_trade: s.minConfidenceToTrade ?? store.strategy.min_confidence_to_trade,
         max_daily_drawdown_pct: s.maxDailyDrawdownPct ?? store.strategy.max_daily_drawdown_pct,
         cycle_budget_pct: s.cycleBudgetPct ?? store.strategy.cycle_budget_pct ?? 0.2,
-        time_stop_hours: s.timeStopHours ?? store.strategy.time_stop_hours ?? 24,
+        time_stop_hours: s.timeStopHours ?? store.strategy.time_stop_hours ?? 0,
         partial_tp_fraction: s.partialTpFraction ?? store.strategy.partial_tp_fraction ?? 1,
       };
       delete store.strategy.allowed_symbols;

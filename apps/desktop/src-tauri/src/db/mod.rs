@@ -81,7 +81,7 @@ impl Database {
             conn,
             "strategy_param_sets",
             "time_stop_hours",
-            "REAL NOT NULL DEFAULT 24.0",
+            "REAL NOT NULL DEFAULT 0.0",
         )?;
         Self::add_column_if_missing(
             conn,
@@ -104,6 +104,19 @@ impl Database {
         Self::add_column_if_missing(conn, "broker_orders", "venue", "TEXT NOT NULL DEFAULT 'wealth'")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
+        conn.execute(
+            "UPDATE strategy_param_sets SET take_profit_pct = 0.10 WHERE take_profit_pct IS NULL",
+            [],
+        )
+        .context("seed take_profit_pct")?;
+        // Factory 24h recycle is structurally losing on NGX; do not clobber a user-set value
+        // other than the old column default.
+        conn.execute(
+            "UPDATE strategy_param_sets SET time_stop_hours = 0.0
+             WHERE time_stop_hours = 24.0",
+            [],
+        )
+        .context("reset factory time_stop")?;
         Ok(())
     }
 

@@ -66,8 +66,13 @@ impl SeedService {
 
         let param_id = Uuid::new_v4().to_string();
         conn.execute(
-            "INSERT INTO strategy_param_sets (id, name, is_active, allowed_symbols)
-             VALUES (?1, 'default', 1, NULL)",
+            "INSERT INTO strategy_param_sets (
+                id, name, is_active, allowed_symbols,
+                max_position_pct, stop_loss_pct, take_profit_pct,
+                min_confidence_to_trade, max_daily_drawdown_pct,
+                position_size_pct, cycle_budget_pct, time_stop_hours,
+                partial_tp_fraction, max_daily_trades
+             ) VALUES (?1, 'default', 1, NULL, 0.10, 0.05, 0.10, 0.65, 0.03, 0.05, 0.20, 0.0, 1.0, 5)",
             rusqlite::params![param_id],
         )?;
 

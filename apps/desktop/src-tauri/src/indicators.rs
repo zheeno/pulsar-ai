@@ -138,20 +138,29 @@ fn rsi(values: &[f64], period: usize) -> Option<f64> {
     if values.len() <= period {
         return None;
     }
-    let mut gains = 0.0;
-    let mut losses = 0.0;
-    for i in (values.len() - period)..values.len() {
+    let mut avg_gain = 0.0;
+    let mut avg_loss = 0.0;
+    for i in 1..=period {
         let change = values[i] - values[i - 1];
         if change >= 0.0 {
-            gains += change;
+            avg_gain += change;
         } else {
-            losses -= change;
+            avg_loss -= change;
         }
     }
-    if losses == 0.0 {
+    avg_gain /= period as f64;
+    avg_loss /= period as f64;
+    for i in (period + 1)..values.len() {
+        let change = values[i] - values[i - 1];
+        let gain = if change > 0.0 { change } else { 0.0 };
+        let loss = if change < 0.0 { -change } else { 0.0 };
+        avg_gain = (avg_gain * (period as f64 - 1.0) + gain) / period as f64;
+        avg_loss = (avg_loss * (period as f64 - 1.0) + loss) / period as f64;
+    }
+    if avg_loss == 0.0 {
         return Some(100.0);
     }
-    let rs = gains / losses;
+    let rs = avg_gain / avg_loss;
     Some(100.0 - (100.0 / (1.0 + rs)))
 }
 

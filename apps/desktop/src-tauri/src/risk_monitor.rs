@@ -361,7 +361,13 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
             crate::risk_exits::ExitParams {
                 stop_loss_pct: param_set.stop_loss_pct,
                 take_profit_pct: param_set.take_profit_pct,
-                time_stop_hours: param_set.time_stop_hours,
+                time_stop_hours: crate::risk_exits::effective_time_stop_hours(
+                    broker
+                        .as_ref()
+                        .map(|s| s.id().as_str())
+                        .unwrap_or("sandbox"),
+                    param_set.time_stop_hours,
+                ),
                 partial_tp_fraction: param_set.partial_tp_fraction,
             },
             &prices,
@@ -479,6 +485,10 @@ fn run_risk_tick(app: &AppHandle, state: &Arc<AppState>) -> anyhow::Result<Optio
                     &exit.rationale,
                     exit.confidence,
                     exit.sell_fraction,
+                    broker
+                        .as_ref()
+                        .map(|s| s.id().as_str())
+                        .unwrap_or("sandbox"),
                 )? {
                     signal_ids.push(id);
                     exit_payloads.push(serde_json::json!({
