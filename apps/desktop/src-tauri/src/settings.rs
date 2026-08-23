@@ -26,6 +26,12 @@ pub struct AppSettings {
     pub auto_cycle_enabled: bool,
     /// Minutes between automatic cycles (clamped to 5–120 when saved).
     pub auto_cycle_interval_minutes: u32,
+    /// When true, compress closed-lot patterns into standing desk rules after hours.
+    #[serde(default)]
+    pub dream_enabled: bool,
+    /// Hours between desk-review passes (clamped to 6–48 when saved).
+    #[serde(default = "default_dream_interval_hours")]
+    pub dream_interval_hours: u32,
     /// Live broker used for Home and order routing (`wealth` | `bamboo`).
     #[serde(default = "default_selected_broker")]
     pub selected_broker: String,
@@ -81,6 +87,8 @@ impl Default for AppSettings {
             simulated_fee_pct: 0.005,
             auto_cycle_enabled: false,
             auto_cycle_interval_minutes: 30,
+            dream_enabled: false,
+            dream_interval_hours: default_dream_interval_hours(),
             selected_broker: "wealth".into(),
             wealth_email: None,
             wealth_connected: false,
@@ -133,6 +141,16 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings> {
             "auto_cycle_interval_minutes" => {
                 settings.auto_cycle_interval_minutes =
                     value.parse::<u32>().unwrap_or(30).clamp(5, 120)
+            }
+            "dream_enabled" => settings.dream_enabled = value == "true",
+            "dream_interval_hours" => {
+                settings.dream_interval_hours = value
+                    .parse::<u32>()
+                    .unwrap_or(crate::dream::DEFAULT_DREAM_INTERVAL_HOURS)
+                    .clamp(
+                        crate::dream::DREAM_INTERVAL_HOURS_MIN,
+                        crate::dream::DREAM_INTERVAL_HOURS_MAX,
+                    )
             }
             "selected_broker" => settings.selected_broker = value,
             "wealth_email" => settings.wealth_email = Some(value),
@@ -243,6 +261,17 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
     )?;
     let interval = settings.auto_cycle_interval_minutes.clamp(5, 120);
     set_setting(conn, "auto_cycle_interval_minutes", &interval.to_string())?;
+    set_setting(
+        conn,
+        "dream_enabled",
+        if settings.dream_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    let dream_interval = crate::dream::clamp_dream_interval_hours(settings.dream_interval_hours);
+    set_setting(conn, "dream_interval_hours", &dream_interval.to_string())?;
     set_setting(conn, "selected_broker", &settings.selected_broker)?;
     if let Some(v) = &settings.wealth_email {
         set_setting(conn, "wealth_email", v)?;
@@ -320,6 +349,10 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<()> {
 
 fn default_selected_broker() -> String {
     "wealth".into()
+}
+
+fn default_dream_interval_hours() -> u32 {
+    crate::dream::DEFAULT_DREAM_INTERVAL_HOURS
 }
 
 fn finite_in_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
@@ -531,11 +564,36 @@ mod tests {
     }
 
     #[test]
+    fn dream_settings_round_trip_preserves_last_at() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        crate::settings::set_setting(&conn, "dream_last_at", "2026-08-01T00:00:00+00:00").unwrap();
+        let mut s = AppSettings::default();
+        s.dream_enabled = true;
+        s.dream_interval_hours = 24;
+        save_settings(&conn, &s).unwrap();
+        let loaded = get_settings(&conn).unwrap();
+        assert!(loaded.dream_enabled);
+        assert_eq!(loaded.dream_interval_hours, 24);
+        let last: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'dream_last_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, "2026-08-01T00:00:00+00:00");
+    }
+
+    #[test]
     fn protective_flags_default_off() {
         let s = AppSettings::default();
         assert!(!s.flatten_on_drawdown_armed);
         assert!(!s.halt_new_buys);
         assert!(!s.launch_at_login);
+        assert!(!s.dream_enabled);
+        assert_eq!(s.dream_interval_hours, 12);
         assert!((s.simulated_fee_pct - 0.005).abs() < 1e-9);
         assert!((fee_pct_for_venue(&s, "bamboo") - 0.005).abs() < 1e-9);
         assert!((fee_pct_for_venue(&s, "busha") - 0.002).abs() < 1e-9);

@@ -59,6 +59,8 @@ function defaultSettings(): Settings {
     simulatedFeePct: 0.0015,
     autoCycleEnabled: false,
     autoCycleIntervalMinutes: 30,
+    dreamEnabled: false,
+    dreamIntervalHours: 12,
     selectedBroker: 'wealth',
     wealthEmail: undefined,
     wealthConnected: false,

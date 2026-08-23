@@ -267,7 +267,9 @@ export default function SettingsPage() {
   const timeStopId = useId();
   const partialTpId = useId();
   const autoCycleId = useId();
+  const dreamId = useId();
   const cycleIntervalId = useId();
+  const dreamIntervalId = useId();
   const haltBuysId = useId();
   const flattenId = useId();
   const launchId = useId();
@@ -296,6 +298,8 @@ export default function SettingsPage() {
   const [strategyDraft, setStrategyDraft] = useState<StrategyDraft | null>(null);
   const [autoCycleEnabled, setAutoCycleEnabled] = useState(false);
   const [autoCycleMinutes, setAutoCycleMinutes] = useState(30);
+  const [dreamEnabled, setDreamEnabled] = useState(false);
+  const [dreamIntervalHours, setDreamIntervalHours] = useState(12);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
   const [haltNewBuys, setHaltNewBuys] = useState(false);
   const [flattenArmed, setFlattenArmed] = useState(false);
@@ -342,6 +346,8 @@ export default function SettingsPage() {
     setStrategyDraft(draftFromStrategy(strategy));
     setAutoCycleEnabled(!!s.autoCycleEnabled);
     setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
+    setDreamEnabled(!!s.dreamEnabled);
+    setDreamIntervalHours(clamp(Math.round(s.dreamIntervalHours || 12), 6, 48));
     setLiveTradingEnabled(!!s.liveTradingEnabled);
     setHaltNewBuys(!!s.haltNewBuys);
     setFlattenArmed(!!s.flattenOnDrawdownArmed);
@@ -734,6 +740,7 @@ export default function SettingsPage() {
     toast.info('Saving automation…');
     try {
       const minutes = clamp(autoCycleMinutes, 5, 120);
+      const dreamHours = clamp(dreamIntervalHours, 6, 48);
       const actions = clamp(maxLiveActions, 1, 40);
       const notional = clamp(maxLiveNotional, 1_000, 50_000_000);
       await api('settings_set', {
@@ -741,6 +748,8 @@ export default function SettingsPage() {
           ...settings,
           autoCycleEnabled,
           autoCycleIntervalMinutes: minutes,
+          dreamEnabled,
+          dreamIntervalHours: dreamHours,
           liveTradingEnabled,
           haltNewBuys,
           flattenOnDrawdownArmed: flattenArmed,
@@ -754,6 +763,8 @@ export default function SettingsPage() {
         ...settings,
         autoCycleEnabled,
         autoCycleIntervalMinutes: minutes,
+        dreamEnabled,
+        dreamIntervalHours: dreamHours,
         liveTradingEnabled,
         haltNewBuys,
         flattenOnDrawdownArmed: flattenArmed,
@@ -763,6 +774,7 @@ export default function SettingsPage() {
         retainRawLlmLogs,
       });
       setAutoCycleMinutes(minutes);
+      setDreamIntervalHours(dreamHours);
       setMaxLiveActions(actions);
       setMaxLiveNotional(notional);
       if (autoCycleEnabled) {
@@ -1307,6 +1319,28 @@ export default function SettingsPage() {
 
         <div className="toggle-row">
           <div className="toggle-row__copy">
+            <label className="toggle-row__label" htmlFor={dreamId}>Overnight desk review (dreaming)</label>
+            <p className="toggle-row__hint">
+              Default off. After enough closed lots, compress repeated patterns into standing DREAM
+              cautions for new buys. Does not place orders, raise minConfidence, or blacklist tickers.
+              NGX waits until the market is closed; Busha waits for the interval and an idle cycle.
+            </p>
+          </div>
+          <button
+            id={dreamId}
+            type="button"
+            role="switch"
+            aria-checked={dreamEnabled}
+            className={`toggle ${dreamEnabled ? 'is-on' : ''}`}
+            disabled={cycleBusy}
+            onClick={() => setDreamEnabled((v) => !v)}
+          >
+            <span className="toggle__thumb" />
+          </button>
+        </div>
+
+        <div className="toggle-row">
+          <div className="toggle-row__copy">
             <label className="toggle-row__label">Enable live trading</label>
             <p className="toggle-row__hint">
               When on, Pulsar submits real broker orders for discretionary trading cycles. Stop-loss, take-profit, and time-stop always submit while a live broker is connected and the venue is open — this toggle does not gate those protective sells. Prefer Halt new buys if you want to freeze entries only.
@@ -1411,6 +1445,18 @@ export default function SettingsPage() {
             format={(v) => `${v} min`}
             disabled={cycleBusy || !autoCycleEnabled}
             onChange={setAutoCycleMinutes}
+          />
+          <ParamSlider
+            id={dreamIntervalId}
+            label="Desk-review interval"
+            hint="Hours between overnight reviews. NGX still waits for the close; Busha only needs this interval and an idle cycle."
+            value={dreamIntervalHours}
+            min={6}
+            max={48}
+            step={1}
+            format={(v) => `${v} h`}
+            disabled={cycleBusy || !dreamEnabled}
+            onChange={setDreamIntervalHours}
           />
           <ParamSlider
             id={maxActionsId}

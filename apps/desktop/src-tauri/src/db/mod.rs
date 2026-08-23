@@ -101,6 +101,7 @@ impl Database {
             .context("run busha pairs migration")?;
         conn.execute_batch(include_str!("../../migrations/014_busha_ohlc.sql"))
             .context("run busha ohlc migration")?;
+        Self::migrate_agent_memories_dream_source(conn)?;
         Self::add_column_if_missing(conn, "broker_orders", "venue", "TEXT NOT NULL DEFAULT 'wealth'")?;
         conn.execute("UPDATE strategy_param_sets SET allowed_symbols = NULL", [])
             .context("clear allowed_symbols")?;
@@ -117,6 +118,25 @@ impl Database {
             [],
         )
         .context("reset factory time_stop")?;
+        Ok(())
+    }
+
+    fn migrate_agent_memories_dream_source(conn: &Connection) -> Result<()> {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_memories'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(sql) = sql else {
+            return Ok(());
+        };
+        if sql.contains("dream_consolidate") {
+            return Ok(());
+        }
+        conn.execute_batch(include_str!("../../migrations/015_dream_consolidate.sql"))
+            .context("run agent_memories dream_consolidate migration")?;
         Ok(())
     }
 

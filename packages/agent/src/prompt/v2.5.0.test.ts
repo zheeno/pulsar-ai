@@ -19,10 +19,13 @@ test('prompt treats closed lots as patterns, not a blacklist', () => {
   const prompt = buildPortfolioSignalPrompt({
     universeSize: 4,
     tradeLessons: [{ symbol: 'HOME', pattern: 'chase_reversal', repeatCount: 3 }],
+    dreamRules: [{ pattern: 'chase_reversal', n: 5 }],
   });
   assert.match(prompt, /not a ticker blacklist/);
   assert.match(prompt, /repeatCount >= 3/);
   assert.match(prompt, /Do not raise minConfidence/);
+  assert.match(prompt, /dreamRules are overnight consolidations/);
+  assert.match(prompt, /Do not treat a dream rule as a sell-now order/);
 });
 
 test('crypto prompt names Busha, not NGX', () => {

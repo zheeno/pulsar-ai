@@ -9,7 +9,7 @@ use crate::memory;
 use crate::secrets::{get_secret, SECRET_LLM_API_KEY};
 use crate::settings::AppSettings;
 
-const PORTFOLIO_PROMPT_VERSION: &str = "v2.5.2";
+const PORTFOLIO_PROMPT_VERSION: &str = "v2.5.3";
 const PROMPT_VERSION: &str = "v1.0.0";
 /// Hard ceiling on LLM BUY+SELL ideas per cycle (further capped by trade capacity).
 const LLM_SIGNAL_CAP: usize = 40;
@@ -361,6 +361,7 @@ impl SignalGenerationService {
             "maxActions": capacity.max_actions as i64,
             "symbolMemory": symbol_memory,
             "tradeLessons": crate::outcomes::desk_lessons(conn, Some(&venue), 12).unwrap_or_default(),
+            "dreamRules": crate::dream::desk_dream_rules(conn).unwrap_or_default(),
             "cashBalance": cash,
             "brokerageBalance": if venue != "sandbox" { Some(cash) } else { None::<f64> },
             "tradingVenue": venue,

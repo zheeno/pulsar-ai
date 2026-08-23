@@ -10,6 +10,7 @@ mod coach;
 mod coach_intent;
 mod commands;
 mod db;
+mod dream;
 mod execution;
 mod http_client;
 mod indicators;
@@ -237,6 +238,7 @@ pub fn run() {
             crate::auth_bridge::start_expiry_watcher(app.handle().clone());
 
             scheduler::start_scheduler(app.handle().clone(), state.clone());
+            dream::start_dream_scheduler(app.handle().clone(), state.clone());
             risk_monitor::start_risk_monitor(app.handle().clone(), state);
             Ok(())
         })

@@ -124,7 +124,7 @@ pub fn classify_close(horizon: f64, hold_hours: Option<f64>, exit_model: &str) -
     }
 }
 
-fn close_caution(pattern: &str) -> &'static str {
+pub(crate) fn close_caution(pattern: &str) -> &'static str {
     match pattern {
         "chase_reversal" => {
             "Do not buy a name already green on the day / mid-RSI just above SMA, then dump on the first dip. One-day % is not an edge."
@@ -201,7 +201,10 @@ pub fn desk_lessons(
         let created: Option<String> = row.get(5)?;
         let sid: String = row.get(6)?;
         let exit_model = signal_model(conn, &sid).unwrap_or_default();
-        let hold = hours_since_last_buy(conn, &symbol);
+        let hold = created
+            .as_deref()
+            .and_then(|ts| hold_hours_as_of(conn, &symbol, ts))
+            .or_else(|| hours_since_last_buy(conn, &symbol));
         let h = horizon.unwrap_or(0.0);
         let pattern = classify_close(h, hold, &exit_model);
         raw.push(serde_json::json!({
@@ -236,46 +239,60 @@ pub fn desk_lessons(
 pub fn memory_search_query(held: &str, recently_sold: &[String]) -> String {
     let sold = recently_sold.join(" ");
     format!(
-        "LESSON close result=loss pattern=chase_reversal stop_loss winner short hold green tape RSI SMA holdings {held} sold {sold}"
+        "LESSON close DREAM rule result=loss pattern=chase_reversal stop_loss winner short hold green tape RSI SMA holdings {held} sold {sold}"
     )
 }
 
-fn hours_since_last_buy(conn: &Connection, symbol: &str) -> Option<f64> {
+fn parse_ts(raw: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f"))
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw).map(|d| d.naive_utc()))
+        .ok()
+}
+
+fn collect_buy_stamps(conn: &Connection, symbol: &str) -> Vec<String> {
     let mut stamps = Vec::new();
-    if let Ok(ts) = conn.query_row(
+    if let Ok(mut stmt) = conn.prepare(
         "SELECT executed_at FROM sandbox_trades
-         WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY'
-         ORDER BY executed_at DESC LIMIT 1",
-        [symbol],
-        |row| row.get::<_, String>(0),
+         WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY'",
     ) {
-        stamps.push(ts);
+        if let Ok(rows) = stmt.query_map([symbol], |row| row.get::<_, String>(0)) {
+            stamps.extend(rows.filter_map(|r| r.ok()));
+        }
     }
-    if let Ok(ts) = conn.query_row(
+    if let Ok(mut stmt) = conn.prepare(
         "SELECT created_at FROM broker_orders
          WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY'
-           AND LOWER(status) IN ('executed', 'filled')
-         ORDER BY created_at DESC LIMIT 1",
-        [symbol],
-        |row| row.get::<_, String>(0),
+           AND LOWER(status) IN ('executed', 'filled')",
     ) {
-        stamps.push(ts);
+        if let Ok(rows) = stmt.query_map([symbol], |row| row.get::<_, String>(0)) {
+            stamps.extend(rows.filter_map(|r| r.ok()));
+        }
     }
-    if let Ok(ts) = conn.query_row(
+    if let Ok(mut stmt) = conn.prepare(
         "SELECT created_at FROM signal_outcomes
-         WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY' AND event = 'fill'
-         ORDER BY created_at DESC LIMIT 1",
-        [symbol],
-        |row| row.get::<_, String>(0),
+         WHERE UPPER(symbol) = UPPER(?1) AND UPPER(side) = 'BUY' AND event = 'fill'",
     ) {
-        stamps.push(ts);
+        if let Ok(rows) = stmt.query_map([symbol], |row| row.get::<_, String>(0)) {
+            stamps.extend(rows.filter_map(|r| r.ok()));
+        }
     }
-    let latest = stamps.into_iter().max()?;
-    let parsed = chrono::NaiveDateTime::parse_from_str(&latest, "%Y-%m-%d %H:%M:%S")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&latest, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| chrono::DateTime::parse_from_rfc3339(&latest).map(|d| d.naive_utc()))
-        .ok()?;
-    let secs = (chrono::Utc::now().naive_utc() - parsed).num_seconds() as f64;
+    stamps
+}
+
+fn hours_since_last_buy(conn: &Connection, symbol: &str) -> Option<f64> {
+    hold_hours_as_of(conn, symbol, &chrono::Utc::now().to_rfc3339())
+}
+
+/// Hold time of the lot that was open at `as_of` (last BUY at or before that stamp).
+pub(crate) fn hold_hours_as_of(conn: &Connection, symbol: &str, as_of: &str) -> Option<f64> {
+    let as_of_dt = parse_ts(as_of)?;
+    let latest = collect_buy_stamps(conn, symbol)
+        .into_iter()
+        .filter_map(|s| parse_ts(&s))
+        .filter(|t| *t <= as_of_dt)
+        .max()?;
+    let secs = (as_of_dt - latest).num_seconds() as f64;
     if secs.is_finite() && secs >= 0.0 {
         Some(secs / 3600.0)
     } else {
@@ -283,7 +300,7 @@ fn hours_since_last_buy(conn: &Connection, symbol: &str) -> Option<f64> {
     }
 }
 
-fn signal_model(conn: &Connection, signal_id: &str) -> Option<String> {
+pub(crate) fn signal_model(conn: &Connection, signal_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT COALESCE(model_name, '') FROM signals WHERE id = ?1",
         [signal_id],
@@ -525,6 +542,29 @@ mod tests {
         assert!(text.contains("result=loss"));
         assert!(text.contains("One-day % is not an edge"));
         assert!(text.contains("RSI 62.9"));
+    }
+
+    #[test]
+    fn historical_hold_uses_close_time_not_now() {
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE sandbox_trades (
+                id TEXT PRIMARY KEY, symbol TEXT, side TEXT, executed_at TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sandbox_trades (id, symbol, side, executed_at)
+             VALUES ('b1', 'HOME', 'BUY', '2026-08-01T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let hold = hold_hours_as_of(&conn, "HOME", "2026-08-01T10:26:00Z").unwrap();
+        assert!((hold - 0.4333).abs() < 0.05);
+        assert_eq!(
+            classify_close(-0.126, Some(hold), "openai:gpt-5.6-luna"),
+            "chase_reversal"
+        );
     }
 
     #[test]
