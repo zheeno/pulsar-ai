@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import pulsarMark from '../assets/pulsar-logo.svg';
 import pulsarFull from '../assets/pulsar-logo-full.svg';
+import { hideNativeSplash } from '../lib/native-splash';
 
 type Props = {
   ready: boolean;
@@ -49,6 +50,19 @@ export default function SplashScreen({ ready, message, onFinished }: Props) {
     return () => {
       window.clearTimeout(toFull);
       window.clearTimeout(seq);
+    };
+  }, []);
+
+  // Wait until this tree has painted so hiding #native-splash does not flash
+  // an empty #root (the HTML splash is what macOS 26 users see first).
+  useEffect(() => {
+    let inner = 0;
+    const outer = window.requestAnimationFrame(() => {
+      inner = window.requestAnimationFrame(() => hideNativeSplash());
+    });
+    return () => {
+      window.cancelAnimationFrame(outer);
+      window.cancelAnimationFrame(inner);
     };
   }, []);
 

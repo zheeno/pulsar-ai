@@ -60,6 +60,11 @@ pub fn init(app_data_dir: &Path) {
 
 /// Load the vault from disk/keychain. Always reloads so a `get_secret` that ran
 /// before `init()` cannot poison memory with an empty map and skip the file vault.
+///
+/// Do not call this from Tauri `setup()` on the macOS AppKit launch thread —
+/// Keychain `get_password` can hang waiting for a prompt that never appears
+/// until the window paints (unsigned builds and macOS 26 Tahoe). Spawn it on
+/// a blocking worker after the window is shown. `get_secret` still lazy-loads.
 pub fn preload() {
     match load_unlocked() {
         Ok(map) => {
@@ -619,6 +624,18 @@ mod tests {
     fn hydrate_skips_empty_token_even_if_connected_flag_would_be_true() {
         assert!(hydrate_access_token(None, Some(future_rfc3339())).is_none());
         assert!(hydrate_access_token(Some("".into()), Some(future_rfc3339())).is_none());
+    }
+
+    #[test]
+    fn init_does_not_unlock_vault() {
+        with_isolated_vault(|| {
+            let dir = std::env::temp_dir().join("pulsar-init-does-not-unlock");
+            init(&dir);
+            assert!(
+                VAULT.lock().is_none(),
+                "setup may call init() on the UI thread; it must not hit Keychain"
+            );
+        });
     }
 
     #[test]

@@ -123,6 +123,14 @@ fn load_dotenv() {
     tracing::warn!("no .env found; will try bundled app.env / compiled Pulse defaults");
 }
 
+/// Fatal setup errors must not return `Err` from `setup()`: Tauri panics at the
+/// macOS `applicationDidFinishLaunching` FFI boundary and the window stays blank.
+fn fatal_setup(context: &str, err: impl std::fmt::Display) -> ! {
+    tracing::error!(error = %err, "{context}");
+    eprintln!("Pulsar: {context}: {err}");
+    std::process::exit(1);
+}
+
 fn load_bundled_app_env(resource_dir: &std::path::Path, extras: &[PathBuf]) {
     let mut candidates = extras.to_vec();
     candidates.extend(crate::agent::bundled_resource_candidates(
@@ -184,6 +192,12 @@ pub fn run() {
             }
         }))
         .setup(|app| {
+            // Runs inside tao's applicationDidFinishLaunching (`extern "C"` on
+            // macOS). A panic becomes panic_cannot_unwind and the window stays
+            // blank. Keychain I/O here can also hang the UI thread — unsigned
+            // and macOS 26 builds wait for a prompt that never appears because
+            // the window has not painted yet. Do not call secrets::preload()
+            // or secret_present() on this path.
             let resource_dir = app.path().resource_dir().ok();
             let mut env_extras = Vec::new();
             let mut worker_extras = Vec::new();
@@ -209,10 +223,11 @@ pub fn run() {
             // Compile-time Pulse config from repo .env fills gaps and beats placeholder app.env.
             apply_compiled_pulse_env();
 
-            let app_data = app.path().app_data_dir().expect("app data dir");
+            let app_data = match app.path().app_data_dir() {
+                Ok(p) => p,
+                Err(e) => fatal_setup("failed to resolve app data directory", e),
+            };
             crate::secrets::init(&app_data);
-            tracing::info!(target: "secrets", "preloading secrets vault");
-            crate::secrets::preload();
 
             let worker_path =
                 crate::agent::resolve_worker_path(resource_dir.as_deref(), &worker_extras, Some(&app_data));
@@ -224,20 +239,45 @@ pub fn run() {
                 node_exists = node_bin.is_file(),
                 "agent runtime paths"
             );
-            let db = Database::open(&app_data).expect("open database");
+            let db = match Database::open(&app_data) {
+                Ok(db) => db,
+                Err(e) => fatal_setup("failed to open database", e),
+            };
             let settings = db.with_conn(get_settings).unwrap_or_default();
-            crate::secrets::log_broker_restore_probe(
-                settings.wealth_connected,
-                settings.bamboo_connected,
-            );
-            db.with_conn(|conn| SeedService::seed_if_empty(conn, settings.default_starting_capital))
-                .expect("seed database");
+            let wealth_connected = settings.wealth_connected;
+            let bamboo_connected = settings.bamboo_connected;
+            if let Err(e) = db.with_conn(|conn| {
+                SeedService::seed_if_empty(conn, settings.default_starting_capital)
+            }) {
+                fatal_setup("failed to seed database", e);
+            }
 
             let state = AppState::new(db, worker_path, node_bin);
             app.manage(state.clone());
             app.manage(crate::auth_bridge::AuthBridge::new());
-            crate::auth_bridge::start_expiry_watcher(app.handle().clone());
 
+            // Paint before any Keychain or scheduler work. Background ticks may
+            // still read auth-bridge Keychain, but only after setup() returns.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+
+            // Keychain after the window can paint. get_secret() still lazy-loads.
+            tauri::async_runtime::spawn(async move {
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    tracing::info!(target: "secrets", "preloading secrets vault");
+                    crate::secrets::preload();
+                    crate::secrets::log_broker_restore_probe(wealth_connected, bamboo_connected);
+                })
+                .await;
+                match result {
+                    Ok(()) => tracing::info!("desktop.secrets_preload_complete"),
+                    Err(e) => tracing::warn!(error = %e, "desktop.secrets_preload_join_failed"),
+                }
+            });
+
+            crate::auth_bridge::start_expiry_watcher(app.handle().clone());
             scheduler::start_scheduler(app.handle().clone(), state.clone());
             dream::start_dream_scheduler(app.handle().clone(), state.clone());
             risk_monitor::start_risk_monitor(app.handle().clone(), state);
