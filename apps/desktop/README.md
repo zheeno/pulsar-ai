@@ -51,7 +51,20 @@ On Intel Macs running **macOS 11.x**, `npm run desktop:dev` can panic at startup
 
 `failed overriding protocol method -[WKUIDelegate webView:requestMediaCapturePermissionForOrigin:...]: method not found`
 
-That WebKit API exists only on macOS 12.3+. The repo sets `[profile.dev.package.objc2] debug-assertions = false` in `src-tauri/Cargo.toml` so dev builds skip that check on macOS 11. Pull latest and rebuild. **Release builds** are unaffected.
+That WebKit API exists only on macOS 12.3+. The repo sets `[profile.dev.package.objc2] debug-assertions = false` (and the same for release) in `src-tauri/Cargo.toml` so builds skip that check on macOS 11. Pull latest and rebuild.
+
+### macOS 26 blank window (no splash)
+
+On **macOS 26 (Tahoe)**, especially Apple Silicon, an unsigned build can look frozen on a dark/blank window if Keychain is touched during Tauri `setup()`. That hook runs inside AppKit `applicationDidFinishLaunching`; a Keychain prompt never surfaces because the window has not painted, and a panic there cannot unwind.
+
+Startup now:
+
+1. Initializes the vault path only (`secrets::init`) — no Keychain.
+2. Opens SQLite and shows the `main` window.
+3. Preloads the Keychain vault on a blocking worker after the window can paint.
+4. Paints a native HTML splash in `index.html` before React mounts, so you still see “Starting Pulsar…” if JS is slow.
+
+If you still get a totally empty window, the webview process itself never started (Gatekeeper quarantine, wrong arch, or a native abort). Check Console.app for `Pulsar AI` / `panic_cannot_unwind`, and open the app with **Right-click → Open** once.
 
 ### Which build to use
 

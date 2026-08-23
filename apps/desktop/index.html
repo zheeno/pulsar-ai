@@ -5,7 +5,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Pulsar AI</title>
     <style>
-      html, body, #root { margin: 0; min-height: 100%; background: #0f172a; color: #f8fafc; }
+      html, body, #root { margin: 0; min-height: 100%; background: #0b1220; color: #f8fafc; }
+      #native-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483646;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.25rem;
+        background:
+          radial-gradient(900px 520px at 50% 42%, rgba(56, 189, 248, 0.1), transparent 58%),
+          #0b1220;
+        color: #e2e8f0;
+        font: 15px/1.4 system-ui, -apple-system, sans-serif;
+      }
+      #native-splash[hidden] { display: none !important; }
+      #native-splash .mark { width: 72px; height: 72px; }
+      #native-splash p { margin: 0; opacity: 0.85; letter-spacing: 0.02em; }
       #boot-error {
         display: none;
         box-sizing: border-box;
@@ -17,6 +35,16 @@
     </style>
   </head>
   <body>
+    <div id="native-splash" role="status" aria-live="polite">
+      <svg class="mark" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="16" fill="#0f172a"/>
+        <rect x="1" y="1" width="62" height="62" rx="15" fill="none" stroke="#334155"/>
+        <circle cx="32" cy="32" r="20" fill="none" stroke="#38bdf8" stroke-opacity="0.35" stroke-width="1.25"/>
+        <circle cx="32" cy="32" r="9" fill="none" stroke="#7dd3fc" stroke-opacity="0.7" stroke-width="1.4"/>
+        <circle cx="32" cy="32" r="3.2" fill="#7dd3fc"/>
+      </svg>
+      <p>Starting Pulsar…</p>
+    </div>
     <div id="boot-error" role="alert"></div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
