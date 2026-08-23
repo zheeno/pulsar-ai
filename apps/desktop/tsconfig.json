@@ -16,7 +16,9 @@
     "noUnusedParameters": false,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@ngx/shared/coach-format": ["../../packages/shared/src/coach-format.ts"],
+      "@ngx/shared": ["../../packages/shared/src/index.ts"]
     }
   },
   "include": ["src"]

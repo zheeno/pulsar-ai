@@ -1,4 +1,4 @@
-import { applyCoachHardBreaks, formatCoachSummary } from '@ngx/shared';
+import { applyCoachHardBreaks, formatCoachSummary } from '@ngx/shared/coach-format';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Components } from 'react-markdown';
