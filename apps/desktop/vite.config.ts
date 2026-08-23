@@ -25,6 +25,10 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    watch: {
+      // tauri / cargo write under src-tauri; watching them reloads the UI in a loop.
+      ignored: ['**/src-tauri/**', '**/target/**'],
+    },
   },
   envPrefix: ['VITE_', 'TAURI_'],
   build: {

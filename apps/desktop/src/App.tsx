@@ -25,6 +25,23 @@ type PulseAuthReport = {
 
 const BOOT_TIMEOUT_MS = 12_000;
 const BOOT_TIMEOUT_MESSAGE = 'Startup timed out while contacting the desktop backend.';
+const SPLASH_SEEN_KEY = 'pulsar.splash.seen';
+
+function hasSeenSplash(): boolean {
+  try {
+    return sessionStorage.getItem(SPLASH_SEEN_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function markSplashSeen() {
+  try {
+    sessionStorage.setItem(SPLASH_SEEN_KEY, '1');
+  } catch {
+    /* private mode */
+  }
+}
 
 function withBootTimeout<T>(promise: Promise<T>): Promise<T> {
   return Promise.race([
@@ -38,7 +55,7 @@ function withBootTimeout<T>(promise: Promise<T>): Promise<T> {
 function AppRoutes() {
   const navigate = useNavigate();
   const [ready, setReady] = useState(false);
-  const [splashDone, setSplashDone] = useState(false);
+  const [splashDone, setSplashDone] = useState(hasSeenSplash);
   const [needsOnboarding, setNeedsOnboarding] = useState(true);
   const [bootMessage, setBootMessage] = useState('Igniting Pulsar…');
   const [bootError, setBootError] = useState<string | null>(null);
@@ -106,7 +123,10 @@ function AppRoutes() {
   }, [navigate]);
 
   const session = useMemo(() => ({ logout }), [logout]);
-  const finishSplash = useCallback(() => setSplashDone(true), []);
+  const finishSplash = useCallback(() => {
+    markSplashSeen();
+    setSplashDone(true);
+  }, []);
 
   if (!splashDone) {
     return (
