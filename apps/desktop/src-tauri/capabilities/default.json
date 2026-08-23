@@ -34,6 +34,7 @@
     "allow-symbol-detail-pulse",
     "allow-get-strategy",
     "allow-update-strategy",
+    "allow-desk-advice",
     "allow-strategy-coach-propose",
     "allow-strategy-coach-apply",
     "allow-coach-list-sessions",

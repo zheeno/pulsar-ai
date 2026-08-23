@@ -309,6 +309,12 @@
           "markdownDescription": "Enables the cycle_status command without any pre-configured scope."
         },
         {
+          "description": "Enables the desk_advice command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-desk-advice",
+          "markdownDescription": "Enables the desk_advice command without any pre-configured scope."
+        },
+        {
           "description": "Enables the export_database command without any pre-configured scope.",
           "type": "string",
           "const": "allow-export-database",
@@ -643,6 +649,12 @@
           "type": "string",
           "const": "deny-cycle-status",
           "markdownDescription": "Denies the cycle_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the desk_advice command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-desk-advice",
+          "markdownDescription": "Denies the desk_advice command without any pre-configured scope."
         },
         {
           "description": "Denies the export_database command without any pre-configured scope.",
