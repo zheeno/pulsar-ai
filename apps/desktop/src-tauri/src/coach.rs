@@ -289,9 +289,13 @@ fn dispatch(
             "error": "use memory_search via host",
         })),
         "get_news" => {
-            if crate::broker::crypto_mode() {
-                let symbol = arg_str(args, "symbol");
-                let query = arg_str(args, "query");
+            let symbol = arg_str(args, "symbol");
+            let query = arg_str(args, "query");
+            if crate::news::wants_crypto_news(
+                symbol.as_deref(),
+                query.as_deref(),
+                crate::broker::crypto_mode(),
+            ) {
                 Ok(crate::runtime_util::block_on_local(
                     crate::news::coach_crypto_news(symbol.as_deref(), query.as_deref()),
                 ))
@@ -299,7 +303,7 @@ fn dispatch(
                 Ok(json!({
                     "ok": false,
                     "unavailable": true,
-                    "error": "NGX news is not wired in this build. No headlines were invented.",
+                    "error": "NGX news is not wired in this build. Crypto headlines (BTC and other coins) use CoinDesk / Decrypt / The Block RSS — pass symbol or query. No headlines were invented.",
                 }))
             }
         }
@@ -1077,6 +1081,8 @@ mod tests {
         assert_eq!(v["ok"], false);
         assert_eq!(v["unavailable"], true);
         assert!(!v["error"].as_str().unwrap().is_empty());
+        assert!(crate::news::wants_crypto_news(Some("BTC"), None, false));
+        assert!(!crate::news::wants_crypto_news(Some("GTCO"), None, false));
         let _ = std::fs::remove_dir_all(dir);
     }
 

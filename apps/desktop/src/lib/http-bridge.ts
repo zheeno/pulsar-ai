@@ -822,7 +822,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
       if (isMeta) {
         toolTrace = [];
         summary =
-          "I'm Coach, Pulsar's NGX desk copilot. I can check the tape, a name's history, news when it's wired, help you tighten risk sliders, and propose trades. I won't silently place live orders, and I won't invent prices or headlines. What do you want to look at?";
+          "I'm Coach, Pulsar's desk copilot for NGX equities and Busha crypto. I can check the tape, a name's history, crypto headlines from CoinDesk / Decrypt / The Block RSS, help you tighten risk sliders, and propose trades. NGX news is not wired — I won't invent it. I won't silently place live orders or invent prices. What do you want to look at?";
       } else if (isGreeting) {
         toolTrace = [];
         summary = lower.includes('thank')
@@ -830,11 +830,14 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
           : 'Hey. Tape, a ticker, news, risk sliders, or a trade idea — your call.';
       } else if (isAdvisory || lower.includes('news')) {
         const news = lower.includes('news');
+        const cryptoNews = /\b(btc|bitcoin|eth|crypto)\b/.test(lower);
         toolTrace = news
-          ? [{ name: 'get_news', ok: false, summary: 'unavailable' }]
+          ? [{ name: 'get_news', ok: true, summary: cryptoNews ? 'rss' : 'unavailable' }]
           : [{ name: 'get_symbol_quote', ok: true, summary: 'GTCO @ 46.2' }];
         summary = news
-          ? 'NGX news is not wired in this mock. No headlines were invented.'
+          ? cryptoNews
+            ? 'BTC (mock RSS): CoinDesk — Bitcoin ETF inflows rose this week. Title+lede only; not a buy signal.'
+            : 'NGX news is not wired in this mock. Ask for BTC/crypto for CoinDesk/Decrypt/The Block RSS. No headlines were invented.'
           : 'GTCO last ₦46.20 as-of mock tape. Advice only — not an order.';
       } else if (lower.includes('moving') || lower.includes('quote')) {
         toolTrace = [{ name: 'list_universe_quotes', ok: true, summary: '2 quotes' }];

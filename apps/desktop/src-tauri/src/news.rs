@@ -122,6 +122,33 @@ pub async fn fetch_crypto_desk(focus: &[String]) -> NewsBundle {
     }
 }
 
+/// Crypto RSS when Busha is the live desk, or the user named a coin (BTC, bitcoin, …).
+/// NGX tickers stay on the honest-unavailable path.
+pub fn wants_crypto_news(symbol: Option<&str>, query: Option<&str>, crypto_mode: bool) -> bool {
+    if crypto_mode {
+        return true;
+    }
+    [symbol, query]
+        .into_iter()
+        .flatten()
+        .any(|raw| looks_like_crypto_ask(raw))
+}
+
+fn looks_like_crypto_ask(raw: &str) -> bool {
+    let padded = format!(" {} ", raw.to_ascii_uppercase());
+    if CRYPTO_MARKERS.iter().any(|m| padded.contains(m)) {
+        return true;
+    }
+    if ALIASES
+        .iter()
+        .any(|(alias, sym)| padded.contains(alias) || padded.contains(&format!(" {sym} ")))
+    {
+        return true;
+    }
+    let token = normalize_symbol(raw);
+    !token.is_empty() && ALIASES.iter().any(|(_, sym)| *sym == token)
+}
+
 pub async fn coach_crypto_news(symbol: Option<&str>, query: Option<&str>) -> Value {
     let mut focus = Vec::new();
     if let Some(s) = symbol.map(normalize_symbol).filter(|s| !s.is_empty()) {
@@ -505,6 +532,18 @@ mod tests {
         let focus = HashSet::from(["SOL".into()]);
         let picked = select_headlines(&items, &focus);
         assert_eq!(picked[0].symbols.contains(&"SOL".into()), true);
+    }
+
+    #[test]
+    fn coach_routes_btc_off_busha_and_leaves_ngx_alone() {
+        assert!(wants_crypto_news(Some("BTC"), None, false));
+        assert!(wants_crypto_news(Some("btcngn"), None, false));
+        assert!(wants_crypto_news(None, Some("get BTC news"), false));
+        assert!(wants_crypto_news(None, Some("bitcoin headlines"), false));
+        assert!(wants_crypto_news(None, None, true));
+        assert!(!wants_crypto_news(Some("GTCO"), None, false));
+        assert!(!wants_crypto_news(None, Some("NGX market news"), false));
+        assert!(!wants_crypto_news(None, None, false));
     }
 
     #[test]
