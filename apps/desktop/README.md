@@ -62,7 +62,8 @@ Startup now:
 1. Initializes the vault path only (`secrets::init`) — no Keychain.
 2. Opens SQLite and shows the `main` window.
 3. Preloads the Keychain vault on a blocking worker after the window can paint.
-4. Paints a native HTML splash in `index.html` before React mounts, so you still see “Starting Pulsar…” if JS is slow.
+4. Paints a native HTML splash (official Pulsar mark) in `index.html` before React mounts.
+5. Hides that overlay as soon as the JS bundle evaluates — it does not wait for `requestAnimationFrame` (WKWebView on Tahoe can stall rAF). If the bundle never loads, the splash updates after 8s instead of hanging forever.
 
 If you still get a totally empty window, the webview process itself never started (Gatekeeper quarantine, wrong arch, or a native abort). Check Console.app for `Pulsar AI` / `panic_cannot_unwind`, and open the app with **Right-click → Open** once.
 

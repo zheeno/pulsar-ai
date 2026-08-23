@@ -1,8 +1,11 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import App from './App';
 import { hideNativeSplash } from './lib/native-splash';
 import './styles.css';
+
+// Do not statically import App — a failed page/module would never reach hide.
+document.documentElement.setAttribute('data-js-booted', '1');
+hideNativeSplash();
 
 function showBootError(message: string) {
   hideNativeSplash();
@@ -21,13 +24,20 @@ window.addEventListener('unhandledrejection', (event) => {
   showBootError(`Pulsar AI failed to start: ${reason}`);
 });
 
-const root = document.getElementById('root');
-if (!root) {
-  showBootError('Pulsar AI failed to start: missing #root element.');
-} else {
-  ReactDOM.createRoot(root).render(
-    <React.StrictMode>
-      <App />
-    </React.StrictMode>,
-  );
-}
+void import('./App')
+  .then(({ default: App }) => {
+    const root = document.getElementById('root');
+    if (!root) {
+      showBootError('Pulsar AI failed to start: missing #root element.');
+      return;
+    }
+    ReactDOM.createRoot(root).render(
+      <React.StrictMode>
+        <App />
+      </React.StrictMode>,
+    );
+  })
+  .catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    showBootError(`Pulsar AI failed to start: ${message}`);
+  });
