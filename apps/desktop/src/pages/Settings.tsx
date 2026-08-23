@@ -2,7 +2,7 @@ import { Fragment, useEffect, useId, useRef, useState } from 'react';
 import bambooLogo from '../assets/bamboo.webp';
 import bushaLogo from '../assets/busha.webp';
 import wealthLogo from '../assets/wealth.webp';
-import { DeskAdviceCard } from '../components/DeskAdviceCard';
+import { DeskAdviceHost } from '../components/DeskAdviceModal';
 import { IconLogout, IconSpinner } from '../components/Icons';
 import {
   draftFromLlmTemperature,
@@ -10,7 +10,7 @@ import {
   LlmTemperatureControl,
   llmTemperatureFromDraft,
 } from '../components/LlmTemperatureControl';
-import { api, type AppSettings, type DeskAdvice } from '../lib/api';
+import { api, type AppSettings } from '../lib/api';
 import {
   authenticate as authBridgeAuthenticate,
   listSessions,
@@ -310,7 +310,6 @@ export default function SettingsPage() {
   const [maxLiveNotional, setMaxLiveNotional] = useState(500_000);
   const [retainRawLlmLogs, setRetainRawLlmLogs] = useState(false);
   const [journal, setJournal] = useState<JournalRow[]>([]);
-  const [deskAdvice, setDeskAdvice] = useState<DeskAdvice | null>(null);
   const [busy, setBusy] = useState(false);
   const [strategyBusy, setStrategyBusy] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
@@ -338,16 +337,14 @@ export default function SettingsPage() {
   const [confirmBusy, setConfirmBusy] = useState(false);
 
   async function refresh() {
-    const [s, llm, strategy, advice] = await Promise.all([
+    const [s, llm, strategy] = await Promise.all([
       api<AppSettings>('settings_get'),
       api<LlmStatus>('llm_status'),
       api<StrategyRecord>('get_strategy'),
-      api<DeskAdvice>('desk_advice').catch(() => null),
     ]);
     setSettings(s);
     setLlmStatus(llm);
     setStrategyDraft(draftFromStrategy(strategy));
-    setDeskAdvice(advice);
     setAutoCycleEnabled(!!s.autoCycleEnabled);
     setAutoCycleMinutes(clamp(Math.round(s.autoCycleIntervalMinutes || 30), 5, 120));
     setDreamEnabled(!!s.dreamEnabled);
@@ -547,8 +544,6 @@ export default function SettingsPage() {
         },
       });
       setStrategyDraft(draftFromStrategy(updated));
-      const nextAdvice = await api<DeskAdvice>('desk_advice').catch(() => null);
-      setDeskAdvice(nextAdvice);
       toast.success('Strategy parameters saved.', 'Strategy');
     } catch (e) {
       toast.error(String(e), 'Strategy');
@@ -783,8 +778,6 @@ export default function SettingsPage() {
       setDreamIntervalHours(dreamHours);
       setMaxLiveActions(actions);
       setMaxLiveNotional(notional);
-      const nextAdvice = await api<DeskAdvice>('desk_advice').catch(() => null);
-      setDeskAdvice(nextAdvice);
       if (autoCycleEnabled) {
         toast.success(
           `Automatic cycles enabled every ${minutes} minutes during market hours.`,
@@ -1162,7 +1155,7 @@ export default function SettingsPage() {
 
       <section className="panel" aria-labelledby="strategy-heading" id="strategy">
         <h2 id="strategy-heading">Strategy</h2>
-        <DeskAdviceCard advice={deskAdvice} compact />
+        <DeskAdviceHost variant="settings" />
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
           {wealth?.tradingMode === 'live'
             ? cryptoMode

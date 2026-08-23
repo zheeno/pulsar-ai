@@ -735,6 +735,7 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
         doNot: [],
         note: 'Advice only. Do not apply a patch unless the user asks to preview one.',
         applied: false,
+        lastCycleId: null,
       } as T;
 
     case 'update_strategy': {

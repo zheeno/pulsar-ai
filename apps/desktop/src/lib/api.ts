@@ -155,4 +155,5 @@ export interface DeskAdvice {
   equity?: number | null;
   equity24hAgo?: number | null;
   drop24hPct?: number | null;
+  lastCycleId?: string | null;
 }

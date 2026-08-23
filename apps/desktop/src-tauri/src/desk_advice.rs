@@ -67,6 +67,7 @@ pub struct DeskAdvice {
     pub equity: Option<f64>,
     pub equity_24h_ago: Option<f64>,
     pub drop_24h_pct: Option<f64>,
+    pub last_cycle_id: Option<String>,
 }
 
 impl Default for DeskAdviceInput {
@@ -198,6 +199,7 @@ pub fn evaluate(input: &DeskAdviceInput) -> DeskAdvice {
         equity: input.equity,
         equity_24h_ago: input.equity_24h_ago,
         drop_24h_pct: drop,
+        last_cycle_id: None,
     }
 }
 
@@ -439,8 +441,23 @@ fn input_from_db(conn: &Connection, settings: &AppSettings) -> Result<DeskAdvice
     })
 }
 
+fn last_cycle_id(conn: &Connection) -> Result<Option<String>> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT COALESCE(NULLIF(cycle_id, ''), id, created_at)
+             FROM cycle_audits
+             ORDER BY created_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value.filter(|s| !s.is_empty()))
+}
+
 pub fn evaluate_from_db(conn: &Connection, settings: &AppSettings) -> Result<DeskAdvice> {
-    Ok(evaluate(&input_from_db(conn, settings)?))
+    let mut advice = evaluate(&input_from_db(conn, settings)?);
+    advice.last_cycle_id = last_cycle_id(conn).ok().flatten();
+    Ok(advice)
 }
 
 pub fn coach_tool(conn: &Connection, settings: &AppSettings) -> Result<serde_json::Value> {
@@ -482,6 +499,7 @@ mod tests {
         assert!(advice.applicable);
         assert_eq!(advice.severity, "protect");
         assert!(!advice.applied);
+        assert_eq!(advice.last_cycle_id, None);
         assert!(advice.note.contains("Do not raise minConfidence"));
         assert!(advice.note.contains("Do not persist this as Memory"));
         assert!(advice.headline.contains("did not change") || advice.headline.contains("nothing was applied"));

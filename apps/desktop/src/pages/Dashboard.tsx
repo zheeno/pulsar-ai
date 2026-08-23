@@ -8,9 +8,9 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { DeskAdviceCard } from '../components/DeskAdviceCard';
+import { DeskAdviceHost } from '../components/DeskAdviceModal';
 import { IconShieldAlert, IconShieldCheck, IconSpinner } from '../components/Icons';
-import { api, type DeskAdvice, type PortfolioData } from '../lib/api';
+import { api, type PortfolioData } from '../lib/api';
 import { formatNaira } from '../lib/format';
 import { useCycle } from '../lib/cycle';
 import { useToast } from '../lib/toast';
@@ -136,7 +136,6 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [cycleConfirmOpen, setCycleConfirmOpen] = useState(false);
-  const [deskAdvice, setDeskAdvice] = useState<DeskAdvice | null>(null);
   const cycleConfirmTitleId = useId();
 
   useEffect(() => {
@@ -277,11 +276,10 @@ export default function DashboardPage() {
 
   async function loadData() {
     try {
-      const [portfolioRaw, usageData, marketData, advice] = await Promise.all([
+      const [portfolioRaw, usageData, marketData] = await Promise.all([
         api<RawPortfolio>('portfolio_default'),
         api<Usage>('usage_ngx_pulse'),
         api<MarketStatus>('market_status'),
-        api<DeskAdvice>('desk_advice').catch(() => null),
       ]);
       const portfolio = normalizePortfolio(portfolioRaw);
       setData((prev) => {
@@ -311,7 +309,6 @@ export default function DashboardPage() {
       });
       setUsage(usageData);
       setMarket(marketData);
-      setDeskAdvice(advice);
       setError(null);
       const venue = portfolio.tradingMode === 'live' ? (portfolio.brokerId || 'wealth') : 'sandbox';
       const perf = await api<EquityPoint[]>(
@@ -531,7 +528,7 @@ export default function DashboardPage() {
         </button>
       </section>
 
-      <DeskAdviceCard advice={deskAdvice} />
+      <DeskAdviceHost variant="home" />
 
       {loading && !data ? (
         <div className="stat-grid" aria-hidden>
