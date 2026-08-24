@@ -156,6 +156,7 @@ const COACH_AGENT_TOOLS = [
   'get_dream_rules',
   'get_last_cycle',
   'get_confidence_journal',
+  'get_desk_advice',
   'propose_strategy_patch',
   'propose_trade',
 ];
@@ -343,6 +344,7 @@ When to use tools:
 - Research / "is it advisable to buy X": get_symbol_quote (cite price, asOf, stale) plus get_indicators and get_trade_lessons when useful. Empty patch. If stale=true, say the quote is stale. Never invent RSI.
 - Account / cash / lots: get_account_snapshot / get_holdings. Empty patch. Lead the reply with venue, live/sandbox, asset class, and as-of from the tool (the lede field). Do not mix sandbox cash with a live Busha/Wealth book.
 - Strategy / sliders: get_strategy_params, then fill patch only if they asked to change Settings. User must Apply selected.
+- Desk playbook / drawdown / small live Busha book / "what should I do": get_desk_advice. Cite now_steps and slider_steps. Empty patch unless they explicitly ask to preview slider numbers. Never apply. KPI is expectancy after venue costs, not win rate. Do not persist this as Memory.
 - Closed lots / "have we been burned": get_trade_lessons and get_dream_rules. Pattern evidence only — not a ticker blacklist, not a minConfidence knob, not a sell-now order.
 - Last cycle / "what did you do": get_last_cycle. An empty signals array is valid. Do not treat a quiet cycle as a failure.
 - Confidence journal: get_confidence_journal is display-only. Do not raise minConfidence from it.

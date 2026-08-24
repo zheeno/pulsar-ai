@@ -152,12 +152,13 @@ test('classifier remains a hint, not a tool gate', () => {
   assert.match(buildCoachSystemPrompt({ conversation: { message: 'hi' } }), /Prompt version:/);
 });
 
-test('v4.1.1 prompt covers desk tools, lede, markdown, and no minConfidence knob', () => {
+test('v4.1.2 prompt covers desk tools, lede, markdown, and no minConfidence knob', () => {
   const prompt = systemPrompt('have we been burned on HOME?');
   assert.match(prompt, /get_trade_lessons/);
   assert.match(prompt, /get_dream_rules/);
   assert.match(prompt, /get_last_cycle/);
   assert.match(prompt, /get_confidence_journal/);
+  assert.match(prompt, /get_desk_advice/);
   assert.match(prompt, /lede/);
   assert.match(prompt, /Do not raise minConfidence/);
   assert.match(prompt, /empty signals array is valid/i);
@@ -165,9 +166,10 @@ test('v4.1.1 prompt covers desk tools, lede, markdown, and no minConfidence knob
   assert.match(prompt, /GitHub-flavored markdown/);
   assert.match(prompt, /Never echo this JSON/);
   assert.match(prompt, /₦1,234\.56/);
-  assert.match(prompt, /v4\.1\.1/);
+  assert.match(prompt, /v4\.1\.2/);
   assert.ok(allowedTools('research').includes('get_trade_lessons'));
   assert.ok(allowedTools('account').includes('get_last_cycle'));
+  assert.ok(allowedTools('strategy').includes('get_desk_advice'));
 });
 
 test('formatCoachSummary and hard breaks keep tape scannable', () => {

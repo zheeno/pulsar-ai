@@ -8,6 +8,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { DeskAdviceHost } from '../components/DeskAdviceModal';
 import { IconShieldAlert, IconShieldCheck, IconSpinner } from '../components/Icons';
 import { api, type PortfolioData } from '../lib/api';
 import { formatNaira } from '../lib/format';
@@ -526,6 +527,8 @@ export default function DashboardPage() {
           {cycleBlocked ? 'Cycle running…' : 'Run trading cycle'}
         </button>
       </section>
+
+      <DeskAdviceHost variant="home" />
 
       {loading && !data ? (
         <div className="stat-grid" aria-hidden>

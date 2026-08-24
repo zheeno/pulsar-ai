@@ -167,6 +167,11 @@ function coachTools(callTool: ToolCaller, allowed?: string[]): any[] {
       z.object({}),
     ),
     t(
+      'get_desk_advice',
+      'Read-only small-book playbook for live Busha (halt buys, size down). Advice only — do not apply a patch unless the user asks to preview one. Do not raise minConfidence.',
+      z.object({}),
+    ),
+    t(
       'propose_strategy_patch',
       'Preview a slider patch. Does not save.',
       z.object({ patch: z.record(z.number()).optional() }).passthrough(),

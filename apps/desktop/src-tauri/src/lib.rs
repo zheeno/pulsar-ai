@@ -10,6 +10,7 @@ mod coach;
 mod coach_intent;
 mod commands;
 mod db;
+mod desk_advice;
 mod dream;
 mod execution;
 mod http_client;
@@ -314,6 +315,7 @@ pub fn run() {
             commands::symbol_detail_busha,
             commands::get_strategy,
             commands::update_strategy,
+            desk_advice::desk_advice,
             strategy_coach::strategy_coach_propose,
             strategy_coach::strategy_coach_apply,
             strategy_coach::coach_list_sessions,

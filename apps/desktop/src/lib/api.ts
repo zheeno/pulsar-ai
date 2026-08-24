@@ -129,3 +129,31 @@ export interface PortfolioData {
   } | null;
   wealthError?: string | null;
 }
+
+export interface DeskAdviceStep {
+  id: string;
+  label: string;
+  detail: string;
+  aligned: boolean;
+  current?: string | null;
+  suggested?: string | null;
+}
+
+export interface DeskAdvice {
+  ok: boolean;
+  applicable: boolean;
+  severity: string;
+  reasons: string[];
+  title: string;
+  headline: string;
+  nowSteps: DeskAdviceStep[];
+  sliderSteps: DeskAdviceStep[];
+  kpi: string;
+  doNot: string[];
+  note: string;
+  applied: boolean;
+  equity?: number | null;
+  equity24hAgo?: number | null;
+  drop24hPct?: number | null;
+  lastCycleId?: string | null;
+}

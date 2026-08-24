@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-desk-advice"
+description = "Enables the desk_advice command without any pre-configured scope."
+commands.allow = ["desk_advice"]
+
+[[permission]]
+identifier = "deny-desk-advice"
+description = "Denies the desk_advice command without any pre-configured scope."
+commands.deny = ["desk_advice"]

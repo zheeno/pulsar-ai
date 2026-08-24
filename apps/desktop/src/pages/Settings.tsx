@@ -2,6 +2,7 @@ import { Fragment, useEffect, useId, useRef, useState } from 'react';
 import bambooLogo from '../assets/bamboo.webp';
 import bushaLogo from '../assets/busha.webp';
 import wealthLogo from '../assets/wealth.webp';
+import { DeskAdviceHost } from '../components/DeskAdviceModal';
 import { IconLogout, IconSpinner } from '../components/Icons';
 import {
   draftFromLlmTemperature,
@@ -1152,8 +1153,9 @@ export default function SettingsPage() {
       </section>
       ) : null}
 
-      <section className="panel" aria-labelledby="strategy-heading">
+      <section className="panel" aria-labelledby="strategy-heading" id="strategy">
         <h2 id="strategy-heading">Strategy</h2>
+        <DeskAdviceHost variant="settings" />
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
           {wealth?.tradingMode === 'live'
             ? cryptoMode
@@ -1264,7 +1266,7 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      <section className="panel" aria-labelledby="automation-heading">
+      <section className="panel" aria-labelledby="automation-heading" id="automation">
         <h2 id="automation-heading">Automation</h2>
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.45 }}>
           Pulsar is not a headless daemon. Closing this window stops cycle scheduling and the risk monitor

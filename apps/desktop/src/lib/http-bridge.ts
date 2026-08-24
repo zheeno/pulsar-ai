@@ -720,6 +720,24 @@ export async function httpInvoke<T>(command: string, args?: Record<string, unkno
     case 'get_strategy':
       return loadStore().strategy as T;
 
+    case 'desk_advice':
+      return {
+        ok: true,
+        applicable: false,
+        severity: 'none',
+        reasons: [],
+        title: 'Small-book playbook',
+        headline:
+          'Playbook is on file. Home only surfaces it on a live Busha book that is under ₦40k or down 10%+ in ~24h.',
+        nowSteps: [],
+        sliderSteps: [],
+        kpi: 'Judge the desk by expectancy after Busha fees and spread — not by win rate.',
+        doNot: [],
+        note: 'Advice only. Do not apply a patch unless the user asks to preview one.',
+        applied: false,
+        lastCycleId: null,
+      } as T;
+
     case 'update_strategy': {
       const payload = (args || {}) as {
         strategy?: {

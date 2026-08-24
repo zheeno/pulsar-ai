@@ -407,6 +407,7 @@ fn dispatch(
             "journal": crate::outcomes::confidence_journal(conn).unwrap_or_default(),
             "note": "Display only. Do not raise minConfidence from these buckets.",
         })),
+        "get_desk_advice" => Ok(crate::desk_advice::coach_tool(conn, settings)?),
         "propose_strategy_patch" => Ok(propose_strategy_patch(conn, args)?),
         "apply_strategy_patch" => Ok(json!({
             "ok": false,
@@ -2159,6 +2160,7 @@ mod tests {
             "get_dream_rules",
             "get_last_cycle",
             "get_confidence_journal",
+            "get_desk_advice",
         ] {
             let v = handle_tool(&db, &settings, name, &json!({}));
             assert_eq!(v["ok"], true, "{name} {v}");

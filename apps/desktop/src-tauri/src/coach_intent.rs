@@ -88,6 +88,7 @@ pub const COACH_AGENT_TOOLS: &[&str] = &[
     "get_dream_rules",
     "get_last_cycle",
     "get_confidence_journal",
+    "get_desk_advice",
     "propose_strategy_patch",
     "propose_trade",
 ];
@@ -513,6 +514,7 @@ mod tests {
         assert!(COACH_AGENT_TOOLS.contains(&"get_dream_rules"));
         assert!(COACH_AGENT_TOOLS.contains(&"get_last_cycle"));
         assert!(COACH_AGENT_TOOLS.contains(&"get_confidence_journal"));
+        assert!(COACH_AGENT_TOOLS.contains(&"get_desk_advice"));
     }
 
     #[test]

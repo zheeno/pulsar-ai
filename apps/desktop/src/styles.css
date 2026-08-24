@@ -1978,6 +1978,116 @@ select.input {
   }
 }
 
+.modal--desk-advice {
+  width: min(640px, 100%);
+}
+
+.desk-advice-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 var(--space-4);
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: var(--status-warn-soft);
+  color: var(--text);
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+.desk-advice-toggle:hover {
+  border-color: rgba(245, 158, 11, 0.55);
+}
+
+.desk-advice-toggle.is-silenced {
+  border-color: var(--border);
+  background: rgba(51, 65, 85, 0.45);
+  color: var(--text-muted);
+}
+
+.desk-advice__meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.desk-advice__headline {
+  margin: 0 0 12px;
+  line-height: 1.45;
+}
+
+.desk-advice__reasons,
+.desk-advice__steps,
+.desk-advice__donot {
+  margin: 0 0 14px;
+  padding-left: 1.15rem;
+  line-height: 1.45;
+}
+
+.modal--desk-advice h3 {
+  margin: 16px 0 8px;
+  font-size: 0.86rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.desk-advice__steps li {
+  margin-bottom: 10px;
+}
+
+.desk-advice__steps li.is-aligned strong {
+  color: var(--status-ok);
+}
+
+.desk-advice__step-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.desk-advice__badge {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.desk-advice__badge.is-on {
+  color: #bbf7d0;
+  border-color: rgba(34, 197, 94, 0.35);
+  background: var(--status-ok-soft);
+}
+
+.desk-advice__badge.is-off {
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.35);
+  background: var(--status-warn-soft);
+}
+
+.desk-advice__compare,
+.desk-advice__steps p {
+  margin: 4px 0 0;
+  font-size: 0.9rem;
+}
+
+.desk-advice__kpi {
+  margin: 8px 0 10px;
+  font-size: 0.92rem;
+}
+
+.desk-advice__cta {
+  margin: 0 0 14px;
+}
+
+.desk-advice__actions {
+  margin-top: var(--space-4);
+}
+
 @keyframes status-in {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }

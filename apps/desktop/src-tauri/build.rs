@@ -106,6 +106,7 @@ fn main() {
                 "symbol_detail_busha",
                 "get_strategy",
                 "update_strategy",
+                "desk_advice",
                 "strategy_coach_propose",
                 "strategy_coach_apply",
                 "coach_list_sessions",
